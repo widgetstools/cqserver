@@ -1,0 +1,11 @@
+{
+  "cusip": "string",
+  "ticker": "string",
+  "assetClass": "string",
+  "sector": "string",
+  "bid": "double",
+  "ask": "double",
+  "mid": "double",
+  "yieldPct": "double",
+  "timestamp": "string"
+}

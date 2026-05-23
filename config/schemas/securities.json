@@ -1,0 +1,11 @@
+{
+  "cusip": "string",
+  "ticker": "string",
+  "issuer": "string",
+  "coupon": "double",
+  "maturity": "string",
+  "assetClass": "string",
+  "sector": "string",
+  "currency": "string",
+  "initialMid": "double"
+}

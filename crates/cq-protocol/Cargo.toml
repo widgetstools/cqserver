@@ -1,0 +1,13 @@
+[package]
+name = "cq-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+compact_str.workspace = true
+rmp-serde.workspace = true
+bson.workspace = true

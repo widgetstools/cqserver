@@ -1,0 +1,82 @@
+# CQServer Configuration
+
+tcp_addr = "0.0.0.0:9007"
+websocket_addr = "0.0.0.0:9008"
+websocket_path = "/cq/json"
+admin_addr = "0.0.0.0:8085"
+
+# Per-session outbound queue depth (frames). SOW uses backpressure (await
+# on send) and won't drop even when this is exceeded — sizing this is
+# about steady-state burst headroom. Live deltas still try_send and drop
+# if a subscriber falls behind; tune up for slow consumers or wide rows.
+[transport]
+outbound_queue_capacity = 16384
+
+# ===== Fixed-income demo topics =====
+#
+# Every FI topic declares its schema up front via an external JSON file
+# under `config/schemas/`. The server installs the schema at startup, so
+# `schemaDiscovered` is `true` from the moment the topic exists — there
+# is no first-publish race with subscribers that used to break the
+# demo. Nested schema objects are flattened to dotted-path columns
+# internally; `WHERE risk.duration > 10` works regardless.
+
+# Reference data — instrument master.
+[[topics]]
+name = "/securities"
+key = ["cusip"]
+persist = false
+initial_capacity = 1000
+schema_file = "schemas/securities.json"
+
+# Live market data ticks. Conflated at 100ms so a browser-side
+# subscriber doesn't drown in raw tick rate.
+[[topics]]
+name = "/fi-market-data"
+key = ["cusip"]
+persist = false
+conflation_ms = 100
+initial_capacity = 1000
+schema_file = "schemas/fi-market-data.json"
+
+# Persistent trade log — each fill is a row, never updated in place.
+[[topics]]
+name = "/trades"
+key = ["tradeId"]
+persist = true
+initial_capacity = 100000
+schema_file = "schemas/trades.json"
+
+# Derived positions, keyed by `book|cusip`. Recomputed each trade.
+[[topics]]
+name = "/positions"
+key = ["positionKey"]
+persist = false
+conflation_ms = 50
+initial_capacity = 10000
+schema_file = "schemas/positions.json"
+
+# Risk metrics — wide nested schema (~112 columns) showcasing
+# pre-declared nesting and queries on dotted paths.
+[[topics]]
+name = "/risk"
+key = ["positionKey"]
+persist = false
+conflation_ms = 100
+initial_capacity = 50000
+schema_file = "schemas/risk.json"
+
+# ===== Legacy / generic demo topics =====
+
+[[topics]]
+name = "/market-data"
+key = ["symbol"]
+persist = false
+conflation_ms = 100
+initial_capacity = 100000
+
+[[topics]]
+name = "/orders"
+key = ["orderId"]
+persist = true
+initial_capacity = 100000

@@ -1,0 +1,15 @@
+{
+  "tradeId": "string",
+  "timestamp": "string",
+  "cusip": "string",
+  "ticker": "string",
+  "side": "string",
+  "qty": "long",
+  "price": "double",
+  "notional": "double",
+  "trader": "string",
+  "counterparty": "string",
+  "book": "string",
+  "assetClass": "string",
+  "sector": "string"
+}

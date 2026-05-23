@@ -1,0 +1,1273 @@
+//! Transport-agnostic command dispatcher.
+//!
+//! Both the WebSocket and TCP transports decode a `CqMessage` and then
+//! call `dispatch`. Per-command handlers live here so the protocol
+//! semantics stay in one place.
+
+use crate::auth::{Op, SharedAuth};
+use crate::queue::QueueRegistry;
+use crate::session::{DeliveryRoute, Session, SessionRegistry};
+use cq_core::topic::SharedTopic;
+use cq_protocol::command::Command;
+use cq_protocol::message::CqMessage;
+use dashmap::DashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Aggregate of the per-server registries the router consults. Keeps
+/// the dispatch signature small as we add new resource types (topics,
+/// queues, and future siblings).
+#[derive(Clone)]
+pub struct RouterContext {
+    pub topics: Arc<DashMap<String, SharedTopic>>,
+    pub sessions: SessionRegistry,
+    pub queues: QueueRegistry,
+    pub auth: SharedAuth,
+    /// Rows per outbound `sow_batch` frame on the streaming SOW path.
+    pub sow_batch_size: usize,
+    /// Server-side `(client_name, topic) → last delivered sequence`.
+    /// Used by `MOST_RECENT` replay: when a client reconnects with
+    /// the same name and asks for `most_recent`, the server starts
+    /// the replay from the stored sequence. In-memory; survives
+    /// reconnects within the process lifetime but not restarts.
+    pub bookmark_store: BookmarkStore,
+}
+
+/// Process-wide map of `(client_name, topic_name) → max sequence
+/// delivered`. Updated on every bookmark-replay completion + every
+/// live delta. Looked up by `handle_subscribe` when the client asks
+/// for `MOST_RECENT`.
+pub type BookmarkStore = Arc<DashMap<(String, String), std::sync::atomic::AtomicU64>>;
+
+pub fn new_bookmark_store() -> BookmarkStore {
+    Arc::new(DashMap::new())
+}
+
+/// Record that a client just received delta with `seq` on `topic`.
+/// Monotonic update — won't lower an already-higher mark.
+pub fn record_bookmark(store: &BookmarkStore, client_name: &str, topic: &str, seq: u64) {
+    use std::sync::atomic::Ordering;
+    if client_name.is_empty() {
+        return;
+    }
+    let key = (client_name.to_string(), topic.to_string());
+    let entry = store
+        .entry(key)
+        .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+    let mut cur = entry.load(Ordering::Relaxed);
+    while cur < seq {
+        match entry.compare_exchange_weak(cur, seq, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+pub fn lookup_bookmark(store: &BookmarkStore, client_name: &str, topic: &str) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let key = (client_name.to_string(), topic.to_string());
+    store.get(&key).map(|e| e.load(Ordering::Relaxed))
+}
+
+/// Scan the topic's txlog for the highest sequence whose write
+/// timestamp is **strictly less than** `since_ms`, returning that
+/// as the implicit bookmark (the replay path picks up at
+/// `bookmark + 1`, so we want everything at/after the cutoff to
+/// flow). Returns `Ok(None)` if every entry already happened after
+/// the cutoff (replay everything) or if the topic isn't persistent.
+fn resolve_timestamp_to_seq(
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    topic_name: &str,
+    since_ms: u64,
+) -> Result<Option<u64>, String> {
+    let topic = topics
+        .get(topic_name)
+        .ok_or_else(|| format!("topic not found: {topic_name}"))?
+        .clone();
+    let log_path = topic
+        .txlog_path()
+        .ok_or_else(|| "topic is not persistent".to_string())?;
+    let mut reader = cq_txlog::reader::TxLogReader::open(&log_path)
+        .map_err(|e| format!("open txlog: {e}"))?;
+    let mut last_before: Option<u64> = None;
+    loop {
+        match reader.read_next() {
+            Ok(Some(entry)) => {
+                if entry.timestamp_ms < since_ms {
+                    last_before = Some(entry.sequence);
+                } else {
+                    // Reader is sequential — once we cross the
+                    // cutoff there are no more "before" entries.
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("read txlog: {e}")),
+        }
+    }
+    Ok(last_before)
+}
+
+pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) {
+    // Gate every command except Logon and Heartbeat when auth is required.
+    if ctx.auth.required
+        && !session.is_authenticated()
+        && !matches!(msg.command, Command::Logon | Command::Heartbeat)
+    {
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id,
+            "Not authenticated — send Logon first",
+        ));
+        return;
+    }
+
+    // Row-level entitlement: AND the user's row_filter into
+    // `msg.filter` so it applies to every read-side command
+    // (subscribe / sow / sow_and_subscribe / delta_subscribe /
+    // sow_delete). Read-side only — writes aren't affected.
+    if matches!(
+        msg.command,
+        Command::Subscribe
+            | Command::Sow
+            | Command::SowAndSubscribe
+            | Command::DeltaSubscribe
+            | Command::SowDelete
+    ) {
+        apply_entitlement_filter(&mut msg, &ctx.auth, session);
+    }
+
+    match msg.command {
+        Command::Logon => handle_logon(session, msg, &ctx.auth),
+        Command::Publish => handle_publish(session, msg, ctx),
+        Command::DeltaPublish => handle_delta_publish(session, msg, ctx),
+        Command::Sow => handle_sow(session, msg, &ctx.topics, &ctx.auth, ctx.sow_batch_size),
+        Command::SowAndSubscribe => handle_sow_and_subscribe(session, msg, ctx, false),
+        Command::DeltaSubscribe => handle_sow_and_subscribe(session, msg, ctx, true),
+        Command::Subscribe => handle_subscribe(session, msg, ctx),
+        Command::Unsubscribe => handle_unsubscribe(session, msg, &ctx.topics, &ctx.sessions),
+        Command::SowDelete => handle_sow_delete(session, msg, &ctx.topics, &ctx.auth),
+        Command::Heartbeat => {
+            let _ = session.send_message(&CqMessage::ack_ok(msg.command_id));
+        }
+        Command::Ack => {
+            // Consumer-side Ack: when `topic` is a queue and a
+            // `delivery_id` is set, commit the matching lease so
+            // the message isn't redelivered. Otherwise it's just an
+            // ack frame the server can ignore (clients don't need
+            // to ack server-originated messages today).
+            if let (Some(topic), Some(did)) = (&msg.topic, msg.delivery_id) {
+                if let Some(q) = ctx.queues.get(topic) {
+                    q.ack(did);
+                }
+            }
+        }
+        Command::Pause => {
+            if let Some(sid) = msg.sub_id.as_deref() {
+                if let Some(route) = ctx.sessions.get(sid) {
+                    route
+                        .paused
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        Command::Resume => {
+            if let Some(sid) = msg.sub_id.as_deref() {
+                if let Some(route) = ctx.sessions.get(sid) {
+                    route
+                        .paused
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    route.resume_notify.notify_waiters();
+                }
+            }
+        }
+        _ => {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                &format!("Unsupported command: {:?}", msg.command),
+            ));
+        }
+    }
+}
+
+/// Per-command entitlement check. Returns `true` if auth is not required
+/// or the session is allowed; sends an error ack and returns `false`
+/// otherwise.
+fn check_entitlement(
+    session: &Session,
+    cid: &Option<String>,
+    auth: &SharedAuth,
+    op: Op,
+    topic: &str,
+) -> bool {
+    if !auth.required {
+        return true;
+    }
+    if session.can(op, topic) {
+        return true;
+    }
+    let _ = session.send_message(&CqMessage::error(
+        cid.clone(),
+        &format!("Forbidden: missing {:?} entitlement for {}", op, topic),
+    ));
+    false
+}
+
+fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
+    let creds = msg.data.as_ref().and_then(|d| d.as_object());
+    let user = creds.and_then(|m| m.get("user").and_then(|v| v.as_str()));
+    let pass = creds.and_then(|m| m.get("password").and_then(|v| v.as_str()));
+    let (user, pass) = match (user, pass) {
+        (Some(u), Some(p)) => (u, p),
+        _ => {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "Missing user/password in logon data",
+            ));
+            return;
+        }
+    };
+
+    match auth.verify(user, pass) {
+        Some(matched) => {
+            session.username = Some(matched.username.clone());
+            session.entitlements = matched.entitlements.clone();
+            tracing::info!(
+                session = %session.id,
+                user = %matched.username,
+                entitlements = matched.entitlements.len(),
+                "Logon ok"
+            );
+            metrics::counter!("cq_logon_total", "result" => "ok").increment(1);
+            let _ = session.send_message(&CqMessage::ack_ok(msg.command_id));
+        }
+        None => {
+            tracing::warn!(session = %session.id, attempted_user = %user, "Logon failed");
+            metrics::counter!("cq_logon_total", "result" => "fail").increment(1);
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "Invalid credentials",
+            ));
+        }
+    }
+}
+
+fn handle_publish(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
+    handle_publish_inner(session, msg, ctx, false);
+}
+
+fn handle_delta_publish(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
+    handle_publish_inner(session, msg, ctx, true);
+}
+
+fn handle_publish_inner(
+    session: &mut Session,
+    msg: CqMessage,
+    ctx: &RouterContext,
+    delta_mode: bool,
+) {
+    let topic_name = match &msg.topic {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing topic"));
+            return;
+        }
+    };
+
+    if !check_entitlement(session, &msg.command_id, &ctx.auth, Op::Publish, &topic_name) {
+        return;
+    }
+
+    let data_value = match &msg.data {
+        Some(v @ serde_json::Value::Object(_)) => v.clone(),
+        _ => {
+            let _ = session
+                .send_message(&CqMessage::error(msg.command_id, "Missing or invalid data"));
+            return;
+        }
+    };
+
+    // Queue path: each publish goes to exactly one consumer. Queues
+    // don't support delta merges (no per-key state to merge into);
+    // reject the request so the publisher knows it's a misuse.
+    if let Some(queue) = ctx.queues.get(&topic_name) {
+        if delta_mode {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "delta_publish not supported on queue topics",
+            ));
+            return;
+        }
+        let started = Instant::now();
+        let seq = queue.publish(data_value, &ctx.sessions);
+        let elapsed_us = started.elapsed().as_micros() as f64;
+        metrics::histogram!("cq_publish_latency_us", "topic" => topic_name.clone())
+            .record(elapsed_us);
+        let mut ack = CqMessage::ack_ok(msg.command_id);
+        ack.sequence = Some(seq);
+        let _ = session.send_message(&ack);
+        return;
+    }
+
+    // SOW topic path.
+    let data = match data_value {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!(),
+    };
+
+    if let Some(topic) = ctx.topics.get(&topic_name) {
+        let started = Instant::now();
+        let result = if delta_mode {
+            topic.delta_upsert_map(&data)
+        } else {
+            topic.upsert_map(&data)
+        };
+        match result {
+            Ok(seq) => {
+                let elapsed_us = started.elapsed().as_micros() as f64;
+                let counter = if delta_mode {
+                    "cq_delta_publish_total"
+                } else {
+                    "cq_publish_total"
+                };
+                metrics::counter!(counter, "topic" => topic_name.clone()).increment(1);
+                metrics::histogram!("cq_publish_latency_us", "topic" => topic_name.clone())
+                    .record(elapsed_us);
+                let mut ack = CqMessage::ack_ok(msg.command_id);
+                ack.sequence = Some(seq);
+                let _ = session.send_message(&ack);
+            }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!("Publish failed: {}", e),
+                ));
+            }
+        }
+    } else {
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id,
+            &format!("Topic not found: {}", topic_name),
+        ));
+    }
+}
+
+fn handle_sow(
+    session: &mut Session,
+    msg: CqMessage,
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    auth: &SharedAuth,
+    sow_batch_size: usize,
+) {
+    let topic_name = match &msg.topic {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing topic"));
+            return;
+        }
+    };
+
+    if !check_entitlement(session, &msg.command_id, auth, Op::Sow, &topic_name) {
+        return;
+    }
+
+    let sql = build_sql(&msg);
+    let sub_id = msg.command_id.clone().unwrap_or_default();
+
+    // Resolve the topic Arc before spawning so the task owns it.
+    let topic = match topics.get(&topic_name) {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                &format!("Topic not found: {}", topic_name),
+            ));
+            return;
+        }
+    };
+
+    let tx = session.tx.clone();
+    let codec_slot = session.codec.clone();
+    let session_id = session.id.clone();
+    let topic_label = topic_name.clone();
+    let batch_size = sow_batch_size;
+
+    tokio::spawn(async move {
+        deliver_streaming_snapshot(
+            topic,
+            sql,
+            None, // one-shot SOW carries no ack — group_begin/sow/group_end is enough
+            sub_id,
+            topic_label,
+            session_id,
+            codec_slot,
+            tx,
+            batch_size,
+        )
+        .await;
+    });
+}
+
+fn handle_sow_and_subscribe(
+    session: &mut Session,
+    msg: CqMessage,
+    ctx: &RouterContext,
+    sparse: bool,
+) {
+    let topic_name = match &msg.topic {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing topic"));
+            return;
+        }
+    };
+
+    if !check_entitlement(session, &msg.command_id, &ctx.auth, Op::Subscribe, &topic_name) {
+        return;
+    }
+
+    // Queue subscribe path: no snapshot, no bookmark, no predicates.
+    // The subscriber joins the queue's round-robin consumer set.
+    if let Some(queue) = ctx.queues.get(&topic_name) {
+        let sub_id = session.next_sub_id();
+        session.subscriptions.push(sub_id.clone());
+        ctx.sessions.insert(
+            sub_id.clone(),
+            DeliveryRoute::with_codec(
+                session.tx.clone(),
+                topic_name.clone(),
+                session.codec(),
+            )
+            .with_session(session.id.clone()),
+        );
+        queue.add_consumer(sub_id.clone(), &ctx.sessions);
+        let mut ack = CqMessage::ack_ok(msg.command_id);
+        ack.sub_id = Some(sub_id);
+        let _ = session.send_message(&ack);
+        return;
+    }
+
+    let topics = &ctx.topics;
+    let registry = &ctx.sessions;
+
+    let sql = build_sql(&msg);
+
+    // Resolve the effective replay starting point. Precedence (most
+    // specific to least):
+    //   1. Explicit `bookmark` (sequence number) — verbatim.
+    //   2. `since_timestamp_ms` — scan the txlog for the first entry
+    //      strictly at or after this wall-clock and replay from there.
+    //   3. `most_recent: true` + `client_name` — look up the
+    //      server-side per-client store; replay from there if present.
+    //   4. None of the above — live subscription with snapshot.
+    let resolved_bookmark: Option<u64> = if let Some(bm) = msg.bookmark {
+        Some(bm)
+    } else if let Some(since_ms) = msg.since_timestamp_ms {
+        match resolve_timestamp_to_seq(topics, &topic_name, since_ms) {
+            Ok(b) => b,
+            Err(reason) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id.clone(),
+                    &format!("since_timestamp_ms: {reason}"),
+                ));
+                return;
+            }
+        }
+    } else if msg.most_recent {
+        let cname = msg
+            .client_name
+            .as_deref()
+            .or(session.username.as_deref())
+            .unwrap_or("");
+        if cname.is_empty() {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id.clone(),
+                "most_recent requires client_name (via logon or msg)",
+            ));
+            return;
+        }
+        lookup_bookmark(&ctx.bookmark_store, cname, &topic_name)
+    } else {
+        None
+    };
+
+    // Bookmark path: replay txlog from `bookmark+1`, then go live. No
+    // snapshot — the client is reconstructing from the delta stream.
+    if let Some(bookmark) = resolved_bookmark {
+        let cname = msg.client_name.clone().or_else(|| session.username.clone());
+        handle_bookmark_subscribe(
+            session,
+            msg.command_id,
+            topic_name,
+            &sql,
+            bookmark,
+            topics,
+            registry,
+            cname,
+            ctx.bookmark_store.clone(),
+        );
+        return;
+    }
+
+    let sub_id = session.next_sub_id();
+
+    if let Some(topic) = topics.get(&topic_name) {
+        let conflation_ms = topic.conflation_ms();
+        // For `send_keys`, only the *snapshot* projection should be
+        // keys-only — the live delta path still needs the original
+        // projection (all columns by default) so sparse diff_update
+        // can detect changes on any field.
+        let snapshot_sql = if sparse && msg.send_keys {
+            let key_cols = topic.key_column_names();
+            if !key_cols.is_empty() {
+                build_keys_only_sql(&sql, &key_cols)
+            } else {
+                sql.clone()
+            }
+        } else {
+            sql.clone()
+        };
+        let subscribe_result = if sparse {
+            // Subscription state always uses the original SQL so live
+            // updates see every column they should.
+            topic.subscribe_sparse(sub_id.clone(), &sql)
+        } else {
+            topic.subscribe(sub_id.clone(), &sql)
+        };
+        match subscribe_result {
+            Ok((snapshot, _)) => {
+                session.subscriptions.push(sub_id.clone());
+                registry.insert(
+                    sub_id.clone(),
+                    build_route(
+                        session.tx.clone(),
+                        topic_name.clone(),
+                        sub_id.clone(),
+                        conflation_ms,
+                        session.codec(),
+                        session.id.clone(),
+                        msg.client_name.clone().or_else(|| session.username.clone()),
+                        Some(ctx.bookmark_store.clone()),
+                    ),
+                );
+                metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
+                    .increment(1.0);
+
+                // `_snapshot` returned by `topic.subscribe(..)` is the
+                // materialized snapshot — we keep it for ordering (the
+                // engine's active_set was just seeded from it) but the
+                // actual wire delivery uses `query_streaming` to avoid
+                // ever holding the full result in memory.
+                let _ = snapshot; // discarded: streaming path delivers it
+                let tx = session.tx.clone();
+                let codec_slot = session.codec.clone();
+                let session_id = session.id.clone();
+                let snapshot_sub_id = sub_id.clone();
+                let snapshot_topic = topic_name.clone();
+                let ack_cmd_id = msg.command_id.clone();
+                let batch_size = ctx.sow_batch_size;
+                let topic_for_task = topic.clone();
+                let sql_for_task = snapshot_sql.clone();
+                tokio::spawn(async move {
+                    deliver_streaming_snapshot(
+                        topic_for_task,
+                        sql_for_task,
+                        ack_cmd_id,
+                        snapshot_sub_id,
+                        snapshot_topic,
+                        session_id,
+                        codec_slot,
+                        tx,
+                        batch_size,
+                    )
+                    .await;
+                });
+            }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    None,
+                    &format!("Subscribe error: {}", e),
+                ));
+            }
+        }
+    } else {
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id,
+            &format!("Topic not found: {}", topic_name),
+        ));
+    }
+}
+
+fn handle_bookmark_subscribe(
+    session: &mut Session,
+    command_id: Option<String>,
+    topic_name: String,
+    sql: &str,
+    bookmark: u64,
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    registry: &SessionRegistry,
+    client_name: Option<String>,
+    bookmark_store: BookmarkStore,
+) {
+    let sub_id = session.next_sub_id();
+
+    let topic = match topics.get(&topic_name) {
+        Some(t) => t,
+        None => {
+            let _ = session.send_message(&CqMessage::error(
+                command_id,
+                &format!("Topic not found: {}", topic_name),
+            ));
+            return;
+        }
+    };
+
+    let log_path = match topic.txlog_path() {
+        Some(p) => p,
+        None => {
+            let _ = session.send_message(&CqMessage::error(
+                command_id,
+                "Bookmark replay requires a persistent topic",
+            ));
+            return;
+        }
+    };
+
+    let conflation_ms = topic.conflation_ms();
+    let (query, captured) = match topic.subscribe_with_bookmark(sub_id.clone(), sql) {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = session.send_message(&CqMessage::error(
+                command_id,
+                &format!("Subscribe error: {}", e),
+            ));
+            return;
+        }
+    };
+
+    session.subscriptions.push(sub_id.clone());
+    registry.insert(
+        sub_id.clone(),
+        build_route(
+            session.tx.clone(),
+            topic_name.clone(),
+            sub_id.clone(),
+            conflation_ms,
+            session.codec(),
+            session.id.clone(),
+            client_name,
+            Some(bookmark_store),
+        ),
+    );
+    metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone()).increment(1.0);
+
+    // Ack with the captured high-water sequence — the client knows that
+    // every delta numbered ≤ captured is part of the replay window.
+    let mut ack = CqMessage::ack_ok(command_id);
+    ack.sub_id = Some(sub_id.clone());
+    ack.sequence = Some(captured);
+    let _ = session.send_message(&ack);
+
+    // Capture handles needed inside the replay task before we lose
+    // mutable access to `session`.
+    let route = registry.get(&sub_id).map(|r| r.clone());
+    let tx = session.tx.clone();
+    let codec = session.codec();
+
+    // Move the replay loop into a tokio task so we can:
+    //   1. Yield between entries (avoids blocking the read loop).
+    //   2. Await on the route's `resume_notify` when the client
+    //      issues a Pause command mid-replay.
+    let topic_name_for_task = topic_name.clone();
+    let sub_id_for_task = sub_id.clone();
+    let query_for_task = query.clone();
+    let schema = topic.schema();
+    tokio::spawn(async move {
+        use crate::session::encode_frame;
+        let mut reader = match cq_txlog::reader::TxLogReader::open(&log_path) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = CqMessage::error(None, &format!("Replay open failed: {e}"));
+                if let Some(f) = encode_frame(codec, &err) {
+                    let _ = tx.send(f).await;
+                }
+                return;
+            }
+        };
+        let mut replayed: u64 = 0;
+        loop {
+            // Pause handshake: if paused, await Resume. The
+            // `resume_notify` is `notify_waiters`-style — i.e. it
+            // only wakes already-waiting callers — so we re-check
+            // the atomic in a loop to be race-safe.
+            if let Some(r) = &route {
+                while r.paused.load(std::sync::atomic::Ordering::Acquire) {
+                    r.resume_notify.notified().await;
+                }
+            }
+            match reader.read_next() {
+                Ok(Some(entry)) => {
+                    if entry.sequence <= bookmark {
+                        continue;
+                    }
+                    if entry.sequence > captured {
+                        break;
+                    }
+                    if entry.is_tombstone() {
+                        let mut row_data = serde_json::Map::new();
+                        row_data.insert(
+                            "_key".into(),
+                            serde_json::Value::String(entry.key.clone()),
+                        );
+                        let mut m =
+                            CqMessage::delta(&sub_id_for_task, "remove", row_data);
+                        m.sequence = Some(entry.sequence);
+                        if let Some(f) = encode_frame(codec, &m) {
+                            let _ = tx.send(f).await;
+                        }
+                        replayed += 1;
+                    } else {
+                        let parsed: serde_json::Value =
+                            match serde_json::from_slice(&entry.payload) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                        if let serde_json::Value::Object(map) = parsed {
+                            if cq_core::predicate::predicate_matches_json(
+                                &query_for_task.predicate,
+                                &schema,
+                                &map,
+                            ) {
+                                let mut m =
+                                    CqMessage::delta(&sub_id_for_task, "add", map);
+                                m.sequence = Some(entry.sequence);
+                                if let Some(f) = encode_frame(codec, &m) {
+                                    let _ = tx.send(f).await;
+                                }
+                                replayed += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let err = CqMessage::error(
+                        None,
+                        &format!("Replay aborted on corruption: {e}"),
+                    );
+                    if let Some(f) = encode_frame(codec, &err) {
+                        let _ = tx.send(f).await;
+                    }
+                    break;
+                }
+            }
+        }
+        metrics::counter!(
+            "cq_bookmark_replay_total",
+            "topic" => topic_name_for_task.clone()
+        )
+        .increment(1);
+        metrics::histogram!(
+            "cq_bookmark_replay_entries",
+            "topic" => topic_name_for_task.clone()
+        )
+        .record(replayed as f64);
+        tracing::info!(
+            sub = %sub_id_for_task,
+            bookmark,
+            captured,
+            replayed,
+            "Bookmark replay complete"
+        );
+    });
+}
+
+fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
+    let topic_name = match &msg.topic {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing topic"));
+            return;
+        }
+    };
+
+    if !check_entitlement(session, &msg.command_id, &ctx.auth, Op::Subscribe, &topic_name) {
+        return;
+    }
+
+    // Queue subscribe — same shape as `sow_and_subscribe` for a queue.
+    if let Some(queue) = ctx.queues.get(&topic_name) {
+        let sub_id = session.next_sub_id();
+        session.subscriptions.push(sub_id.clone());
+        ctx.sessions.insert(
+            sub_id.clone(),
+            DeliveryRoute::with_codec(
+                session.tx.clone(),
+                topic_name.clone(),
+                session.codec(),
+            )
+            .with_session(session.id.clone()),
+        );
+        queue.add_consumer(sub_id.clone(), &ctx.sessions);
+        let mut ack = CqMessage::ack_ok(msg.command_id);
+        ack.sub_id = Some(sub_id);
+        let _ = session.send_message(&ack);
+        return;
+    }
+
+    let topics = &ctx.topics;
+    let registry = &ctx.sessions;
+    let sql = build_sql(&msg);
+    let sub_id = session.next_sub_id();
+
+    if let Some(topic) = topics.get(&topic_name) {
+        let conflation_ms = topic.conflation_ms();
+        match topic.subscribe(sub_id.clone(), &sql) {
+            Ok(_) => {
+                session.subscriptions.push(sub_id.clone());
+                registry.insert(
+                    sub_id.clone(),
+                    build_route(
+                        session.tx.clone(),
+                        topic_name.clone(),
+                        sub_id.clone(),
+                        conflation_ms,
+                        session.codec(),
+                        session.id.clone(),
+                        msg.client_name.clone().or_else(|| session.username.clone()),
+                        Some(ctx.bookmark_store.clone()),
+                    ),
+                );
+                metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
+                    .increment(1.0);
+                // Ack via backpressure — see notes in handle_sow_and_subscribe.
+                let tx = session.tx.clone();
+                let codec_slot = session.codec.clone();
+                let ack_cmd_id = msg.command_id.clone();
+                let ack_sub_id = sub_id.clone();
+                tokio::spawn(async move {
+                    use crate::session::encode_frame;
+                    let codec = *codec_slot.lock();
+                    let mut ack = CqMessage::ack_ok(ack_cmd_id);
+                    ack.sub_id = Some(ack_sub_id);
+                    if let Some(f) = encode_frame(codec, &ack) {
+                        let _ = tx.send(f).await;
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    None,
+                    &format!("Subscribe error: {}", e),
+                ));
+            }
+        }
+    } else {
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id,
+            &format!("Topic not found: {}", topic_name),
+        ));
+    }
+}
+
+fn handle_unsubscribe(
+    session: &mut Session,
+    msg: CqMessage,
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    registry: &SessionRegistry,
+) {
+    let sub_id = match &msg.sub_id {
+        Some(id) => id.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing sub_id"));
+            return;
+        }
+    };
+
+    session.subscriptions.retain(|s| s != &sub_id);
+    if let Some((_, route)) = registry.remove(&sub_id) {
+        metrics::gauge!("cq_subscriptions_active", "topic" => route.topic.clone())
+            .decrement(1.0);
+        if let Some(topic) = topics.get(&route.topic) {
+            topic.unsubscribe(&sub_id);
+        }
+        // Queue cleanup happens via `cleanup_session_with_queues` on
+        // disconnect. Stale entries here are safe — the queue's
+        // `deliver` skips routes that aren't in the session registry.
+    }
+
+    let _ = session.send_message(&CqMessage::ack_ok(msg.command_id));
+}
+
+fn handle_sow_delete(
+    session: &mut Session,
+    msg: CqMessage,
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    auth: &SharedAuth,
+) {
+    let topic_name = match &msg.topic {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing topic"));
+            return;
+        }
+    };
+
+    if !check_entitlement(session, &msg.command_id, auth, Op::Delete, &topic_name) {
+        return;
+    }
+
+    let key = msg.data.as_ref().and_then(|d| {
+        d.as_object()
+            .and_then(|m| m.values().next())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    if let Some(key) = key {
+        if let Some(topic) = topics.get(&topic_name) {
+            match topic.delete(&key) {
+                Ok(seq_opt) => {
+                    let mut ack = CqMessage::ack_ok(msg.command_id);
+                    ack.sequence = seq_opt;
+                    let _ = session.send_message(&ack);
+                }
+                Err(e) => {
+                    let _ = session.send_message(&CqMessage::error(
+                        msg.command_id,
+                        &format!("Delete failed: {}", e),
+                    ));
+                }
+            }
+        }
+    } else {
+        let _ = session.send_message(&CqMessage::error(msg.command_id, "Missing key in data"));
+    }
+}
+
+fn build_route(
+    tx: crate::session::OutboundTx,
+    topic: String,
+    sub_id: String,
+    conflation_ms: Option<u64>,
+    codec: cq_protocol::serialization::Codec,
+    session_id: String,
+    client_name: Option<String>,
+    bookmark_store: Option<BookmarkStore>,
+) -> DeliveryRoute {
+    let route = match conflation_ms {
+        Some(ms) if ms > 0 => DeliveryRoute::with_conflation_codec(
+            tx,
+            topic,
+            sub_id,
+            Duration::from_millis(ms),
+            codec,
+        )
+        .with_session(session_id),
+        _ => DeliveryRoute::with_codec(tx, topic, codec).with_session(session_id),
+    };
+    route
+        .with_client_name(client_name)
+        .with_bookmark_store(bookmark_store)
+}
+
+/// Replace the SELECT projection in `sql` with only the topic's key
+/// columns. Preserves the rest of the statement (WHERE / ORDER BY /
+/// LIMIT) verbatim. Used by `send_keys` delta-subscribe so the
+/// initial snapshot delivers only key fields.
+fn build_keys_only_sql(sql: &str, key_cols: &[String]) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let Some(from_pos) = find_keyword(&upper, "FROM") else {
+        return sql.to_string();
+    };
+    let cols_csv: Vec<String> = key_cols
+        .iter()
+        .map(|c| {
+            // Dotted-path columns need backticks/quoting for sqlparser
+            // since `.` is otherwise interpreted as table.column. The
+            // existing SQL pipeline accepts unquoted identifiers in
+            // most cases; key columns in cqserver are typically simple,
+            // so leave as-is. Quote on demand if a `.` shows up.
+            if c.contains('.') {
+                format!("\"{}\"", c)
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    let mut out = String::with_capacity(sql.len() + 32);
+    out.push_str("SELECT ");
+    out.push_str(&cols_csv.join(", "));
+    out.push(' ');
+    out.push_str(&sql[from_pos..]);
+    out
+}
+
+/// AND the user's row-level entitlement filter (if any) into
+/// `msg.filter`. Called on every command that admits a `filter`
+/// parameter — `sow`, `subscribe`, `sow_and_subscribe`,
+/// `delta_subscribe`, `sow_delete` — to enforce the restriction
+/// server-side regardless of what the client sent.
+fn apply_entitlement_filter(msg: &mut CqMessage, auth: &SharedAuth, session: &Session) {
+    if !auth.required || session.username.is_none() {
+        return;
+    }
+    let username = session.username.as_deref().unwrap_or("");
+    let Some(ent_filter) = auth.row_filter_for(username) else {
+        return;
+    };
+    if msg.sql.is_some() {
+        // Raw-SQL clients aren't gated by the WHERE-rewrite path;
+        // their full SELECT is forwarded as-is. We don't try to
+        // splice into the parsed SQL here — that's S6's stretch
+        // goal. For now, deny the raw SQL when a row filter is
+        // configured to avoid silently leaking restricted rows.
+        msg.sql = None;
+        msg.filter = Some(ent_filter);
+        return;
+    }
+    let combined = match msg.filter.as_deref() {
+        Some(client) if !client.is_empty() => format!("({client}) AND ({ent_filter})"),
+        _ => ent_filter,
+    };
+    msg.filter = Some(combined);
+}
+
+fn build_sql(msg: &CqMessage) -> String {
+    // Inline `sql` field wins: the caller passes a full SELECT
+    // verbatim (used for aggregate queries that can't fit the
+    // projection-only options string). The FROM table is rewritten
+    // to the canonical placeholder so the topic name (which may
+    // contain `/`, etc.) doesn't reach the SQL parser.
+    if let Some(raw) = msg.sql.as_deref() {
+        return rewrite_from_to_t(raw);
+    }
+
+    // The FROM table name is irrelevant to execution — the topic was already
+    // resolved from msg.topic. Use a fixed identifier to avoid feeding
+    // arbitrary characters from the topic name (e.g. leading "/") into the
+    // SQL parser. Sidesteps audit item C-4.
+    let filter = msg.filter.as_deref().unwrap_or("");
+    let options = msg.options.as_deref().unwrap_or("");
+
+    let select = parse_option(options, "select").unwrap_or("*".into());
+    let order_by = parse_option(options, "order_by");
+    let top_n = parse_option(options, "top_n");
+
+    let mut sql = format!("SELECT {} FROM t", select);
+    if !filter.is_empty() {
+        sql.push_str(&format!(" WHERE {}", filter));
+    }
+    if let Some(ob) = order_by {
+        sql.push_str(&format!(" ORDER BY {}", ob));
+    }
+    if let Some(n) = top_n {
+        sql.push_str(&format!(" LIMIT {}", n));
+    }
+    sql
+}
+
+/// Replace whatever follows `FROM` (up to the next clause keyword or
+/// end-of-input) with the canonical placeholder identifier `t`. Lets
+/// callers write `... FROM /agg-trades ...` without the topic name
+/// being interpreted as a SQL identifier.
+fn rewrite_from_to_t(sql: &str) -> String {
+    let upper = sql.to_ascii_uppercase();
+    let Some(from_pos) = find_keyword(&upper, "FROM") else {
+        return sql.to_string();
+    };
+    let after_from = from_pos + 4;
+    // Find the start of the next clause boundary.
+    let clauses = [" WHERE ", " GROUP BY ", " ORDER BY ", " LIMIT ", " HAVING "];
+    let mut end = sql.len();
+    for kw in clauses {
+        if let Some(p) = upper[after_from..].find(kw) {
+            let abs = after_from + p;
+            if abs < end {
+                end = abs;
+            }
+        }
+    }
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(&sql[..after_from]);
+    out.push_str(" t");
+    out.push_str(&sql[end..]);
+    out
+}
+
+/// Find a keyword as a standalone token (preceded by start-of-input
+/// or whitespace, followed by whitespace). Avoids matching inside
+/// identifiers like `from_user`.
+fn find_keyword(upper: &str, kw: &str) -> Option<usize> {
+    let bytes = upper.as_bytes();
+    let kw_bytes = kw.as_bytes();
+    let mut i = 0;
+    while i + kw_bytes.len() <= bytes.len() {
+        if &bytes[i..i + kw_bytes.len()] == kw_bytes {
+            let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let after = i + kw_bytes.len();
+            let next_ok = after == bytes.len() || bytes[after].is_ascii_whitespace();
+            if prev_ok && next_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_option(options: &str, key: &str) -> Option<String> {
+    for part in options.split(',') {
+        let part = part.trim();
+        if let Some(eq_pos) = part.find('=') {
+            let k = &part[..eq_pos];
+            if k == key {
+                let v = &part[eq_pos + 1..];
+                let v = v.trim_start_matches('[').trim_end_matches(']');
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Walk a session's subscription list on disconnect and remove each entry
+/// from the registry + the owning topic / queue. Both transports call this
+/// on connection close.
+pub fn cleanup_session(session: &mut Session, ctx: &RouterContext) {
+    for sub_id in session.subscriptions.drain(..) {
+        if let Some((_, route)) = ctx.sessions.remove(&sub_id) {
+            metrics::gauge!("cq_subscriptions_active", "topic" => route.topic.clone())
+                .decrement(1.0);
+            if let Some(topic) = ctx.topics.get(&route.topic) {
+                topic.unsubscribe(&sub_id);
+            }
+            if let Some(queue) = ctx.queues.get(&route.topic) {
+                queue.remove_consumer(&sub_id);
+            }
+        }
+    }
+}
+
+/// Stream a SOW snapshot to one subscriber using chunked `SowBatch`
+/// frames. Iterates the topic's column store and projects rows in
+/// batches of `batch_size`, never materializing the full result. Each
+/// `tx.send(...).await` is backpressure-aware, so a slow consumer
+/// pauses iteration rather than dropping rows.
+///
+/// `ack_cmd_id == Some(cid)` triggers an ack frame (for
+/// sow_and_subscribe / subscribe). For one-shot SOW it should be `None`.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_streaming_snapshot(
+    topic: SharedTopic,
+    sql: String,
+    ack_cmd_id: Option<String>,
+    sub_id: String,
+    topic_label: String,
+    session_id: String,
+    codec_slot: crate::session::SharedCodec,
+    tx: crate::session::OutboundTx,
+    batch_size: usize,
+) {
+    use crate::session::encode_frame;
+    use std::time::Instant;
+
+    let codec = *codec_slot.lock();
+    let started = Instant::now();
+
+    // Optional ack — guaranteed-delivery, awaited.
+    if let Some(cid) = ack_cmd_id {
+        let mut ack = CqMessage::ack_ok(Some(cid));
+        ack.sub_id = Some(sub_id.clone());
+        if let Some(f) = encode_frame(codec, &ack) {
+            if tx.send(f).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // Streaming iteration runs on a blocking worker so the column
+    // store's read lock and per-row projection don't tie up the async
+    // runtime. Batches flow through a bounded channel that gives us
+    // pipelined backpressure (writer drains as iterator produces).
+    let (batch_tx, mut batch_rx) =
+        tokio::sync::mpsc::channel::<Vec<serde_json::Map<String, serde_json::Value>>>(4);
+    let topic_for_block = topic.clone();
+    let sql_for_block = sql.clone();
+    let topic_label_for_block = topic_label.clone();
+    let iter_handle: tokio::task::JoinHandle<Result<usize, String>> =
+        tokio::task::spawn_blocking(move || {
+            let mut err: Option<String> = None;
+            let total = topic_for_block
+                .query_streaming(&sql_for_block, batch_size, |batch| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if batch_tx.blocking_send(batch).is_err() {
+                        err = Some("consumer dropped".into());
+                    }
+                })
+                .map_err(|e| format!("query error on {}: {}", topic_label_for_block, e))?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+            Ok(total)
+        });
+
+    // group_begin carries the row count when known. For the streaming
+    // path we don't know it without scanning, so emit it as 0 — the
+    // total is reported on group_end via the snapshot-completion log.
+    if let Some(f) = encode_frame(codec, &CqMessage::group_begin(&sub_id, 0)) {
+        if tx.send(f).await.is_err() {
+            return;
+        }
+    }
+
+    let mut batches_sent: usize = 0;
+    let mut rows_sent: usize = 0;
+    while let Some(batch) = batch_rx.recv().await {
+        let n = batch.len();
+        if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, batch)) {
+            if tx.send(f).await.is_err() {
+                tracing::warn!(
+                    session = %session_id,
+                    topic = %topic_label,
+                    rows_sent,
+                    "SOW snapshot aborted — session disconnected"
+                );
+                return;
+            }
+        }
+        batches_sent += 1;
+        rows_sent += n;
+    }
+
+    // Wait for the iterator to finish — surfaces any query error.
+    let total = match iter_handle.await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                let _ = tx.send(f).await;
+            }
+            return;
+        }
+        Err(_) => return,
+    };
+
+    if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
+        let _ = tx.send(f).await;
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    metrics::counter!("cq_sow_rows_total", "topic" => topic_label.clone())
+        .increment(total as u64);
+    metrics::histogram!("cq_sow_query_latency_us", "topic" => topic_label.clone())
+        .record(started.elapsed().as_micros() as f64);
+    tracing::info!(
+        session = %session_id,
+        topic = %topic_label,
+        rows = total,
+        batches = batches_sent,
+        elapsed_ms,
+        "SOW snapshot delivered"
+    );
+}

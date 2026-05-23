@@ -1,0 +1,300 @@
+/*
+ * Stockflux Design System — Design Tokens
+ *
+ * Inspired by the Scott Logic / OpenFin "Stockflux" trading
+ * terminal: deep navy ground, vivid mint-teal accent, sharp
+ * corners, monospace numerics, financial-trading semantics.
+ *
+ * Two modes (dark / light). Fully shadcn/ui compatible —
+ * HSL triplets exposed on the standard shadcn variables, plus
+ * an extended `--sf-*` namespace for trading specifics.
+ */
+
+/* ─────────────────────────────── DARK ─────────────────────────── */
+:root,
+[data-theme="dark"] {
+  /* ── shadcn/ui surface tokens (HSL triplets) ── */
+  --background: 215 18% 7%;           /* #0d1219 desaturated navy-grey */
+  --foreground: 210 8% 94%;            /* #f1f4f6 soft mint-white */
+
+  --card: 215 14% 11%;                 /* #1a212a panel */
+  --card-foreground: 210 8% 94%;
+  --popover: 215 13% 18%;              /* #2a323d floating */
+  --popover-foreground: 210 8% 94%;
+
+  --primary: 173 80% 40%;              /* #14b8a6 deeper teal — readable buttons */
+  --primary-foreground: 211 47% 8%;
+
+  --secondary: 215 11% 22%;            /* #363e49 raised */
+  --secondary-foreground: 210 8% 94%;
+
+  --muted: 215 12% 17%;                /* #2a323d */
+  --muted-foreground: 210 6% 58%;      /* #8c969d */
+
+  --accent: 172 66% 50%;               /* same as primary */
+  --accent-foreground: 211 47% 8%;
+
+  --destructive: 354 86% 65%;          /* #f25668 */
+  --destructive-foreground: 0 0% 100%;
+
+  --border: 215 14% 21%;               /* #363e49 */
+  --input: 215 14% 21%;
+  --ring: 172 66% 50%;
+  --radius: 3px;                       /* sharp, terminal-y */
+
+  /* ── Sidebar (for shadcn/ui sidebar pattern) ── */
+  --sidebar-background: 215 22% 6%;
+  --sidebar-foreground: 210 8% 94%;
+  --sidebar-primary: 172 66% 50%;
+  --sidebar-primary-foreground: 215 18% 7%;
+  --sidebar-accent: 215 13% 16%;
+  --sidebar-accent-foreground: 210 8% 94%;
+  --sidebar-border: 215 14% 18%;
+  --sidebar-ring: 172 66% 50%;
+
+  /* ── Chart palette ── */
+  --chart-1: 172 66% 50%;              /* mint-teal */
+  --chart-2: 199 89% 60%;              /* cyan */
+  --chart-3: 268 70% 70%;              /* lavender */
+  --chart-4: 45  93% 60%;              /* amber */
+  --chart-5: 354 86% 65%;              /* rose */
+
+  /* ── Stockflux surface scale (desaturated navy-grey) ── */
+  --sf-bg:        #0d1219;             /* page */
+  --sf-bg-1:      #161c25;             /* sunken */
+  --sf-bg-2:      #1a212a;             /* card / panel */
+  --sf-bg-3:      #2a323d;             /* raised */
+  --sf-bg-4:      #363e49;             /* hover */
+  --sf-bg-5:      #454e5a;             /* active / divider tint */
+
+  /* ── Text scale ── */
+  --sf-t-0:       #f1f4f6;             /* primary */
+  --sf-t-1:       #cfd5da;             /* secondary */
+  --sf-t-2:       #8c969d;             /* tertiary / labels */
+  --sf-t-3:       #636c74;             /* muted */
+  --sf-t-4:       #424950;             /* disabled */
+
+  /* ── Borders ── */
+  --sf-border:    #2d3540;             /* default */
+  --sf-border-2:  #3f4854;             /* prominent */
+  --sf-border-3:  #485058;             /* focus-adjacent */
+
+  /* ── Brand / Accent (mint-teal) ── */
+  --sf-teal:      #2dd4bf;             /* signature */
+  --sf-teal-hi:   #5eead4;             /* hover */
+  --sf-teal-lo:   #14b8a6;             /* pressed */
+  --sf-teal-soft: rgba(45,212,191,0.12);
+  --sf-teal-ring: rgba(45,212,191,0.42);
+  --sf-teal-glow: 0 0 0 3px rgba(45,212,191,0.32);
+
+  /* ── Financial semantics ── */
+  --sf-up:        #2dd4bf;             /* buy / positive (matches brand) */
+  --sf-up-hi:     #5eead4;
+  --sf-up-soft:   rgba(45,212,191,0.13);
+  --sf-up-strip:  rgba(45,212,191,0.06);
+
+  --sf-down:      #f25668;             /* sell / negative */
+  --sf-down-hi:   #ff7484;
+  --sf-down-soft: rgba(242,86,104,0.13);
+  --sf-down-strip:rgba(242,86,104,0.06);
+
+  --sf-flat:      #8aa0ad;             /* unchanged tick */
+
+  /* ── Status ── */
+  --sf-info:      #38bdf8;
+  --sf-info-soft: rgba(56,189,248,0.13);
+  --sf-warn:      #f5c14b;
+  --sf-warn-soft: rgba(245,193,75,0.13);
+  --sf-success:   #2dd4bf;
+  --sf-error:     #f25668;
+
+  /* ── Order Book / strip overlays ── */
+  --sf-bid-fill:  rgba(45,212,191,0.16);
+  --sf-ask-fill:  rgba(242,86,104,0.16);
+
+  /* ── Typography ── */
+  --sf-font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --sf-font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+
+  --sf-fs-2xs: 10px;
+  --sf-fs-xs:  11px;
+  --sf-fs-sm:  12px;
+  --sf-fs-md:  13px;
+  --sf-fs-lg:  14px;
+  --sf-fs-xl:  16px;
+  --sf-fs-2xl: 20px;
+  --sf-fs-3xl: 28px;
+  --sf-fs-4xl: 40px;
+  --sf-fs-5xl: 56px;
+
+  /* ── Motion ── */
+  --sf-t-instant:  80ms cubic-bezier(0.4,0,0.6,1);
+  --sf-t-fast:    140ms cubic-bezier(0.4,0,0.2,1);
+  --sf-t-normal:  220ms cubic-bezier(0.4,0,0.2,1);
+  --sf-t-slow:    420ms cubic-bezier(0.4,0,0.2,1);
+  --sf-t-tick:    900ms cubic-bezier(0.25,0.1,0.25,1);
+
+  /* ── Elevation ── */
+  --sf-shadow-sm:  0 1px 2px rgba(0,0,0,0.4);
+  --sf-shadow-md:  0 4px 12px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.04) inset;
+  --sf-shadow-lg:  0 10px 30px rgba(0,0,0,0.5), 0 1px 0 rgba(255,255,255,0.04) inset;
+  --sf-shadow-glow: 0 0 0 3px rgba(45,212,191,0.28);
+
+  --sf-radius-sm: 2px;
+  --sf-radius:    3px;
+  --sf-radius-md: 5px;
+  --sf-radius-lg: 8px;
+
+  --sf-scrollbar: #2c4660;
+
+  color-scheme: dark;
+}
+
+/* ─────────────────────────────── LIGHT ────────────────────────── */
+[data-theme="light"] {
+  --background: 200 40% 97%;           /* #f3f7f9 */
+  --foreground: 211 60% 7%;           /* #06121f */
+
+  --card: 0 0% 100%;                   /* #ffffff */
+  --card-foreground: 211 60% 7%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 211 60% 7%;
+
+  --primary: 175 78% 26%;              /* #0f766e AA-safe teal */
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 200 28% 92%;            /* #e3ecf0 */
+  --secondary-foreground: 211 47% 16%;
+
+  --muted: 200 28% 92%;
+  --muted-foreground: 208 18% 38%;     /* #3e5663 */
+
+  --accent: 175 78% 26%;
+  --accent-foreground: 0 0% 100%;
+
+  --destructive: 350 78% 42%;          /* #be1f43 */
+  --destructive-foreground: 0 0% 100%;
+
+  --border: 205 24% 78%;               /* #cfd9df */
+  --input: 205 24% 78%;
+  --ring: 175 78% 26%;
+  --radius: 3px;
+
+  --sidebar-background: 200 40% 97%;
+  --sidebar-foreground: 211 60% 7%;
+  --sidebar-primary: 175 78% 26%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 200 28% 92%;
+  --sidebar-accent-foreground: 211 47% 16%;
+  --sidebar-border: 205 24% 78%;
+  --sidebar-ring: 175 78% 26%;
+
+  --chart-1: 175 78% 26%;
+  --chart-2: 199 89% 38%;
+  --chart-3: 268 60% 48%;
+  --chart-4: 35  85% 42%;
+  --chart-5: 350 78% 42%;
+
+  --sf-bg:        #f3f7f9;
+  --sf-bg-1:      #ffffff;
+  --sf-bg-2:      #ffffff;
+  --sf-bg-3:      #eef3f6;
+  --sf-bg-4:      #e3ecf0;
+  --sf-bg-5:      #d4e0e7;
+
+  --sf-t-0:       #06121f;
+  --sf-t-1:       #1c344d;
+  --sf-t-2:       #3e5663;
+  --sf-t-3:       #7d92a0;
+  --sf-t-4:       #b1bfc8;
+
+  --sf-border:    #c5d1da;
+  --sf-border-2:  #a6b6c2;
+  --sf-border-3:  #98aab6;
+
+  --sf-teal:      #0f766e;
+  --sf-teal-hi:   #0a5d56;
+  --sf-teal-lo:   #115e54;
+  --sf-teal-soft: rgba(15,118,110,0.10);
+  --sf-teal-ring: rgba(15,118,110,0.32);
+  --sf-teal-glow: 0 0 0 1px rgba(15,118,110,0.32), 0 0 12px rgba(15,118,110,0.18);
+
+  --sf-up:        #0f766e;
+  --sf-up-hi:     #0a5d56;
+  --sf-up-soft:   rgba(15,118,110,0.10);
+  --sf-up-strip:  rgba(15,118,110,0.05);
+
+  --sf-down:      #be1f43;
+  --sf-down-hi:   #9e1838;
+  --sf-down-soft: rgba(190,31,67,0.10);
+  --sf-down-strip:rgba(190,31,67,0.05);
+
+  --sf-flat:      #3e5663;
+
+  --sf-info:      #0e7490;
+  --sf-info-soft: rgba(14,116,144,0.10);
+  --sf-warn:      #b27607;
+  --sf-warn-soft: rgba(178,118,7,0.11);
+  --sf-success:   #0f766e;
+  --sf-error:     #be1f43;
+
+  --sf-bid-fill:  rgba(15,118,110,0.13);
+  --sf-ask-fill:  rgba(190,31,67,0.11);
+
+  --sf-shadow-sm: 0 1px 2px rgba(12,29,48,0.06);
+  --sf-shadow-md: 0 2px 8px rgba(12,29,48,0.08), 0 1px 0 rgba(255,255,255,0.6) inset;
+  --sf-shadow-lg: 0 12px 32px rgba(12,29,48,0.12), 0 1px 0 rgba(255,255,255,0.6) inset;
+  --sf-shadow-glow: 0 0 0 3px rgba(15,118,110,0.22);
+
+  --sf-scrollbar: #a6b6c2;
+
+  color-scheme: light;
+}
+
+/* ─────────────────────────────── BASE ─────────────────────────── */
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--sf-font-sans);
+  font-size: 13px;
+  background: var(--sf-bg);
+  color: var(--sf-t-0);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background 220ms ease, color 220ms ease;
+}
+
+::selection { background: var(--sf-teal-soft); color: var(--sf-t-0); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--sf-scrollbar); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--sf-border-3); background-clip: padding-box; border: 2px solid transparent; }
+
+@keyframes sfPulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--sf-teal-ring); }
+  50%      { box-shadow: 0 0 0 6px transparent; }
+}
+@keyframes sfFlashUp   { 0% { background: var(--sf-up-soft);   } 100% { background: transparent; } }
+@keyframes sfFlashDown { 0% { background: var(--sf-down-soft); } 100% { background: transparent; } }
+@keyframes sfSpin      { to { transform: rotate(360deg); } }
+@keyframes sfShimmer   { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+button:focus-visible, a:focus-visible, [role="button"]:focus-visible {
+  outline: none;
+  box-shadow: var(--sf-shadow-glow);
+}
+/* Inputs/textareas handle their own focus via border-color in JS to avoid
+   doubling up with their wrapper label's focused border. */
+input:focus, textarea:focus, select:focus { outline: none; }
+
+.ag-root-wrapper :focus-visible,
+.ag-root-wrapper input:focus-visible,
+.ag-root-wrapper button:focus-visible { box-shadow: none !important; }
+
+.sf-mono { font-family: var(--sf-font-mono); font-variant-numeric: tabular-nums; }

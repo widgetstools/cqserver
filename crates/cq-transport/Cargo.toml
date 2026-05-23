@@ -1,0 +1,33 @@
+[package]
+name = "cq-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cq-protocol = { path = "../cq-protocol" }
+cq-core = { path = "../cq-core" }
+cq-txlog = { path = "../cq-txlog" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+dashmap.workspace = true
+uuid.workspace = true
+crossbeam-channel.workspace = true
+metrics.workspace = true
+bcrypt.workspace = true
+rmp-serde.workspace = true
+parking_lot.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+
+[dev-dependencies]
+compact_str.workspace = true
+tempfile.workspace = true
+parking_lot.workspace = true

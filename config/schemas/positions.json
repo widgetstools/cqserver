@@ -1,0 +1,12 @@
+{
+  "positionKey": "string",
+  "book": "string",
+  "cusip": "string",
+  "ticker": "string",
+  "netQty": "long",
+  "avgCost": "double",
+  "lastMid": "double",
+  "marketValue": "double",
+  "unrealizedPnl": "double",
+  "trades": "long"
+}

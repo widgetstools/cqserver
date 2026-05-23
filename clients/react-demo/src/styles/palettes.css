@@ -1,0 +1,645 @@
+/*
+ * Stockflux — Palette Variants
+ *
+ * Base theme (no [data-palette]) = original Stockflux Teal.
+ *
+ * Four alternates, all institutional-grade choices for a serious
+ * trading desk. Surfaces are near-neutral with a subtle hue
+ * undertone (5–10% saturation); brand stays vivid for chrome.
+ *
+ * Available: teal · indigo · amber · slate · grey
+ *
+ * Trading semantics LOCKED to the Stockflux originals across every
+ * palette (up = mint-teal, down = rose) — green/red read the same
+ * regardless of brand.
+ */
+
+/* ───────────────────────── INDIGO · DARK ─────────────────────────── */
+[data-palette="indigo"][data-theme="dark"] {
+  --background: 232 12% 7%;
+  --foreground: 230 10% 96%;
+  --card: 232 10% 10%;
+  --card-foreground: 230 10% 96%;
+  --popover: 232 10% 13%;
+  --popover-foreground: 230 10% 96%;
+  --primary: 234 89% 68%;
+  --primary-foreground: 232 30% 3%;
+  --secondary: 232 6% 18%;
+  --secondary-foreground: 230 10% 96%;
+  --muted: 232 6% 15%;
+  --muted-foreground: 230 5% 60%;
+  --accent: 234 89% 68%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 354 86% 65%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 232 6% 21%;
+  --input: 232 6% 21%;
+  --ring: 234 89% 68%;
+
+  --sidebar-background: 232 10% 8%;
+  --sidebar-foreground: 230 10% 96%;
+  --sidebar-primary: 234 89% 68%;
+  --sidebar-primary-foreground: 232 30% 3%;
+  --sidebar-accent: 232 6% 15%;
+  --sidebar-accent-foreground: 230 10% 96%;
+  --sidebar-border: 232 6% 18%;
+  --sidebar-ring: 234 89% 68%;
+
+  --chart-1: 234 89% 70%;
+  --chart-2: 172 66% 50%;
+  --chart-3: 199 89% 60%;
+  --chart-4: 45  93% 60%;
+  --chart-5: 354 86% 65%;
+
+  --sf-bg:       #0e1013;
+  --sf-bg-1:     #161a1e;
+  --sf-bg-2:     #1a1e22;
+  --sf-bg-3:     #272b32;
+  --sf-bg-4:     #3a3e48;
+  --sf-bg-5:     #525864;
+  --sf-t-0:      #f4f5f6;
+  --sf-t-1:      #d4d6da;
+  --sf-t-2:      #92949a;
+  --sf-t-3:      #6a6c73;
+  --sf-t-4:      #494b51;
+  --sf-border:   #272b32;
+  --sf-border-2: #3d3f45;
+  --sf-border-3: #56585f;
+
+  --sf-teal:      #818cf8;
+  --sf-teal-hi:   #a5b4fc;
+  --sf-teal-lo:   #6366f1;
+  --sf-teal-soft: rgba(99,102,241,0.12);
+  --sf-teal-ring: rgba(99,102,241,0.36);
+
+  --sf-up:        #2dd4bf;
+  --sf-up-hi:     #5eead4;
+  --sf-up-soft:   rgba(45,212,191,0.13);
+  --sf-up-strip:  rgba(45,212,191,0.05);
+  --sf-down:      #f25668;
+  --sf-down-hi:   #ff7484;
+  --sf-down-soft: rgba(242,86,104,0.13);
+  --sf-down-strip:rgba(242,86,104,0.05);
+  --sf-flat:      #92949a;
+  --sf-info:      #38bdf8;
+  --sf-info-soft: rgba(56,189,248,0.13);
+  --sf-warn:      #f5c14b;
+  --sf-warn-soft: rgba(245,193,75,0.13);
+  --sf-success:   #2dd4bf;
+  --sf-error:     #f25668;
+  --sf-bid-fill:  rgba(45,212,191,0.16);
+  --sf-ask-fill:  rgba(242,86,104,0.16);
+  --sf-scrollbar: #3d3f45;
+}
+
+/* ───────────────────────── INDIGO · LIGHT ────────────────────────── */
+[data-palette="indigo"][data-theme="light"] {
+  --background: 232 10% 97%;
+  --foreground: 232 14% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 232 14% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 232 14% 12%;
+  --primary: 239 84% 56%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 232 8% 92%;
+  --secondary-foreground: 232 14% 18%;
+  --muted: 232 8% 92%;
+  --muted-foreground: 232 6% 38%;
+  --accent: 239 84% 56%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 350 78% 42%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 232 7% 84%;
+  --input: 232 7% 84%;
+  --ring: 239 84% 56%;
+
+  --sidebar-background: 232 10% 97%;
+  --sidebar-foreground: 232 14% 12%;
+  --sidebar-primary: 239 84% 56%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 232 8% 92%;
+  --sidebar-accent-foreground: 232 14% 18%;
+  --sidebar-border: 232 7% 84%;
+  --sidebar-ring: 239 84% 56%;
+
+  --chart-1: 239 84% 56%;
+  --chart-2: 172 76% 32%;
+  --chart-3: 199 89% 38%;
+  --chart-4: 35  85% 42%;
+  --chart-5: 350 78% 42%;
+
+  --sf-bg:       #f5f5f7;
+  --sf-bg-1:     #ffffff;
+  --sf-bg-2:     #ffffff;
+  --sf-bg-3:     #edeef1;
+  --sf-bg-4:     #e2e3e8;
+  --sf-bg-5:     #cdcfd6;
+  --sf-t-0:      #181a1f;
+  --sf-t-1:      #1f222a;
+  --sf-t-2:      #51545c;
+  --sf-t-3:      #797c84;
+  --sf-t-4:      #aaadb4;
+  --sf-border:   #c8cad0;
+  --sf-border-2: #a8aab4;
+  --sf-border-3: #94969d;
+
+  --sf-teal:      #4f46e5;
+  --sf-teal-hi:   #4338ca;
+  --sf-teal-lo:   #3730a3;
+  --sf-teal-soft: rgba(79,70,229,0.10);
+  --sf-teal-ring: rgba(79,70,229,0.28);
+
+  --sf-up:        #0f766e;
+  --sf-up-hi:     #0a5d56;
+  --sf-up-soft:   rgba(15,118,110,0.10);
+  --sf-up-strip:  rgba(15,118,110,0.04);
+  --sf-down:      #be1f43;
+  --sf-down-hi:   #9e1838;
+  --sf-down-soft: rgba(190,31,67,0.10);
+  --sf-down-strip:rgba(190,31,67,0.04);
+  --sf-flat:      #51545c;
+  --sf-info:      #0e7490;
+  --sf-info-soft: rgba(14,116,144,0.10);
+  --sf-warn:      #b27607;
+  --sf-warn-soft: rgba(178,118,7,0.11);
+  --sf-success:   #0f766e;
+  --sf-error:     #be1f43;
+  --sf-bid-fill:  rgba(15,118,110,0.13);
+  --sf-ask-fill:  rgba(190,31,67,0.11);
+  --sf-scrollbar: #a8aab4;
+}
+
+/* ───────────────────────── AMBER · DARK ──────────────────────────── */
+/* Bloomberg-inspired: near-black warm chrome, vivid amber accent.
+   Iconic for a reason — amber reads instantly in dim lighting and
+   red/green PnL still pops cleanly against it. */
+[data-palette="amber"][data-theme="dark"] {
+  --background: 30 12% 4%;              /* #0a0907 */
+  --foreground: 36 14% 96%;
+  --card: 30 10% 8%;
+  --card-foreground: 36 14% 96%;
+  --popover: 30 7% 13%;
+  --popover-foreground: 36 14% 96%;
+  --primary: 38 92% 50%;               /* #f59e0b amber */
+  --primary-foreground: 30 30% 8%;
+  --secondary: 30 6% 16%;
+  --secondary-foreground: 36 14% 96%;
+  --muted: 30 6% 13%;
+  --muted-foreground: 32 6% 60%;
+  --accent: 38 92% 50%;
+  --accent-foreground: 30 30% 8%;
+  --destructive: 354 86% 65%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 30 6% 19%;
+  --input: 30 6% 19%;
+  --ring: 38 92% 50%;
+
+  --sidebar-background: 30 10% 4%;
+  --sidebar-foreground: 36 14% 96%;
+  --sidebar-primary: 38 92% 50%;
+  --sidebar-primary-foreground: 30 30% 8%;
+  --sidebar-accent: 30 6% 13%;
+  --sidebar-accent-foreground: 36 14% 96%;
+  --sidebar-border: 30 6% 16%;
+  --sidebar-ring: 38 92% 50%;
+
+  --chart-1: 38 92% 60%;
+  --chart-2: 172 66% 50%;
+  --chart-3: 199 89% 60%;
+  --chart-4: 12 80% 60%;
+  --chart-5: 354 86% 65%;
+
+  --sf-bg:       #0a0907;
+  --sf-bg-1:     #1a1814;
+  --sf-bg-2:     #1c1a14;
+  --sf-bg-3:     #2e2a20;
+  --sf-bg-4:     #3e392c;
+  --sf-bg-5:     #544c3a;
+  --sf-t-0:      #f8f4ea;
+  --sf-t-1:      #d4cebe;
+  --sf-t-2:      #9b958a;
+  --sf-t-3:      #716c62;
+  --sf-t-4:      #4b4740;
+  --sf-border:   #2b2820;
+  --sf-border-2: #3b372d;
+  --sf-border-3: #534e3f;
+
+  --sf-teal:      #fbbf24;             /* brand: vivid amber */
+  --sf-teal-hi:   #fcd34d;
+  --sf-teal-lo:   #f59e0b;
+  --sf-teal-soft: rgba(245,158,11,0.13);
+  --sf-teal-ring: rgba(245,158,11,0.40);
+
+  --sf-up:        #2dd4bf;
+  --sf-up-hi:     #5eead4;
+  --sf-up-soft:   rgba(45,212,191,0.13);
+  --sf-up-strip:  rgba(45,212,191,0.05);
+  --sf-down:      #f25668;
+  --sf-down-hi:   #ff7484;
+  --sf-down-soft: rgba(242,86,104,0.13);
+  --sf-down-strip:rgba(242,86,104,0.05);
+  --sf-flat:      #9b958a;
+  --sf-info:      #38bdf8;
+  --sf-info-soft: rgba(56,189,248,0.13);
+  --sf-warn:      #f5c14b;
+  --sf-warn-soft: rgba(245,193,75,0.13);
+  --sf-success:   #2dd4bf;
+  --sf-error:     #f25668;
+  --sf-bid-fill:  rgba(45,212,191,0.16);
+  --sf-ask-fill:  rgba(242,86,104,0.16);
+  --sf-scrollbar: #3b372d;
+}
+
+/* ───────────────────────── AMBER · LIGHT ─────────────────────────── */
+[data-palette="amber"][data-theme="light"] {
+  --background: 36 24% 96%;            /* #f6f1e8 warm paper */
+  --foreground: 28 30% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 28 30% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 28 30% 12%;
+  --primary: 25 90% 30%;               /* #92400e deep amber for AA on white */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 36 22% 90%;
+  --secondary-foreground: 28 30% 18%;
+  --muted: 36 22% 90%;
+  --muted-foreground: 32 14% 38%;
+  --accent: 25 90% 30%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 350 78% 42%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 36 18% 80%;
+  --input: 36 18% 80%;
+  --ring: 25 90% 30%;
+
+  --sidebar-background: 36 24% 96%;
+  --sidebar-foreground: 28 30% 12%;
+  --sidebar-primary: 25 90% 30%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 36 22% 90%;
+  --sidebar-accent-foreground: 28 30% 18%;
+  --sidebar-border: 36 18% 80%;
+  --sidebar-ring: 25 90% 30%;
+
+  --chart-1: 25 90% 30%;
+  --chart-2: 172 76% 32%;
+  --chart-3: 199 89% 38%;
+  --chart-4: 12 75% 45%;
+  --chart-5: 350 78% 42%;
+
+  --sf-bg:       #f6f1e8;
+  --sf-bg-1:     #ffffff;
+  --sf-bg-2:     #ffffff;
+  --sf-bg-3:     #efe9db;
+  --sf-bg-4:     #e3dbc9;
+  --sf-bg-5:     #cdc2a8;
+  --sf-t-0:      #1a140c;
+  --sf-t-1:      #36281a;
+  --sf-t-2:      #6c5d44;
+  --sf-t-3:      #8e7e62;
+  --sf-t-4:      #b5a888;
+  --sf-border:   #c9bb98;
+  --sf-border-2: #a99a76;
+  --sf-border-3: #94876a;
+
+  --sf-teal:      #92400e;             /* deep amber for buttons */
+  --sf-teal-hi:   #7c2d12;
+  --sf-teal-lo:   #631e09;
+  --sf-teal-soft: rgba(146,64,14,0.10);
+  --sf-teal-ring: rgba(146,64,14,0.28);
+
+  --sf-up:        #0f766e;
+  --sf-up-hi:     #0a5d56;
+  --sf-up-soft:   rgba(15,118,110,0.10);
+  --sf-up-strip:  rgba(15,118,110,0.04);
+  --sf-down:      #be1f43;
+  --sf-down-hi:   #9e1838;
+  --sf-down-soft: rgba(190,31,67,0.10);
+  --sf-down-strip:rgba(190,31,67,0.04);
+  --sf-flat:      #6c5d44;
+  --sf-info:      #0e7490;
+  --sf-info-soft: rgba(14,116,144,0.10);
+  --sf-warn:      #b27607;
+  --sf-warn-soft: rgba(178,118,7,0.11);
+  --sf-success:   #0f766e;
+  --sf-error:     #be1f43;
+  --sf-bid-fill:  rgba(15,118,110,0.13);
+  --sf-ask-fill:  rgba(190,31,67,0.11);
+  --sf-scrollbar: #a99a76;
+}
+
+/* ───────────────────────── SLATE-BLUE · DARK ─────────────────────── */
+/* Industrial cool: pewter-grey chrome with a clear sapphire accent.
+   The "terminal blue" feel — different from Indigo (which is warmer
+   and more purple) — and different from Teal (which is more cyan). */
+[data-palette="slate"][data-theme="dark"] {
+  --background: 215 14% 7%;           /* #0d1014 */
+  --foreground: 215 12% 96%;
+  --card: 215 12% 10%;
+  --card-foreground: 215 12% 96%;
+  --popover: 215 11% 13%;
+  --popover-foreground: 215 12% 96%;
+  --primary: 217 91% 60%;              /* #3b82f6 sapphire */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 215 8% 18%;
+  --secondary-foreground: 215 12% 96%;
+  --muted: 215 8% 15%;
+  --muted-foreground: 215 6% 60%;
+  --accent: 217 91% 60%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 354 86% 65%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 215 8% 21%;
+  --input: 215 8% 21%;
+  --ring: 217 91% 60%;
+
+  --sidebar-background: 215 12% 8%;
+  --sidebar-foreground: 215 12% 96%;
+  --sidebar-primary: 217 91% 60%;
+  --sidebar-primary-foreground: 215 28% 6%;
+  --sidebar-accent: 215 8% 15%;
+  --sidebar-accent-foreground: 215 12% 96%;
+  --sidebar-border: 215 8% 18%;
+  --sidebar-ring: 217 91% 60%;
+
+  --chart-1: 217 91% 60%;
+  --chart-2: 172 66% 50%;
+  --chart-3: 38  92% 50%;
+  --chart-4: 268 70% 70%;
+  --chart-5: 354 86% 65%;
+
+  --sf-bg:       #0d1014;
+  --sf-bg-1:     #161a1f;
+  --sf-bg-2:     #1c2026;
+  --sf-bg-3:     #2d323a;
+  --sf-bg-4:     #3e434c;
+  --sf-bg-5:     #525762;
+  --sf-t-0:      #f3f5f7;
+  --sf-t-1:      #d2d5db;
+  --sf-t-2:      #8f939a;
+  --sf-t-3:      #686d73;
+  --sf-t-4:      #494c52;
+  --sf-border:   #2d323a;
+  --sf-border-2: #3e4148;
+  --sf-border-3: #565a61;
+
+  --sf-teal:      #60a5fa;             /* sapphire — light enough on dark */
+  --sf-teal-hi:   #93c5fd;
+  --sf-teal-lo:   #3b82f6;
+  --sf-teal-soft: rgba(59,130,246,0.13);
+  --sf-teal-ring: rgba(59,130,246,0.38);
+
+  --sf-up:        #2dd4bf;
+  --sf-up-hi:     #5eead4;
+  --sf-up-soft:   rgba(45,212,191,0.13);
+  --sf-up-strip:  rgba(45,212,191,0.05);
+  --sf-down:      #f25668;
+  --sf-down-hi:   #ff7484;
+  --sf-down-soft: rgba(242,86,104,0.13);
+  --sf-down-strip:rgba(242,86,104,0.05);
+  --sf-flat:      #8f939a;
+  --sf-info:      #38bdf8;
+  --sf-info-soft: rgba(56,189,248,0.13);
+  --sf-warn:      #f5c14b;
+  --sf-warn-soft: rgba(245,193,75,0.13);
+  --sf-success:   #2dd4bf;
+  --sf-error:     #f25668;
+  --sf-bid-fill:  rgba(45,212,191,0.16);
+  --sf-ask-fill:  rgba(242,86,104,0.16);
+  --sf-scrollbar: #3e4148;
+}
+
+/* ───────────────────────── SLATE-BLUE · LIGHT ────────────────────── */
+[data-palette="slate"][data-theme="light"] {
+  --background: 215 14% 97%;           /* #f1f3f6 cool paper */
+  --foreground: 215 28% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 215 28% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 215 28% 12%;
+  --primary: 221 83% 53%;               /* #2563eb */
+  --primary-foreground: 0 0% 100%;
+  --secondary: 215 12% 91%;
+  --secondary-foreground: 215 28% 18%;
+  --muted: 215 12% 91%;
+  --muted-foreground: 215 10% 38%;
+  --accent: 221 83% 53%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 350 78% 42%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 215 10% 82%;
+  --input: 215 10% 82%;
+  --ring: 221 83% 53%;
+
+  --sidebar-background: 215 14% 97%;
+  --sidebar-foreground: 215 28% 12%;
+  --sidebar-primary: 221 83% 53%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 215 12% 91%;
+  --sidebar-accent-foreground: 215 28% 18%;
+  --sidebar-border: 215 10% 82%;
+  --sidebar-ring: 221 83% 53%;
+
+  --chart-1: 221 83% 53%;
+  --chart-2: 172 76% 32%;
+  --chart-3: 25 90% 30%;
+  --chart-4: 268 60% 48%;
+  --chart-5: 350 78% 42%;
+
+  --sf-bg:       #f1f3f6;
+  --sf-bg-1:     #ffffff;
+  --sf-bg-2:     #ffffff;
+  --sf-bg-3:     #e9ecf0;
+  --sf-bg-4:     #dde1e7;
+  --sf-bg-5:     #c8cdd5;
+  --sf-t-0:      #0b1521;
+  --sf-t-1:      #1e2937;
+  --sf-t-2:      #525d6c;
+  --sf-t-3:      #7a8392;
+  --sf-t-4:      #abb1bb;
+  --sf-border:   #c4c9d0;
+  --sf-border-2: #a4abb4;
+  --sf-border-3: #8e94a0;
+
+  --sf-teal:      #2563eb;
+  --sf-teal-hi:   #1d4ed8;
+  --sf-teal-lo:   #1e40af;
+  --sf-teal-soft: rgba(37,99,235,0.10);
+  --sf-teal-ring: rgba(37,99,235,0.28);
+
+  --sf-up:        #0f766e;
+  --sf-up-hi:     #0a5d56;
+  --sf-up-soft:   rgba(15,118,110,0.10);
+  --sf-up-strip:  rgba(15,118,110,0.04);
+  --sf-down:      #be1f43;
+  --sf-down-hi:   #9e1838;
+  --sf-down-soft: rgba(190,31,67,0.10);
+  --sf-down-strip:rgba(190,31,67,0.04);
+  --sf-flat:      #525d6c;
+  --sf-info:      #0e7490;
+  --sf-info-soft: rgba(14,116,144,0.10);
+  --sf-warn:      #b27607;
+  --sf-warn-soft: rgba(178,118,7,0.11);
+  --sf-success:   #0f766e;
+  --sf-error:     #be1f43;
+  --sf-bid-fill:  rgba(15,118,110,0.13);
+  --sf-ask-fill:  rgba(190,31,67,0.11);
+  --sf-scrollbar: #a4abb4;
+}
+
+/* ───────────────────────── GREY · DARK ───────────────────────────── */
+[data-palette="grey"][data-theme="dark"] {
+  --background: 220 6% 3%;
+  --foreground: 220 5% 97%;
+  --card: 220 6% 7%;
+  --card-foreground: 220 5% 97%;
+  --popover: 220 4% 12%;
+  --popover-foreground: 220 5% 97%;
+  --primary: 220 4% 88%;
+  --primary-foreground: 220 8% 9%;
+  --secondary: 220 4% 14%;
+  --secondary-foreground: 220 5% 97%;
+  --muted: 220 4% 11%;
+  --muted-foreground: 220 4% 60%;
+  --accent: 220 4% 14%;
+  --accent-foreground: 220 5% 97%;
+  --destructive: 354 86% 65%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 4% 18%;
+  --input: 220 4% 18%;
+  --ring: 220 4% 88%;
+
+  --sidebar-background: 220 4% 4%;
+  --sidebar-foreground: 220 5% 97%;
+  --sidebar-primary: 220 4% 88%;
+  --sidebar-primary-foreground: 220 8% 9%;
+  --sidebar-accent: 220 4% 11%;
+  --sidebar-accent-foreground: 220 5% 97%;
+  --sidebar-border: 220 4% 15%;
+  --sidebar-ring: 220 4% 88%;
+
+  --chart-1: 220 4% 88%;
+  --chart-2: 172 66% 50%;
+  --chart-3: 199 89% 60%;
+  --chart-4: 45  93% 60%;
+  --chart-5: 354 86% 65%;
+
+  --sf-bg:       #070708;
+  --sf-bg-1:     #101113;
+  --sf-bg-2:     #15161a;
+  --sf-bg-3:     #252628;
+  --sf-bg-4:     #34363a;
+  --sf-bg-5:     #46474c;
+  --sf-t-0:      #fbfbfc;
+  --sf-t-1:      #dadcde;
+  --sf-t-2:      #a1a2a5;
+  --sf-t-3:      #717275;
+  --sf-t-4:      #515255;
+  --sf-border:   #15171b;
+  --sf-border-2: #3e3f43;
+  --sf-border-3: #515255;
+
+  --sf-teal:      #fbfbfc;
+  --sf-teal-hi:   #ffffff;
+  --sf-teal-lo:   #e3e4e6;
+  --sf-teal-soft: rgba(248,249,250,0.08);
+  --sf-teal-ring: rgba(248,249,250,0.28);
+
+  --sf-up:        #2dd4bf;
+  --sf-up-hi:     #5eead4;
+  --sf-up-soft:   rgba(45,212,191,0.13);
+  --sf-up-strip:  rgba(45,212,191,0.05);
+  --sf-down:      #f25668;
+  --sf-down-hi:   #ff7484;
+  --sf-down-soft: rgba(242,86,104,0.13);
+  --sf-down-strip:rgba(242,86,104,0.05);
+  --sf-flat:      #a3a3a3;
+  --sf-info:      #38bdf8;
+  --sf-info-soft: rgba(56,189,248,0.13);
+  --sf-warn:      #f5c14b;
+  --sf-warn-soft: rgba(245,193,75,0.13);
+  --sf-success:   #2dd4bf;
+  --sf-error:     #f25668;
+  --sf-bid-fill:  rgba(45,212,191,0.16);
+  --sf-ask-fill:  rgba(242,86,104,0.16);
+  --sf-scrollbar: #404040;
+}
+
+/* ───────────────────────── GREY · LIGHT ──────────────────────────── */
+[data-palette="grey"][data-theme="light"] {
+  --background: 220 6% 98%;
+  --foreground: 220 8% 9%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 8% 9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 220 8% 9%;
+  --primary: 220 8% 9%;
+  --primary-foreground: 220 6% 98%;
+  --secondary: 220 5% 92%;
+  --secondary-foreground: 220 8% 18%;
+  --muted: 220 5% 92%;
+  --muted-foreground: 220 6% 40%;
+  --accent: 220 5% 92%;
+  --accent-foreground: 220 8% 9%;
+  --destructive: 350 78% 42%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 220 5% 84%;
+  --input: 220 5% 84%;
+  --ring: 220 8% 9%;
+
+  --sidebar-background: 220 6% 98%;
+  --sidebar-foreground: 220 8% 9%;
+  --sidebar-primary: 220 8% 9%;
+  --sidebar-primary-foreground: 220 6% 98%;
+  --sidebar-accent: 220 5% 92%;
+  --sidebar-accent-foreground: 220 8% 18%;
+  --sidebar-border: 220 5% 84%;
+  --sidebar-ring: 220 8% 9%;
+
+  --chart-1: 220 8% 9%;
+  --chart-2: 172 76% 32%;
+  --chart-3: 199 89% 38%;
+  --chart-4: 35  85% 42%;
+  --chart-5: 350 78% 42%;
+
+  --sf-bg:       #fbfbfc;
+  --sf-bg-1:     #ffffff;
+  --sf-bg-2:     #ffffff;
+  --sf-bg-3:     #f2f3f4;
+  --sf-bg-4:     #e6e7e9;
+  --sf-bg-5:     #d3d4d6;
+  --sf-t-0:      #040506;
+  --sf-t-1:      #15171b;
+  --sf-t-2:      #515257;
+  --sf-t-3:      #717276;
+  --sf-t-4:      #a1a2a5;
+  --sf-border:   #e3e4e6;
+  --sf-border-2: #dadcde;
+  --sf-border-3: #a1a2a5;
+
+  --sf-teal:      #040506;
+  --sf-teal-hi:   #15171b;
+  --sf-teal-lo:   #3e3f43;
+  --sf-teal-soft: rgba(12,13,14,0.06);
+  --sf-teal-ring: rgba(12,13,14,0.18);
+
+  --sf-up:        #0f766e;
+  --sf-up-hi:     #0a5d56;
+  --sf-up-soft:   rgba(15,118,110,0.10);
+  --sf-up-strip:  rgba(15,118,110,0.04);
+  --sf-down:      #be1f43;
+  --sf-down-hi:   #9e1838;
+  --sf-down-soft: rgba(190,31,67,0.10);
+  --sf-down-strip:rgba(190,31,67,0.04);
+  --sf-flat:      #525252;
+  --sf-info:      #0e7490;
+  --sf-info-soft: rgba(14,116,144,0.10);
+  --sf-warn:      #b27607;
+  --sf-warn-soft: rgba(178,118,7,0.11);
+  --sf-success:   #0f766e;
+  --sf-error:     #be1f43;
+  --sf-bid-fill:  rgba(15,118,110,0.13);
+  --sf-ask-fill:  rgba(190,31,67,0.11);
+  --sf-scrollbar: #c2c4c8;
+}

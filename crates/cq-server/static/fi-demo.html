@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>cqserver · FI demo</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #181b21;
+    --panel-2: #1f232b;
+    --border: #2a2f38;
+    --text: #d7dbe0;
+    --muted: #8590a0;
+    --accent: #7fb6ff;
+    --good: #4caf50;
+    --warn: #f5a623;
+    --bad: #ef5350;
+    --buy: #4caf50;
+    --sell: #ef5350;
+    --flash-up: rgba(76,175,80,.45);
+    --flash-down: rgba(239,83,80,.45);
+    --flash-neutral: #234d6e;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-size: 12px; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; color: var(--accent); }
+  header .nav a { color: var(--muted); text-decoration: none; margin-right: 16px; }
+  header .nav a:hover { color: var(--text); }
+  header .nav a.active { color: var(--accent); }
+  .status { color: var(--muted); font-size: 11px; }
+  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); margin-right: 6px; vertical-align: middle; }
+  .status.connected .dot { background: var(--good); }
+  main { padding: 16px; max-width: 1600px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; display: flex; flex-direction: column; min-height: 260px; }
+  section h2 { margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; display: flex; justify-content: space-between; }
+  section h2 .count { color: var(--muted); font-weight: normal; }
+  .scroller { overflow: auto; flex: 1; max-height: 380px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th { text-align: left; padding: 6px 10px; font-weight: 500; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); background: var(--panel-2); position: sticky; top: 0; }
+  td { padding: 5px 10px; border-bottom: 1px solid #1f232b; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  tr.flash td { animation: flash 600ms ease-out; }
+  tr.flash-up td { animation: flashUp 600ms ease-out; }
+  tr.flash-down td { animation: flashDown 600ms ease-out; }
+  @keyframes flash { from { background: var(--flash-neutral); } to { background: transparent; } }
+  @keyframes flashUp { from { background: var(--flash-up); } to { background: transparent; } }
+  @keyframes flashDown { from { background: var(--flash-down); } to { background: transparent; } }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .num.pos { color: var(--good); }
+  .num.neg { color: var(--bad); }
+  .buy { color: var(--buy); font-weight: 500; }
+  .sell { color: var(--sell); font-weight: 500; }
+  .pill { display: inline-block; padding: 1px 6px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; font-size: 10px; color: var(--muted); }
+  .agg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 12px; }
+  .agg-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
+  .agg-card h3 { margin: 0 0 6px 0; font-size: 11px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 11px; }
+  .bar-row .label { width: 130px; color: var(--text); }
+  .bar-row .bar { flex: 1; height: 14px; background: var(--bg); border-radius: 2px; position: relative; overflow: hidden; }
+  .bar-row .bar .fill { position: absolute; top: 0; bottom: 0; left: 0; background: var(--accent); opacity: 0.6; }
+  .bar-row .bar .fill.pos { background: var(--good); }
+  .bar-row .bar .fill.neg { background: var(--bad); }
+  .bar-row .val { width: 100px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>cqserver · fixed-income demo</h1>
+  <nav class="nav">
+    <a href="/">topics</a>
+    <a href="/fi-demo" class="active">fi-demo</a>
+    <a href="/metrics" target="_blank">/metrics</a>
+  </nav>
+  <div class="status" id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+</header>
+<main>
+  <div class="grid-row">
+    <section style="grid-column: 1 / span 2;">
+      <h2>Market data <span class="count" id="md-count"></span></h2>
+      <div class="scroller">
+        <table id="md-table">
+          <thead><tr>
+            <th>CUSIP</th><th>Ticker</th><th>Sector</th>
+            <th class="num">Bid</th><th class="num">Mid</th><th class="num">Ask</th>
+            <th class="num">Yield %</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recent trades <span class="count" id="trade-count"></span></h2>
+      <div class="scroller" id="trades-scroller">
+        <table id="trades-table">
+          <thead><tr>
+            <th>Trade ID</th><th>Time</th><th>Ticker</th>
+            <th>Side</th><th class="num">Qty</th><th class="num">Price</th>
+            <th>Book</th><th>Trader</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section>
+      <h2>Positions <span class="count" id="pos-count"></span></h2>
+      <div class="scroller">
+        <table id="positions-table">
+          <thead><tr>
+            <th>Book</th><th>Ticker</th>
+            <th class="num">Net Qty</th><th class="num">Avg Cost</th><th class="num">Last Mid</th>
+            <th class="num">Mkt Value</th><th class="num">Unreal. P&amp;L</th>
+            <th class="num">Trades</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Aggregations</h2>
+      <div class="agg-grid">
+        <div class="agg-card">
+          <h3>P&amp;L by book</h3>
+          <div id="agg-pnl-book"></div>
+        </div>
+        <div class="agg-card">
+          <h3>Net exposure by sector</h3>
+          <div id="agg-sector"></div>
+        </div>
+        <div class="agg-card">
+          <h3>Top 5 positions by market value</h3>
+          <div id="agg-top-positions"></div>
+        </div>
+        <div class="agg-card">
+          <h3>Trade count (last 60s) by ticker</h3>
+          <div id="agg-trade-count"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const WS_URL = `ws://${window.location.hostname}:9008/cq/json`;
+const MAX_RECENT_TRADES = 50;
+const MAX_POSITION_ROWS = 200; // cap rendered positions table — full SOW can be 40k+
+
+// Local mirrors of the three live topics.
+const market = new Map();    // cusip → row
+const trades = [];           // recent trades (latest first)
+const positions = new Map(); // positionKey → row
+const securities = new Map(); // cusip → reference security
+
+let ws = null;
+let subIds = {};
+
+// Render coalescing — set dirty flags from event handlers, render at next frame.
+const dirty = { market: false, trades: false, positions: false, aggs: false };
+let highlightCusip = null;
+let highlightDir = 0;
+let highlightPositionKey = null;
+let trades_flash_first = false;
+let renderScheduled = false;
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    if (dirty.market) { renderMarket(highlightCusip, highlightDir); dirty.market = false; highlightCusip = null; highlightDir = 0; }
+    if (dirty.trades) { renderTrades(trades_flash_first); dirty.trades = false; trades_flash_first = false; }
+    if (dirty.positions) { renderPositions(highlightPositionKey); dirty.positions = false; highlightPositionKey = null; }
+    if (dirty.aggs) { renderAggregations(); dirty.aggs = false; }
+  });
+}
+
+function setStatus(connected, text) {
+  const s = document.getElementById('status');
+  s.classList.toggle('connected', connected);
+  document.getElementById('status-text').textContent = text;
+}
+
+function fmtNum(n, dp = 2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return '—';
+  return Number(n).toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+function fmtInt(n) { return n === null || n === undefined ? '—' : Number(n).toLocaleString(); }
+function shortTime(iso) { return iso ? iso.slice(11, 19) : '—'; }
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    setStatus(true, `connected · ${WS_URL}`);
+    subscribeAll();
+  };
+  ws.onclose = () => {
+    setStatus(false, 'disconnected · retrying in 2s');
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => setStatus(false, 'websocket error');
+  ws.onmessage = (evt) => {
+    let m;
+    try { m = JSON.parse(evt.data); } catch { return; }
+    dispatch(m);
+  };
+}
+
+function subscribeAll() {
+  // sow_and_subscribe each FI topic. We track per-topic sub_ids so we
+  // can dispatch deltas correctly.
+  const subs = [
+    ['securities',     '/securities',     null],
+    ['market-data',    '/fi-market-data', null],
+    ['trades',         '/trades',         null],
+    ['positions',      '/positions',      null],
+  ];
+  subs.forEach(([key, topic], i) => {
+    ws.send(JSON.stringify({
+      c: 'sow_and_subscribe',
+      cid: `fi-${key}`,
+      t: topic,
+    }));
+  });
+}
+
+const cidToKey = {
+  'fi-securities':  'securities',
+  'fi-market-data': 'market-data',
+  'fi-trades':      'trades',
+  'fi-positions':   'positions',
+};
+
+function dispatch(m) {
+  // ack carries the assigned sub_id; remember which topic.
+  if (m.c === 'ack' && m.cid && m.sid) {
+    const k = cidToKey[m.cid];
+    if (k) subIds[m.sid] = k;
+    return;
+  }
+  if (m.c === 'sow' && m.sid && m.d) {
+    routeRow(subIds[m.sid], m.d, false);
+    return;
+  }
+  if (m.c === 'publish' && m.sid && m.d) {
+    routeRow(subIds[m.sid], m.d, true);
+    return;
+  }
+  // group_begin / group_end / heartbeat / etc. — ignore
+}
+
+function routeRow(stream, row, live) {
+  switch (stream) {
+    case 'securities':  securities.set(row.cusip, row); break;
+    case 'market-data': onMarket(row); break;
+    case 'trades':      onTrade(row, live); break;
+    case 'positions':   onPosition(row); break;
+  }
+}
+
+function onMarket(row) {
+  const prev = market.get(row.cusip);
+  market.set(row.cusip, row);
+  const dir = prev ? Math.sign(row.mid - prev.mid) : 0;
+  // Last-write-wins for the highlight target — fine for a burst.
+  highlightCusip = row.cusip;
+  highlightDir = dir;
+  dirty.market = true;
+  scheduleRender();
+}
+
+function onTrade(row, live) {
+  trades.unshift(row);
+  if (trades.length > MAX_RECENT_TRADES) trades.length = MAX_RECENT_TRADES;
+  if (live) trades_flash_first = true;
+  dirty.trades = true;
+  dirty.aggs = true;
+  scheduleRender();
+}
+
+function onPosition(row) {
+  positions.set(row.positionKey, row);
+  highlightPositionKey = row.positionKey;
+  dirty.positions = true;
+  dirty.aggs = true;
+  scheduleRender();
+}
+
+// ===== Render: Market data =====
+
+function renderMarket(highlightCusip, dir) {
+  const tbody = document.querySelector('#mr-tbody') || createMarketTbody();
+  // Sort by ticker for stable display.
+  const rows = [...market.values()].sort((a, b) => a.ticker.localeCompare(b.ticker));
+  tbody.innerHTML = rows.map(r => {
+    const flash = r.cusip === highlightCusip ? (dir > 0 ? 'flash-up' : dir < 0 ? 'flash-down' : 'flash') : '';
+    return `<tr class="${flash}" data-cusip="${r.cusip}">
+      <td>${r.cusip}</td>
+      <td>${r.ticker}</td>
+      <td><span class="pill">${r.sector ?? ''}</span></td>
+      <td class="num">${fmtNum(r.bid, 4)}</td>
+      <td class="num">${fmtNum(r.mid, 4)}</td>
+      <td class="num">${fmtNum(r.ask, 4)}</td>
+      <td class="num">${fmtNum(r.yieldPct, 3)}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('md-count').textContent = `(${rows.length})`;
+}
+function createMarketTbody() {
+  const tbody = document.querySelector('#md-table tbody');
+  tbody.id = 'mr-tbody';
+  return tbody;
+}
+
+// ===== Render: Trades =====
+
+function renderTrades(flashFirst) {
+  const tbody = document.querySelector('#trades-table tbody');
+  tbody.innerHTML = trades.map((t, i) => {
+    const flashCls = (flashFirst && i === 0) ? 'flash' : '';
+    return `<tr class="${flashCls}">
+      <td>${t.tradeId}</td>
+      <td>${shortTime(t.timestamp)}</td>
+      <td>${t.ticker}</td>
+      <td class="${t.side === 'BUY' ? 'buy' : 'sell'}">${t.side}</td>
+      <td class="num">${fmtInt(t.qty)}</td>
+      <td class="num">${fmtNum(t.price, 4)}</td>
+      <td>${t.book}</td>
+      <td>${t.trader}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('trade-count').textContent = `(${trades.length})`;
+}
+
+// ===== Render: Positions =====
+
+function renderPositions(highlightKey) {
+  const tbody = document.querySelector('#positions-table tbody');
+  const filtered = [...positions.values()].filter(p => Math.abs(p.netQty) > 0);
+  // Cap the rendered table — building >MAX_POSITION_ROWS <tr> elements stalls
+  // the layout pass on every frame. Counter still reflects the true total.
+  const rows = filtered
+    .sort((a, b) => Math.abs(b.marketValue) - Math.abs(a.marketValue))
+    .slice(0, MAX_POSITION_ROWS);
+  tbody.innerHTML = rows.map(p => {
+    const flash = p.positionKey === highlightKey ? 'flash' : '';
+    const pnlCls = p.unrealizedPnl > 0 ? 'pos' : p.unrealizedPnl < 0 ? 'neg' : '';
+    return `<tr class="${flash}">
+      <td>${p.book}</td>
+      <td>${p.ticker}</td>
+      <td class="num">${fmtInt(p.netQty)}</td>
+      <td class="num">${fmtNum(p.avgCost, 4)}</td>
+      <td class="num">${fmtNum(p.lastMid, 4)}</td>
+      <td class="num">${fmtNum(p.marketValue, 2)}</td>
+      <td class="num ${pnlCls}">${fmtNum(p.unrealizedPnl, 2)}</td>
+      <td class="num">${fmtInt(p.trades)}</td>
+    </tr>`;
+  }).join('');
+  const totalLabel = filtered.length > rows.length
+    ? `(${rows.length.toLocaleString()} of ${filtered.length.toLocaleString()})`
+    : `(${filtered.length.toLocaleString()})`;
+  document.getElementById('pos-count').textContent = totalLabel;
+}
+
+// ===== Render: Aggregations =====
+
+function renderAggregations() {
+  // 1. P&L by book.
+  const pnlByBook = new Map();
+  for (const p of positions.values()) {
+    pnlByBook.set(p.book, (pnlByBook.get(p.book) ?? 0) + (p.unrealizedPnl ?? 0));
+  }
+  renderBars('agg-pnl-book', pnlByBook, { signed: true });
+
+  // 2. Net exposure (sum of |marketValue|) by sector.
+  const sectorExposure = new Map();
+  for (const p of positions.values()) {
+    const sector = (securities.get(p.cusip)?.sector) ?? '?';
+    sectorExposure.set(sector, (sectorExposure.get(sector) ?? 0) + Math.abs(p.marketValue ?? 0));
+  }
+  renderBars('agg-sector', sectorExposure, { signed: false });
+
+  // 3. Top 5 positions by abs(market value).
+  const top = [...positions.values()]
+    .map(p => [`${p.book} ${p.ticker}`, Math.abs(p.marketValue ?? 0)])
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+  renderBars('agg-top-positions', new Map(top), { signed: false });
+
+  // 4. Trade count in last 60s by ticker.
+  const cutoff = Date.now() - 60_000;
+  const tradeCount = new Map();
+  for (const t of trades) {
+    const ts = new Date(t.timestamp).getTime();
+    if (ts >= cutoff) {
+      tradeCount.set(t.ticker, (tradeCount.get(t.ticker) ?? 0) + 1);
+    }
+  }
+  const topCount = new Map([...tradeCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5));
+  renderBars('agg-trade-count', topCount, { signed: false, intValues: true });
+}
+
+function renderBars(containerId, map, opts) {
+  const container = document.getElementById(containerId);
+  const entries = [...map.entries()];
+  if (entries.length === 0) {
+    container.innerHTML = '<div style="color:var(--muted);padding:6px 0">(no data yet)</div>';
+    return;
+  }
+  const maxAbs = Math.max(...entries.map(([_, v]) => Math.abs(v))) || 1;
+  container.innerHTML = entries.map(([k, v]) => {
+    const pct = (Math.abs(v) / maxAbs) * 100;
+    const cls = opts.signed ? (v >= 0 ? 'pos' : 'neg') : '';
+    const formatted = opts.intValues ? fmtInt(v) : fmtNum(v, 0);
+    return `<div class="bar-row">
+      <div class="label">${k}</div>
+      <div class="bar"><div class="fill ${cls}" style="width:${pct}%"></div></div>
+      <div class="val">${formatted}</div>
+    </div>`;
+  }).join('');
+}
+
+connect();
+// Heartbeat refresh — keeps bar widths and "trades in last 60s" current
+// even when no events are arriving.
+setInterval(() => { dirty.aggs = true; scheduleRender(); }, 1000);
+</script>
+</body>
+</html>

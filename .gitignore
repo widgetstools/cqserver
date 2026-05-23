@@ -1,0 +1,61 @@
+# ---- Rust ----
+target/
+**/*.rs.bk
+*.pdb
+
+# ---- Runtime artifacts ----
+/.demo-run/
+/data/
+*.log
+*.pid
+
+# ---- Node / TypeScript clients ----
+node_modules/
+dist/
+build/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# ---- Python client ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+.python-version
+
+# ---- Root-level stray lockfile (no root package.json) ----
+/package-lock.json
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Editor / OS ----
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Coverage / profiling ----
+coverage/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html

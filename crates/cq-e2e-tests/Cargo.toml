@@ -1,0 +1,39 @@
+[package]
+name = "cq-e2e-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# This crate exists purely for the integration test suite under `tests/`.
+# The library produces a few helpers (config + subprocess harness) used
+# by all the tests.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cq-client = { path = "../cq-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# For tests that need raw wire access — counting `sow_batch` frames
+# to verify the chunked SOW shape on the TCP transport.
+bytes = "1"
+# For TLS e2e — generate a self-signed cert+key at test time so we
+# don't have to check anything secret into the repo. Use the
+# aws-lc-rs backend to match the rustls provider the rest of the
+# workspace uses.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
+
+# For tests that need to deliver a real SIGTERM to the child server
+# (graceful shutdown). std::process::Child::kill is SIGKILL on Unix
+# which bypasses the shutdown path we're trying to exercise.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true }
+bcrypt = { workspace = true }

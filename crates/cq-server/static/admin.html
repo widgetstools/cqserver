@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>cqserver · admin</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #181b21;
+    --panel-2: #1f232b;
+    --border: #2a2f38;
+    --text: #d7dbe0;
+    --muted: #8590a0;
+    --accent: #7fb6ff;
+    --good: #4caf50;
+    --warn: #f5a623;
+    --bad: #ef5350;
+    --flash: #234d6e;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-size: 13px; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; color: var(--accent); }
+  header .nav a { color: var(--muted); text-decoration: none; margin-right: 16px; }
+  header .nav a:hover { color: var(--text); }
+  header .nav a.active { color: var(--accent); }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+  .stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat .value { font-size: 24px; font-weight: 600; margin-top: 6px; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 20px; }
+  section h2 { margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 8px 16px; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+  td { padding: 8px 16px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: var(--panel-2); }
+  .topic-name { color: var(--accent); font-weight: 500; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .badge.discovered { background: rgba(76,175,80,.15); color: var(--good); }
+  .badge.placeholder { background: rgba(245,166,35,.15); color: var(--warn); }
+  .btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; font: inherit; font-size: 11px; cursor: pointer; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .num { font-variant-numeric: tabular-nums; text-align: right; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: none; align-items: flex-start; justify-content: center; padding-top: 40px; z-index: 10; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; width: 90vw; max-width: 1200px; max-height: 85vh; display: flex; flex-direction: column; }
+  .modal header { display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .modal header h3 { margin: 0; font-size: 14px; }
+  .modal .body { padding: 12px 16px; overflow: auto; flex: 1; }
+  .modal pre { font-size: 11px; line-height: 1.4; margin: 0; }
+  .live-row { transition: background 600ms ease-out; }
+  .live-row.flash { background: var(--flash); }
+  footer { padding: 12px 20px; color: var(--muted); font-size: 11px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cqserver · admin</h1>
+  <nav class="nav">
+    <a href="/" class="active">topics</a>
+    <a href="/fi-demo">fi-demo</a>
+    <a href="/metrics" target="_blank">/metrics</a>
+  </nav>
+</header>
+<main>
+  <div class="stats" id="stats"></div>
+
+  <section>
+    <h2>Topics</h2>
+    <table id="topics-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Schema</th>
+          <th class="num">Rows</th>
+          <th class="num">Columns</th>
+          <th class="num">Subs</th>
+          <th class="num">Capacity</th>
+          <th>Key fields</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Prometheus headline metrics</h2>
+    <table id="metrics-table">
+      <thead><tr><th>Metric</th><th class="num">Value</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal">
+    <header>
+      <h3 id="modal-title"></h3>
+      <button class="btn" onclick="closeModal()">Close</button>
+    </header>
+    <div class="body">
+      <div id="modal-toolbar" style="margin-bottom:8px;"></div>
+      <pre id="modal-body"></pre>
+    </div>
+  </div>
+</div>
+
+<footer>cqserver admin · refreshes every 2s</footer>
+
+<script>
+const ADMIN_BASE = window.location.origin;
+const WS_URL = `ws://${window.location.hostname}:9008/cq/json`;
+let activeSubWs = null;
+
+async function fetchJSON(path) {
+  const r = await fetch(ADMIN_BASE + path);
+  if (!r.ok) throw new Error(`GET ${path}: ${r.status}`);
+  return r.json();
+}
+async function fetchText(path) {
+  const r = await fetch(ADMIN_BASE + path);
+  if (!r.ok) throw new Error(`GET ${path}: ${r.status}`);
+  return r.text();
+}
+
+async function refresh() {
+  try {
+    const [stats, topics, metricsRaw] = await Promise.all([
+      fetchJSON('/stats'),
+      fetchJSON('/topics'),
+      fetchText('/metrics'),
+    ]);
+    renderStats(stats);
+    renderTopics(topics);
+    renderMetrics(metricsRaw);
+  } catch (e) {
+    console.warn('refresh failed', e);
+  }
+}
+
+function renderStats(s) {
+  const cards = [
+    ['Topics', s.topics ?? 0],
+    ['Total rows', s.totalRows ?? 0],
+    ['Subscriptions', s.totalSubscriptions ?? 0],
+    ['Active routes', s.activeRoutes ?? 0],
+  ];
+  document.getElementById('stats').innerHTML = cards.map(([l, v]) =>
+    `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div></div>`
+  ).join('');
+}
+
+function renderTopics(topics) {
+  const tbody = document.querySelector('#topics-table tbody');
+  tbody.innerHTML = topics.map(t => {
+    const schemaLabel = t.schemaDiscovered
+      ? '<span class="badge discovered">discovered</span>'
+      : '<span class="badge placeholder">placeholder</span>';
+    const keys = (t.keyFields || []).join(', ') || '<span style="color:var(--muted)">none</span>';
+    return `
+      <tr>
+        <td class="topic-name">${t.name}</td>
+        <td>${schemaLabel}</td>
+        <td class="num">${t.rowCount ?? 0}</td>
+        <td class="num">${t.columnCount ?? 0}</td>
+        <td class="num">${t.subscriptions ?? 0}</td>
+        <td class="num">${t.capacity ?? 0}</td>
+        <td>${keys}</td>
+        <td><button class="btn" onclick="inspect('${t.name}')">Inspect</button>
+            <button class="btn" onclick="liveTail('${t.name}')">Live</button></td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function renderMetrics(raw) {
+  const interesting = [
+    'cq_connections_active',
+    'cq_subscriptions_active',
+    'cq_publish_total',
+    'cq_deltas_delivered_total',
+    'cq_deltas_dropped_total',
+    'cq_queue_delivered_total',
+    'cq_repl_shipped_entries_total',
+    'cq_repl_applied_entries_total',
+  ];
+  const rows = [];
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('#') || !line.trim()) continue;
+    const [k, v] = line.split(/\s+/);
+    const bare = k?.split('{')[0];
+    if (interesting.includes(bare)) {
+      rows.push([k, v]);
+    }
+  }
+  const tbody = document.querySelector('#metrics-table tbody');
+  tbody.innerHTML = rows
+    .map(([k, v]) => `<tr><td style="font-size:11px">${k}</td><td class="num">${v}</td></tr>`)
+    .join('');
+}
+
+// ===== Inspect modal: one-shot SOW =====
+
+async function inspect(topic) {
+  openModal(`SOW snapshot · ${topic}`);
+  setModalToolbar('');
+  document.getElementById('modal-body').textContent = 'Loading...';
+  const rows = await sowQuery(topic);
+  if (rows.length === 0) {
+    document.getElementById('modal-body').textContent = '(no rows)';
+    return;
+  }
+  document.getElementById('modal-body').textContent = formatRows(rows);
+}
+
+function sowQuery(topic) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(WS_URL);
+    const rows = [];
+    let groupSubId = null;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ c: 'sow', cid: 'admin-sow', t: topic }));
+    };
+    ws.onmessage = (evt) => {
+      const m = JSON.parse(evt.data);
+      if (m.c === 'group_begin') { groupSubId = m.sid; return; }
+      if (m.c === 'group_end' && (!groupSubId || m.sid === groupSubId)) {
+        ws.close(); resolve(rows); return;
+      }
+      if (m.c === 'sow' && m.d) rows.push(m.d);
+      if (m.c === 'ack' && m.s === 'error') {
+        ws.close(); reject(new Error(m.r ?? 'sow error'));
+      }
+    };
+    ws.onerror = () => reject(new Error('websocket error'));
+    ws.onclose = () => resolve(rows);
+  });
+}
+
+// ===== Live tail modal: subscribe and stream =====
+
+function liveTail(topic) {
+  openModal(`Live tail · ${topic}`);
+  setModalToolbar('Connecting...');
+  document.getElementById('modal-body').textContent = '';
+  if (activeSubWs) { try { activeSubWs.close(); } catch (e) {} }
+  const ws = new WebSocket(WS_URL);
+  activeSubWs = ws;
+  let count = 0;
+  let subId = null;
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ c: 'sow_and_subscribe', cid: 'admin-live', t: topic }));
+    setModalToolbar('Streaming... (close modal to stop)');
+  };
+  ws.onmessage = (evt) => {
+    const m = JSON.parse(evt.data);
+    if (m.c === 'ack' && m.sid) { subId = m.sid; return; }
+    if (m.c === 'publish' && m.sid === subId) {
+      count++;
+      const body = document.getElementById('modal-body');
+      const lines = [
+        `[${count}] ${m.dt?.toUpperCase() ?? 'UPD'} seq=${m.seq ?? '-'} ${JSON.stringify(m.d ?? {})}`,
+        body.textContent,
+      ];
+      body.textContent = lines.join('\n').split('\n').slice(0, 200).join('\n');
+    }
+  };
+}
+
+// ===== Modal helpers =====
+
+function openModal(title) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-backdrop').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('modal-backdrop').classList.remove('open');
+  if (activeSubWs) { try { activeSubWs.close(); } catch (e) {} activeSubWs = null; }
+}
+function setModalToolbar(text) {
+  document.getElementById('modal-toolbar').textContent = text;
+}
+function formatRows(rows) {
+  return rows.map((r, i) => `[${i + 1}] ${JSON.stringify(r)}`).join('\n');
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

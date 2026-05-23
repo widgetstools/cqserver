@@ -1,0 +1,29 @@
+[package]
+name = "cq-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cq-txlog = { path = "../cq-txlog" }
+serde.workspace = true
+serde_json.workspace = true
+sqlparser.workspace = true
+roaring.workspace = true
+compact_str.workspace = true
+ahash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+regex.workspace = true
+uuid.workspace = true
+metrics.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "store_bench"
+harness = false

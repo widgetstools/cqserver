@@ -1,0 +1,21 @@
+[package]
+name = "cq-replication"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cq-core = { path = "../cq-core" }
+cq-txlog = { path = "../cq-txlog" }
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+dashmap.workspace = true
+metrics.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

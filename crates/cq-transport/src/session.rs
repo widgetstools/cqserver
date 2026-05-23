@@ -1,0 +1,631 @@
+//! Per-connection session state and the global subscription delivery registry.
+
+use crate::auth::{Entitlement, Op};
+use cq_core::conflation::Conflator;
+use cq_core::subscription::{Delta, DeltaType};
+use cq_protocol::message::CqMessage;
+use cq_protocol::serialization::Codec;
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+
+/// One outbound wire frame. The transport-specific writer knows how to
+/// emit each variant on its medium:
+///
+/// - WebSocket: `Text` → `Message::Text(s)`, `Binary` → `Message::Binary(b)`.
+/// - TCP: both variants are length-prefixed bytes; the underlying codec
+///   is recorded on the session so the receiver can decode them, but the
+///   framing is identical.
+#[derive(Debug, Clone)]
+pub enum OutboundFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl OutboundFrame {
+    pub fn len(&self) -> usize {
+        match self {
+            OutboundFrame::Text(s) => s.len(),
+            OutboundFrame::Binary(b) => b.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            OutboundFrame::Text(s) => s.as_bytes(),
+            OutboundFrame::Binary(b) => b.as_slice(),
+        }
+    }
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Default per-session outbound queue depth. Overridable from
+/// `[transport].outbound_queue_capacity` in `cqserver.toml`. Sized so a
+/// typical SOW burst absorbs without backpressure; the SOW path uses
+/// `send().await` and so won't drop even when this is exceeded, but
+/// live-delta `try_send` still drops on full.
+pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 8192;
+
+/// Default rows packed per outbound `sow_batch` frame on the
+/// streaming SOW path. Overridable from `[transport].sow_batch_size`.
+pub const DEFAULT_SOW_BATCH_SIZE: usize = 200;
+
+pub type OutboundTx = mpsc::Sender<OutboundFrame>;
+
+/// Encode `msg` into a wire frame using `codec`. JSON produces a Text
+/// frame, MessagePack produces a Binary frame.
+pub fn encode_frame(codec: Codec, msg: &CqMessage) -> Option<OutboundFrame> {
+    match codec {
+        Codec::Json => serde_json::to_string(msg).ok().map(OutboundFrame::Text),
+        Codec::MessagePack => rmp_serde::to_vec_named(msg).ok().map(OutboundFrame::Binary),
+        Codec::Bson => codec.encode(msg).ok().map(OutboundFrame::Binary),
+    }
+}
+
+/// Pre-serialize a row body (the `d` field of a delta frame) to JSON
+/// bytes. Used by the encode-once-fan-out delivery path so the same
+/// row body can be embedded in many per-subscriber frames without
+/// re-serializing the payload N times.
+pub fn encode_row_body_json(
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<u8>> {
+    serde_json::to_vec(data).ok()
+}
+
+/// Build a JSON delta frame by stitching a pre-encoded body into a
+/// per-subscriber envelope. The envelope is tiny and string-built; the
+/// body bytes (which can be many KB on wide-row topics) are reused.
+///
+/// `dt` must be a literal kind (`add`, `update`, `remove`, `oof`) — no
+/// escaping is performed. `body` is assumed to be valid UTF-8 JSON.
+pub fn build_json_delta_frame(
+    sub_id: &str,
+    dt: &str,
+    seq: u64,
+    body: &[u8],
+) -> Option<OutboundFrame> {
+    let body_str = std::str::from_utf8(body).ok()?;
+    let mut buf = String::with_capacity(body_str.len() + 64 + sub_id.len());
+    buf.push_str("{\"c\":\"publish\",\"sid\":\"");
+    push_json_string_escaped(&mut buf, sub_id);
+    buf.push_str("\",\"dt\":\"");
+    buf.push_str(dt);
+    buf.push_str("\",\"seq\":");
+    buf.push_str(&seq.to_string());
+    buf.push_str(",\"d\":");
+    buf.push_str(body_str);
+    buf.push('}');
+    Some(OutboundFrame::Text(buf))
+}
+
+/// JSON-string-escape `s` into `out`. Sub-ids are server-assigned in
+/// the form `sess-N:sub-M`, but we still escape defensively in case
+/// future schemes include `"`, `\` or control chars.
+fn push_json_string_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+/// Shared codec slot. Used by the heartbeat task (and any other
+/// session-adjacent background task) to read whatever codec the session
+/// currently negotiated.
+pub type SharedCodec = Arc<parking_lot::Mutex<Codec>>;
+
+/// Routing entry for a single subscription.
+#[derive(Clone)]
+pub struct DeliveryRoute {
+    pub tx: OutboundTx,
+    pub topic: String,
+    pub dropped: Arc<AtomicU64>,
+    /// Codec used by the owning session — determines whether outbound
+    /// deltas are serialized as JSON text or MessagePack binary.
+    pub codec: Codec,
+    /// Optional per-subscription conflator. When `Some`, deltas are coalesced
+    /// by row and a background flush task pushes them through `tx` at the
+    /// configured interval. When `None`, callers send directly.
+    pub conflator: Option<Arc<Conflator>>,
+    /// Adjustable flush interval in milliseconds. `0` means "no
+    /// conflation"; the value is read by the flush task each iteration
+    /// so the watcher can widen the interval under back-pressure
+    /// without recreating the task. `None` when the route was built
+    /// without conflation.
+    pub interval_ms: Option<Arc<AtomicU64>>,
+    /// Wall-clock when the subscription was registered. Used by admin
+    /// endpoints / slow-consumer watcher to compute "age".
+    pub created_at: std::time::Instant,
+    /// Owning session id, so the slow-consumer policy can disconnect
+    /// the underlying connection if it decides to.
+    pub session_id: String,
+    /// Stable client identity, when known (from logon username or an
+    /// explicit `client_name` field on the subscribe message). Used
+    /// by the server-side bookmark store to power `MOST_RECENT`
+    /// replay across reconnects. `None` for anonymous sessions.
+    pub client_name: Option<String>,
+    /// Highest delta sequence successfully enqueued for this route.
+    /// Updated by the delivery layer; read by the bookmark-store
+    /// updater so `MOST_RECENT` knows where the client last got to.
+    pub last_seq: Arc<AtomicU64>,
+    /// Per-(client_name, topic) bookmark store. The delivery layer
+    /// updates the store on every successful send so `MOST_RECENT`
+    /// resumption picks up from the right place after a reconnect.
+    /// `None` when no client_name is known (anonymous session).
+    pub bookmark_store: Option<crate::router::BookmarkStore>,
+    /// When `true`, the bookmark-replay loop pauses between
+    /// entries until a Resume command flips it back. Live
+    /// delivery isn't paused (out of scope for S10 — matches the
+    /// AMPS semantics where pause/resume covers replay only).
+    pub paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Notified when `paused` transitions false → true → false (a
+    /// resume). The replay loop awaits this notify when it sees
+    /// the paused flag set.
+    pub resume_notify: Arc<tokio::sync::Notify>,
+}
+
+impl DeliveryRoute {
+    pub fn new(tx: OutboundTx, topic: String) -> Self {
+        Self::with_codec(tx, topic, Codec::Json)
+    }
+
+    pub fn with_codec(tx: OutboundTx, topic: String, codec: Codec) -> Self {
+        DeliveryRoute {
+            tx,
+            topic,
+            dropped: Arc::new(AtomicU64::new(0)),
+            codec,
+            conflator: None,
+            interval_ms: None,
+            created_at: std::time::Instant::now(),
+            session_id: String::new(),
+            client_name: None,
+            last_seq: Arc::new(AtomicU64::new(0)),
+            bookmark_store: None,
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub fn with_client_name(mut self, client_name: Option<String>) -> Self {
+        self.client_name = client_name;
+        self
+    }
+
+    pub fn with_bookmark_store(
+        mut self,
+        store: Option<crate::router::BookmarkStore>,
+    ) -> Self {
+        self.bookmark_store = store;
+        self
+    }
+
+    /// Update the conflator's flush interval. Takes effect from the
+    /// next tick. No-op when this route was built without conflation.
+    /// Used by the slow-consumer watcher to widen the interval under
+    /// back-pressure.
+    pub fn set_conflation_interval_ms(&self, ms: u64) {
+        if let Some(i) = self.interval_ms.as_ref() {
+            i.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Current flush interval in millis, or 0 if no conflator is active.
+    pub fn conflation_interval_ms(&self) -> u64 {
+        self.interval_ms
+            .as_ref()
+            .map(|i| i.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
+    }
+
+    /// Number of frames currently sitting in the outbound queue.
+    pub fn queue_depth(&self) -> usize {
+        self.tx.max_capacity().saturating_sub(self.tx.capacity())
+    }
+
+    /// Channel capacity (`max_capacity` from tokio).
+    pub fn queue_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
+    /// Total frames dropped by this route since registration.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Milliseconds since the route was registered.
+    pub fn age_ms(&self) -> u64 {
+        self.created_at.elapsed().as_millis() as u64
+    }
+
+    /// Build a route with conflation enabled. Spawns a flush task on the
+    /// current tokio runtime that drains the conflator every `interval` and
+    /// pushes deltas through `tx`. The task auto-terminates when the
+    /// `DeliveryRoute` (and any clones) are dropped from the registry, via
+    /// the `Weak` reference path.
+    pub fn with_conflation(
+        tx: OutboundTx,
+        topic: String,
+        sub_id: String,
+        interval: Duration,
+    ) -> Self {
+        Self::with_conflation_codec(tx, topic, sub_id, interval, Codec::Json)
+    }
+
+    pub fn with_conflation_codec(
+        tx: OutboundTx,
+        topic: String,
+        sub_id: String,
+        interval: Duration,
+        codec: Codec,
+    ) -> Self {
+        let conflator = Arc::new(Conflator::new());
+        let dropped = Arc::new(AtomicU64::new(0));
+        let interval_ms = Arc::new(AtomicU64::new(interval.as_millis().max(1) as u64));
+        let last_seq = Arc::new(AtomicU64::new(0));
+
+        spawn_flush_loop(
+            sub_id,
+            topic.clone(),
+            Arc::downgrade(&conflator),
+            tx.clone(),
+            dropped.clone(),
+            interval_ms.clone(),
+            codec,
+            last_seq.clone(),
+            None, // client_name + bookmark_store are bound later via
+            None, // `with_*` builders; the flush loop captures them
+                  // through Arc cloning at spawn time. Conflated subs
+                  // therefore only record `last_seq` locally — the
+                  // MOST_RECENT bookmark store update flows through
+                  // the direct-send path. (Acceptable: conflated subs
+                  // are typically high-rate live streams where
+                  // MOST_RECENT resume isn't the primary use case.)
+        );
+
+        DeliveryRoute {
+            tx,
+            topic,
+            dropped,
+            codec,
+            conflator: Some(conflator),
+            interval_ms: Some(interval_ms),
+            created_at: std::time::Instant::now(),
+            session_id: String::new(),
+            client_name: None,
+            last_seq,
+            bookmark_store: None,
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+/// Spawn a background task that drains `conflator` every `interval` and
+/// pushes deltas through `tx`. Exits when the conflator's last strong ref
+/// is dropped (i.e., the route is evicted from the registry).
+fn spawn_flush_loop(
+    sub_id: String,
+    topic: String,
+    weak: Weak<Conflator>,
+    tx: OutboundTx,
+    dropped: Arc<AtomicU64>,
+    interval_ms: Arc<AtomicU64>,
+    codec: Codec,
+    last_seq: Arc<AtomicU64>,
+    client_name: Option<String>,
+    bookmark_store: Option<crate::router::BookmarkStore>,
+) {
+    tokio::spawn(async move {
+        // We read `interval_ms` every tick rather than caching it in a
+        // `tokio::time::interval` instance, so the slow-consumer
+        // watcher can widen the interval at runtime under
+        // back-pressure. The atomic is checked once per sleep — cheap.
+        loop {
+            let ms = interval_ms.load(Ordering::Relaxed).max(1);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            let conflator = match weak.upgrade() {
+                Some(c) => c,
+                None => return, // Route gone — exit.
+            };
+
+            let deltas = conflator.drain();
+            drop(conflator); // Don't hold the strong ref while sending.
+
+            for delta in deltas {
+                let dt_str = match delta.delta_type {
+                    DeltaType::Add => "add",
+                    DeltaType::Update => "update",
+                    DeltaType::Remove => "remove",
+                    DeltaType::Oof => "oof",
+                };
+                // Fast path: JSON codec + pre-encoded body attached by
+                // the evaluator. Skip serialization entirely and just
+                // stitch the per-sub envelope.
+                let frame = if matches!(codec, Codec::Json) {
+                    match delta.encoded_body_json.as_ref() {
+                        Some(body) => {
+                            metrics::counter!("cq_conflator_body_reuses_total").increment(1);
+                            match build_json_delta_frame(
+                                &delta.subscription_id,
+                                dt_str,
+                                delta.sequence,
+                                body,
+                            ) {
+                                Some(f) => f,
+                                None => {
+                                    tracing::warn!(
+                                        sub = %sub_id,
+                                        "Conflated delta envelope build failed"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            // No pre-encoded body — fall back to a
+                            // full encode. Happens when the delta was
+                            // submitted via a path that didn't pre-
+                            // serialize (e.g., tests).
+                            metrics::counter!("cq_conflator_body_encodes_total").increment(1);
+                            let mut msg = CqMessage::delta(
+                                &delta.subscription_id,
+                                dt_str,
+                                (*delta.row_data).clone(),
+                            );
+                            msg.sequence = Some(delta.sequence);
+                            match encode_frame(codec, &msg) {
+                                Some(f) => f,
+                                None => {
+                                    tracing::warn!(
+                                        sub = %sub_id,
+                                        "Conflated delta serialize failed"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    metrics::counter!("cq_conflator_body_encodes_total").increment(1);
+                    let mut msg = CqMessage::delta(
+                        &delta.subscription_id,
+                        dt_str,
+                        (*delta.row_data).clone(),
+                    );
+                    msg.sequence = Some(delta.sequence);
+                    match encode_frame(codec, &msg) {
+                        Some(f) => f,
+                        None => {
+                            tracing::warn!(sub = %sub_id, "Conflated delta serialize failed");
+                            continue;
+                        }
+                    }
+                };
+                match tx.try_send(frame) {
+                    Ok(()) => {
+                        last_seq.fetch_max(delta.sequence, Ordering::Relaxed);
+                        if let (Some(cname), Some(store)) =
+                            (client_name.as_deref(), bookmark_store.as_ref())
+                        {
+                            crate::router::record_bookmark(
+                                store,
+                                cname,
+                                &topic,
+                                delta.sequence,
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        metrics::counter!(
+                            "cq_subscription_dropped_total",
+                            "topic" => topic.clone()
+                        )
+                        .increment(1);
+                        // Cap log spam: only log every 256th drop per sub.
+                        let n = dropped.load(Ordering::Relaxed);
+                        if n.is_power_of_two() {
+                            tracing::warn!(
+                                sub = %sub_id,
+                                topic = %topic,
+                                drops_so_far = n,
+                                "Conflated delta dropped (outbound queue full)"
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+        }
+    });
+}
+
+/// Helper used by `deliver_delta` when the route has a conflator. Returns
+/// `true` if the delta was consumed (submitted to the conflator), `false`
+/// if the caller should fall through to direct send.
+pub fn try_submit_to_conflator(route: &DeliveryRoute, delta: &Delta) -> bool {
+    if let Some(c) = route.conflator.as_ref() {
+        c.submit(delta.clone());
+        true
+    } else {
+        false
+    }
+}
+
+/// Shared `sub_id → route` map.
+pub type SessionRegistry = Arc<DashMap<String, DeliveryRoute>>;
+
+pub fn new_registry() -> SessionRegistry {
+    Arc::new(DashMap::new())
+}
+
+/// Snapshot stats for one entry in the session registry. Used by the
+/// admin API and the slow-consumer watcher.
+#[derive(Debug, Clone)]
+pub struct SubscriptionStats {
+    pub sub_id: String,
+    pub topic: String,
+    pub session_id: String,
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    pub dropped: u64,
+    pub age_ms: u64,
+    pub conflated: bool,
+    /// Current flush interval (ms) when the route uses conflation;
+    /// 0 when conflation is disabled.
+    pub conflation_interval_ms: u64,
+}
+
+impl SubscriptionStats {
+    /// Fill ratio of the outbound queue, in `[0.0, 1.0]`.
+    pub fn fill_ratio(&self) -> f32 {
+        if self.queue_capacity == 0 {
+            0.0
+        } else {
+            self.queue_depth as f32 / self.queue_capacity as f32
+        }
+    }
+}
+
+/// Iterate every active route and produce a snapshot of its stats.
+/// Cheap — just reads atomics and the mpsc capacity counters.
+pub fn collect_subscription_stats(registry: &SessionRegistry) -> Vec<SubscriptionStats> {
+    registry
+        .iter()
+        .map(|e| {
+            let sub_id = e.key().clone();
+            let r = e.value();
+            SubscriptionStats {
+                sub_id,
+                topic: r.topic.clone(),
+                session_id: r.session_id.clone(),
+                queue_depth: r.queue_depth(),
+                queue_capacity: r.queue_capacity(),
+                dropped: r.dropped_count(),
+                age_ms: r.age_ms(),
+                conflated: r.conflator.is_some(),
+                conflation_interval_ms: r.conflation_interval_ms(),
+            }
+        })
+        .collect()
+}
+
+pub struct Session {
+    pub id: String,
+    pub remote_addr: String,
+    pub tx: OutboundTx,
+    pub subscriptions: Vec<String>,
+    sub_seq: u64,
+    pub dropped: Arc<AtomicU64>,
+    /// Millis-since-epoch of the last inbound frame on this connection.
+    /// Touched by the read loop, read by the heartbeat task to detect
+    /// idle peers.
+    pub last_inbound_ms: Arc<AtomicU64>,
+    /// Authenticated user identity. `None` until a successful `Logon`.
+    pub username: Option<String>,
+    /// Cached entitlement list (copied out of `AuthStore` on logon) so
+    /// per-message checks don't have to take the store's lock.
+    pub entitlements: Vec<Entitlement>,
+    /// Wire codec for this connection. Defaults to JSON; switched to
+    /// MessagePack by the WebSocket transport when it sees the first
+    /// binary frame from the client. Shared via `Arc` so the
+    /// heartbeat task can encode in the negotiated codec.
+    pub codec: SharedCodec,
+}
+
+impl Session {
+    pub fn new(remote_addr: String, tx: OutboundTx) -> Self {
+        let id = format!("sess-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        Session {
+            id,
+            remote_addr,
+            tx,
+            subscriptions: Vec::new(),
+            sub_seq: 0,
+            dropped: Arc::new(AtomicU64::new(0)),
+            last_inbound_ms: Arc::new(AtomicU64::new(now_ms())),
+            username: None,
+            entitlements: Vec::new(),
+            codec: Arc::new(parking_lot::Mutex::new(Codec::Json)),
+        }
+    }
+
+    pub fn codec(&self) -> Codec {
+        *self.codec.lock()
+    }
+
+    pub fn set_codec(&self, codec: Codec) {
+        *self.codec.lock() = codec;
+    }
+
+    /// Mark that an inbound frame just arrived. Called from the read loop.
+    pub fn touch_inbound(&self) {
+        self.last_inbound_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.username.is_some()
+    }
+
+    /// True if the authenticated user is allowed to perform `op` on
+    /// `topic`. Always returns `true` for un-gated sessions (the caller
+    /// is responsible for deciding whether to consult this).
+    pub fn can(&self, op: Op, topic: &str) -> bool {
+        self.entitlements.iter().any(|e| e.matches(op, topic))
+    }
+
+    pub fn next_sub_id(&mut self) -> String {
+        self.sub_seq += 1;
+        format!("{}:sub-{}", self.id, self.sub_seq)
+    }
+
+    /// Push a pre-encoded frame onto the outbound queue. Full queue →
+    /// drop + counter.
+    pub fn send_frame(&self, frame: OutboundFrame) -> bool {
+        match self.tx.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(session = %self.id, "Outbound queue full; dropping frame");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Serialize `msg` using the session's codec and enqueue.
+    pub fn send_message(&self, msg: &CqMessage) -> bool {
+        let codec = self.codec();
+        match encode_frame(codec, msg) {
+            Some(frame) => self.send_frame(frame),
+            None => {
+                tracing::warn!(session = %self.id, "Failed to serialize message");
+                false
+            }
+        }
+    }
+}

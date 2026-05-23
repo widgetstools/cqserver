@@ -1,0 +1,138 @@
+{
+  "positionKey": "string",
+  "book": "string",
+  "trader": "string",
+
+  "instrument": {
+    "cusip": "string",
+    "ticker": "string",
+    "issuer": "string",
+    "assetClass": "string",
+    "sector": "string",
+    "subSector": "string",
+    "rating": "string",
+    "currency": "string",
+    "country": "string",
+    "exchange": "string",
+    "couponPct": "double",
+    "maturity": "string",
+    "callable": "string",
+    "putable": "string",
+    "seniority": "string"
+  },
+
+  "position": {
+    "netQty": "double",
+    "longQty": "double",
+    "shortQty": "double",
+    "avgCost": "double",
+    "lastMid": "double",
+    "lastBid": "double",
+    "lastAsk": "double",
+    "marketValue": "double",
+    "unrealizedPnl": "double",
+    "realizedPnl": "double",
+    "dayPnl": "double",
+    "mtdPnl": "double",
+    "ytdPnl": "double",
+    "carry": "double",
+    "rollDown": "double",
+    "tradeCount": "long",
+    "lastTradeTs": "string"
+  },
+
+  "risk": {
+    "duration": "double",
+    "modifiedDuration": "double",
+    "effectiveDuration": "double",
+    "convexity": "double",
+    "modConvexity": "double",
+    "ytm": "double",
+    "ytw": "double",
+    "ytc": "double",
+    "ytp": "double",
+    "spreadDv01": "double",
+    "creditDv01": "double",
+    "rateDv01": "double",
+    "asw": "double",
+    "zspread": "double",
+    "oasSpread": "double",
+    "iSpread": "double",
+    "swapSpread": "double",
+    "treasurySpread": "double",
+    "benchmarkSpread": "double",
+    "currentYield": "double",
+    "ir01_USD": "double",
+    "ir01_EUR": "double",
+    "ir01_GBP": "double",
+    "ir01_JPY": "double",
+    "ir01_CHF": "double",
+    "ir01_CAD": "double",
+    "kr01_3m": "double",
+    "kr01_6m": "double",
+    "kr01_1y": "double",
+    "kr01_2y": "double",
+    "kr01_5y": "double",
+    "kr01_10y": "double",
+    "kr01_30y": "double"
+  },
+
+  "var": {
+    "var_1d_95": "double",
+    "var_1d_99": "double",
+    "var_5d_95": "double",
+    "var_5d_99": "double",
+    "var_10d_99": "double",
+    "es_1d_95": "double",
+    "es_1d_99": "double",
+    "es_10d_99": "double"
+  },
+
+  "stress": {
+    "parallel_up_50bp": "double",
+    "parallel_down_50bp": "double",
+    "parallel_up_100bp": "double",
+    "parallel_down_100bp": "double",
+    "steepener_2y10y": "double",
+    "flattener_2y10y": "double",
+    "credit_up_50bp": "double",
+    "credit_down_50bp": "double"
+  },
+
+  "limits": {
+    "grossLimit": "double",
+    "grossUsed": "double",
+    "grossPct": "double",
+    "netLimit": "double",
+    "netUsed": "double",
+    "netPct": "double",
+    "dv01Limit": "double",
+    "dv01Used": "double",
+    "dv01Pct": "double",
+    "varLimit": "double",
+    "varUsed": "double",
+    "varPct": "double"
+  },
+
+  "attribution": {
+    "daily_carry": "double",
+    "daily_rates": "double",
+    "daily_spread": "double",
+    "daily_fx": "double",
+    "daily_convexity": "double",
+    "mtd_carry": "double",
+    "mtd_rates": "double",
+    "mtd_spread": "double",
+    "ytd_carry": "double",
+    "ytd_rates": "double",
+    "ytd_spread": "double"
+  },
+
+  "liquidity": {
+    "adv30d": "double",
+    "bidAskBps": "double",
+    "isOnTheRun": "string",
+    "amountOutstanding": "double",
+    "freeFloat": "double"
+  }
+}
