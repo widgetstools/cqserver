@@ -30,6 +30,13 @@ metrics.workspace = true
 # the tokio runtime itself.
 tokio = { workspace = true, features = ["sync"] }
 
+# Fast integer + float formatters used by the direct-streaming JSON
+# encoder (`ColumnStore::write_row_json_projected`). Both are already
+# transitive deps via serde_json; declared explicitly here so the API
+# is visible to the encoder code.
+itoa = "1"
+ryu = "1"
+
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true

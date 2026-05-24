@@ -130,7 +130,9 @@ cqserver/
 │   │   │   ├── store.rs       # Columnar SOW store
 │   │   │   ├── predicate.rs   # SQL predicate compiler
 │   │   │   ├── query.rs       # Query executor (filter, sort, project, limit)
+│   │   │   ├── pivot.rs       # PIVOT / UNPIVOT operators (static + dynamic)
 │   │   │   ├── subscription.rs # Active sets, delta computation
+│   │   │   ├── view.rs        # Materialized views (single-source + JOIN USING)
 │   │   │   ├── topic.rs       # Topic abstraction (SOW + key + config)
 │   │   │   ├── conflation.rs  # Rate-limited delta delivery
 │   │   │   └── flatten.rs     # JSON flattener (dot/bracket notation)
@@ -350,6 +352,122 @@ impl CompiledPredicate {
     pub fn matches(&self, store: &ColumnStore, row: u32) -> bool { ... }
 }
 ```
+
+---
+
+## PIVOT / UNPIVOT
+
+CQServer's query engine compiles ANSI-style `PIVOT` and `UNPIVOT` clauses
+(Snowflake / BigQuery dialect) into native operators that run directly on
+the columnar SOW — no detour through an external SQL engine. Lives in
+[`crates/cq-core/src/pivot.rs`](crates/cq-core/src/pivot.rs); query.rs
+dispatches to the pivot executors when `ParsedQuery.pivot` or
+`ParsedQuery.unpivot` is present.
+
+### Static PIVOT (S43)
+
+```sql
+SELECT *
+FROM /trades
+PIVOT (SUM(qty) FOR desk IN ('RATES', 'FX'))
+```
+
+Transforms a tall table (`trader, desk, qty`) into a wide one keyed by
+the *anchor* columns (every column not mentioned in the pivot or
+aggregate spec):
+
+| trader | RATES | FX |
+|---|---:|---:|
+| alice | 100 | NULL |
+| bob | 50 | 200 |
+
+- **Single-measure** output columns = `anchor_cols ++ pivot_values`
+  (one new column per listed literal, named after the literal).
+- **Multi-measure** (`PIVOT (SUM(qty), SUM(notional)) FOR desk IN ('A','B')`)
+  output columns = `anchor_cols ++ {pivot_value × agg_alias}` — names
+  combine the pivot value with each aggregate alias (`A_SUM(qty)`,
+  `A_SUM(notional)`, `B_SUM(qty)`, ...).
+- **Out-of-list rows** are silently dropped (Snowflake / BigQuery
+  convention). A trader on the `EQUITIES` desk doesn't appear in the
+  example above unless their anchor key also has a `RATES` or `FX` row.
+
+### Dynamic PIVOT (S45)
+
+```sql
+SELECT *
+FROM /trades
+PIVOT (SUM(qty) FOR desk IN ANY)
+```
+
+`IN ANY` means "discover the pivot values from the data at execution
+time." The executor does a first pass over predicate-matched rows to
+collect the distinct values of `desk`, sorts them in natural order
+(string ascending, numeric ascending) for stable column ordering, then
+falls through to the regular static-pivot bucketing path against the
+discovered set. Useful when the value set isn't known up front — e.g.,
+a live trader list that grows over the day.
+
+Today's dynamic PIVOT runs **batch-only**: every query re-discovers
+the pivot value set from scratch. Continuous-query mode (a subscription
+that emits a `SchemaChange` frame when a new pivot value first appears,
+followed by data deltas) is staged for a follow-up — the wire frame
+already exists from S44.
+
+### UNPIVOT
+
+```sql
+SELECT *
+FROM /risk
+UNPIVOT (val FOR colname IN (RATES, FX, EQUITIES))
+```
+
+The inverse: every input row explodes into N output rows, one per
+listed source column. Each output row carries the anchor columns plus
+two synthesized columns — `colname = '<source col name>'` and
+`val = <source col value>`. Rows whose source value is NULL are
+dropped (Snowflake's default `EXCLUDE NULLS` behavior); to keep them,
+filter post-unpivot.
+
+Round-trip property `PIVOT(UNPIVOT(x)) ≡ x` (modulo NULLs) is verified
+by proptest.
+
+### Executor shape
+
+Both operators reuse the rest of the query pipeline — `plan_candidates`
+picks the candidate row index iterator (full scan or via
+`predicate_index`), the predicate filter runs as usual, only the
+materialization step differs:
+
+| Operator | Per-row work | Output shape |
+|---|---|---|
+| PIVOT (static) | hash the anchor key, look up the pivot value's position in the literal list, fold the aggregate input into the bucket's `AggState` | one row per distinct anchor key |
+| PIVOT (dynamic) | first-pass scan to discover the value set, then identical to static | one row per distinct anchor key |
+| UNPIVOT | emit N rows per input row, one per non-NULL source column | tall again |
+
+PIVOT output `source_rows` is intentionally empty — synthesized rows
+have no 1:1 mapping back to a single SOW row (matches the
+aggregate-output convention).
+
+### Verified by
+
+- **Unit tests** in `crates/cq-core/src/pivot.rs::tests` — single-measure,
+  multi-measure, out-of-list drop, dynamic discovery, UNPIVOT NULL-drop.
+- **Differential corpus** (`crates/cq-differential-tests/corpus/008_pivot.yaml`)
+  — three cases including the dynamic form. DataFusion can't plan PIVOT,
+  so these run through the harness's CQ-only fallback path: CQ output
+  is checked against declared `expected_rows`.
+- **Property tests** — `PIVOT(UNPIVOT(x)) ≡ x` modulo NULLs; dynamic-pivot
+  output equals static-pivot output when fed the discovered IN-list.
+
+### Client surface
+
+The bundled React demo's "Pivot" panel ([clients/react-demo/src/components/PivotPanel.tsx](clients/react-demo/src/components/PivotPanel.tsx))
+subscribes to `/positions` + `/securities` and renders an AG Grid
+pivot grouped by `sector`/`assetClass` with live deltas. The display
+preview shows the equivalent server-side SQL — the grid happens to
+do the pivot client-side for fine-grained cell-flash control, but the
+underlying engine can produce the same materialization in one query
+via `PIVOT (...) FOR ... IN (ANY)`.
 
 ---
 
@@ -664,3 +782,6 @@ peer = "cqserver-2:9010"
 | Client SDKs (JS, Python, Java) | v2 | |
 | Bookmark / replay | v2 | |
 | Aggregate subscriptions | v3 | GROUP BY with live updates |
+| PIVOT — static IN-list | v1 | S43 — `PIVOT (agg) FOR col IN ('a','b')`, multi-measure |
+| PIVOT — dynamic IN ANY | v1 (batch) | S45 — values discovered from data; continuous-mode deferred |
+| UNPIVOT | v1 | S43 — `UNPIVOT (val FOR colname IN (c1,c2,...))`, EXCLUDE NULLS |

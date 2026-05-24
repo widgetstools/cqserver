@@ -421,6 +421,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting transports + admin + replication...");
 
+    // Spawn the admin HTTP server on its OWN tokio runtime, on a
+    // dedicated OS thread. The original wiring had admin in the same
+    // `tokio::select!` as the WS/TCP transports — under heavy WS
+    // load (e.g. concurrent SOW-snapshot encoders), the shared
+    // runtime starved the admin handler and `/stats` / `/healthz`
+    // would time out, exactly when you most need them to debug what's
+    // happening. A dedicated 2-worker runtime guarantees the admin
+    // endpoint stays responsive regardless of what the data path is
+    // doing.
+    {
+        let admin_addr = admin_addr.clone();
+        let admin_state = admin_state.clone();
+        std::thread::Builder::new()
+            .name("cq-admin-rt".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .thread_name("cq-admin-worker")
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to build admin runtime");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(start_admin_server(admin_addr, admin_state)) {
+                    tracing::error!(error = %e, "Admin server exited with error");
+                }
+            })
+            .map_err(|e| format!("spawn admin thread: {}", e))?;
+    }
+
     let shutdown_topics = topics.clone();
     tokio::select! {
         result = websocket::start_ws_server(
@@ -435,11 +469,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "TCP server failed");
-            }
-        }
-        result = start_admin_server(admin_addr, admin_state) => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "Admin server failed");
             }
         }
         result = run_replication(

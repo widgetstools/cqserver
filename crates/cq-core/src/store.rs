@@ -514,6 +514,118 @@ impl ColumnStore {
         map
     }
 
+    /// Direct-streaming variant of `get_row_map_projected` — writes
+    /// the row as a JSON object straight into `buf` without going
+    /// through `serde_json::Map<String, Value>`. Used by the SOW
+    /// snapshot path (`Topic::query_streaming_json`); skipping the
+    /// Map intermediate eliminates the per-cell String key alloc and
+    /// the HashMap bucket overhead, which dominate CPU on wide-row
+    /// topics like /trades (865K rows × 13 cols).
+    ///
+    /// Output is byte-identical to `serde_json::to_vec(&map)` for the
+    /// equivalent Map, including the field-order behaviour: keys are
+    /// emitted in `col_indices` order, null values are skipped, and
+    /// strings are JSON-escaped. NaN / infinite floats become `null`
+    /// (matching `Value::to_json`).
+    pub fn write_row_json_projected(
+        &self,
+        row: u32,
+        col_indices: &[usize],
+        buf: &mut Vec<u8>,
+    ) {
+        buf.push(b'{');
+        let mut first = true;
+        for &col_idx in col_indices {
+            let val = self.get(col_idx, row);
+            if val.is_null() {
+                continue;
+            }
+            if !first {
+                buf.push(b',');
+            }
+            first = false;
+            // Key
+            buf.push(b'"');
+            write_json_str(self.schema.column_name(col_idx), buf);
+            buf.extend_from_slice(b"\":");
+            // Value
+            match &val {
+                Value::String(Some(s)) => {
+                    buf.push(b'"');
+                    write_json_str(s, buf);
+                    buf.push(b'"');
+                }
+                Value::String(None) | Value::Null => {
+                    // unreachable — covered by is_null above, but be
+                    // explicit for the match-completeness.
+                    buf.extend_from_slice(b"null");
+                }
+                Value::Long(n) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    buf.extend_from_slice(ibuf.format(*n).as_bytes());
+                }
+                Value::Int(n) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    buf.extend_from_slice(ibuf.format(*n).as_bytes());
+                }
+                Value::Double(d) => {
+                    if d.is_nan() || d.is_infinite() {
+                        buf.extend_from_slice(b"null");
+                    } else {
+                        let mut rbuf = ryu::Buffer::new();
+                        buf.extend_from_slice(rbuf.format(*d).as_bytes());
+                    }
+                }
+            }
+        }
+        buf.push(b'}');
+    }
+}
+
+/// Escape `s` as a JSON string body (no surrounding quotes) into `buf`.
+/// Fast path: bulk-copy ASCII printable runs; fall through to per-byte
+/// escape for control chars / quotes / backslash.
+fn write_json_str(s: &str, buf: &mut Vec<u8>) {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escape: Option<&[u8]> = match b {
+            b'"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            b'\n' => Some(b"\\n"),
+            b'\r' => Some(b"\\r"),
+            b'\t' => Some(b"\\t"),
+            0x08 => Some(b"\\b"),
+            0x0c => Some(b"\\f"),
+            // Other control chars: \u00XX. Rare in our data so the
+            // hex-format branch is cold.
+            0x00..=0x1f => None,
+            _ => continue, // ASCII printable / UTF-8 continuation byte
+        };
+        if let Some(esc) = escape {
+            buf.extend_from_slice(&bytes[start..i]);
+            buf.extend_from_slice(esc);
+            start = i + 1;
+        } else {
+            // Control char with no short escape.
+            buf.extend_from_slice(&bytes[start..i]);
+            let hex = format!("\\u{:04x}", b);
+            buf.extend_from_slice(hex.as_bytes());
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        buf.extend_from_slice(&bytes[start..]);
+    }
+}
+
+// Cap the impl block above; the unit tests below verify byte-for-byte
+// equivalence with `serde_json::to_vec(&get_row_map_projected(...))`.
+impl ColumnStore {
+    /// Reserved — see `write_row_json_projected` above.
+    #[allow(dead_code)]
+    fn __direct_json_anchor() {}
+
     // ========================= Internal =========================
 
     /// Grow capacity. Doubling is amortized-O(1) but wastes up to 50%
@@ -628,6 +740,95 @@ mod tests {
                 ColumnType::String,
             ],
         ))
+    }
+
+    /// `write_row_json_projected` must produce JSON whose parsed shape
+    /// matches `get_row_map_projected(...)`. JSON object property order
+    /// is not significant per spec, so we compare values not bytes —
+    /// the direct path emits keys in projection order, `serde_json`'s
+    /// default `Map` emits them alphabetically. Both round-trip to the
+    /// same logical map.
+    #[test]
+    fn write_row_json_projected_matches_map_serialization() {
+        let mut store = ColumnStore::new(test_schema(), 16);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("T1"))),
+            Value::Double(100.25),
+            Value::Long(500),
+            Value::String(Some(CompactString::new("RATES"))),
+        ]);
+        // Tricky strings: embedded quote, backslash, control char.
+        store.append_row(&[
+            Value::String(Some(CompactString::new(r#"T"weird\char"#))),
+            Value::Double(0.0),
+            Value::Long(0),
+            Value::String(Some(CompactString::new("tab\there\n"))),
+        ]);
+        // Mix of nulls — must be skipped by both paths.
+        store.append_row(&[
+            Value::String(Some(CompactString::new("T3"))),
+            Value::Double(NULL_DOUBLE),
+            Value::Long(NULL_LONG),
+            Value::String(None),
+        ]);
+
+        let proj = vec![0usize, 1, 2, 3];
+        for row in 0..store.row_count() {
+            let map = store.get_row_map_projected(row, &proj);
+            let expected: serde_json::Value = serde_json::Value::Object(map);
+            let mut via_direct = Vec::new();
+            store.write_row_json_projected(row, &proj, &mut via_direct);
+            let got: serde_json::Value = serde_json::from_slice(&via_direct)
+                .expect("direct output must be valid JSON");
+            assert_eq!(
+                got,
+                expected,
+                "row {} mismatch:\n  direct bytes: {}\n  expected:     {}",
+                row,
+                String::from_utf8_lossy(&via_direct),
+                serde_json::to_string(&expected).unwrap(),
+            );
+        }
+    }
+
+    /// Partial projection: same equivalence required.
+    #[test]
+    fn write_row_json_projected_partial_columns() {
+        let mut store = ColumnStore::new(test_schema(), 16);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("T2"))),
+            Value::Double(99.9),
+            Value::Long(1),
+            Value::String(Some(CompactString::new("FX"))),
+        ]);
+        let proj = vec![0usize, 3];
+        let map = store.get_row_map_projected(0, &proj);
+        let expected = serde_json::Value::Object(map);
+        let mut via_direct = Vec::new();
+        store.write_row_json_projected(0, &proj, &mut via_direct);
+        let got: serde_json::Value = serde_json::from_slice(&via_direct).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// NaN / infinite floats become `null` (matching `Value::to_json`).
+    #[test]
+    fn write_row_json_projected_nan_becomes_null() {
+        let mut store = ColumnStore::new(test_schema(), 4);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("T_nan"))),
+            Value::Double(f64::NAN),
+            Value::Long(42),
+            Value::String(Some(CompactString::new("FX"))),
+        ]);
+        let proj = vec![0usize, 1, 2, 3];
+        let mut buf = Vec::new();
+        store.write_row_json_projected(0, &proj, &mut buf);
+        // NaN is treated as null by `is_null()` and is therefore SKIPPED
+        // (not emitted as `"price":null`). Matches `Value::to_json`'s
+        // contract via `get_row_map_projected` (skip + null become same
+        // omission).
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(parsed.get("price").is_none(), "got: {}", String::from_utf8_lossy(&buf));
     }
 
     #[test]

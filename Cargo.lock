@@ -564,6 +564,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cq-client",
+ "futures",
  "hdrhistogram",
  "serde",
  "serde_json",

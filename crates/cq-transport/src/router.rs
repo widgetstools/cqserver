@@ -11,8 +11,158 @@ use cq_core::topic::SharedTopic;
 use cq_protocol::command::Command;
 use cq_protocol::message::CqMessage;
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+/// Cap on concurrent SOW-snapshot encoders. Each `sow_and_subscribe`
+/// against a wide topic kicks off a streaming snapshot that encodes
+/// the full result set as JSON; running too many in parallel saturates
+/// the runtime (the stress-2k harness reproduces this with 8
+/// concurrent PIVOT snapshots over /trades's 865K rows). Excess
+/// requests queue on the semaphore — they don't fail, they just wait
+/// in line. Tuned via the `CQSERVER_MAX_SNAPSHOT_ENCODERS` env var;
+/// default 4.
+fn snapshot_encoder_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let n: usize = std::env::var("CQSERVER_MAX_SNAPSHOT_ENCODERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(4);
+        Semaphore::new(n)
+    })
+}
+
+// ── Encode-once-fanout snapshot cache ──────────────────────────
+//
+// Two subscribers arriving close in time with the same (topic, SQL)
+// would otherwise each build a full snapshot. The cache lets the
+// first arrival build, and every subsequent arrival within the TTL
+// gets the SAME `Arc<Vec<Vec<u8>>>` back — one encode, N fanouts.
+//
+// Concurrency model: per-key tokio Notify. The first thread to claim
+// a missing key transitions the entry to `Building` and computes the
+// snapshot; subsequent threads see `Building`, await the notify, then
+// read `Ready`. After `TTL`, the entry is treated as missing and the
+// next caller rebuilds.
+
+use parking_lot::Mutex as PMutex;
+use std::collections::HashMap as StdHashMap;
+use tokio::sync::Notify;
+
+#[derive(Clone)]
+struct CachedSnapshot {
+    batches: Arc<Vec<Vec<Vec<u8>>>>,
+    expires_at: Instant,
+}
+
+enum SnapshotCacheState {
+    Building(Arc<Notify>),
+    Ready(CachedSnapshot),
+}
+
+fn snapshot_fanout_cache() -> &'static PMutex<StdHashMap<(String, String), SnapshotCacheState>> {
+    static CACHE: OnceLock<PMutex<StdHashMap<(String, String), SnapshotCacheState>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| PMutex::new(StdHashMap::new()))
+}
+
+/// How long a freshly-built snapshot stays in the cache. Tuned via
+/// `CQSERVER_SNAPSHOT_CACHE_TTL_MS`; default 500 ms — enough to
+/// absorb a wave of subs joining together, short enough that the
+/// data a new sub sees doesn't drift too far from "live".
+fn snapshot_cache_ttl() -> Duration {
+    let ms: u64 = std::env::var("CQSERVER_SNAPSHOT_CACHE_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    Duration::from_millis(ms)
+}
+
+/// Try to satisfy a snapshot request from the cache. Returns
+/// `Some(batches)` on hit; on miss, returns `None` and the caller
+/// should build the snapshot itself, then call
+/// `publish_snapshot_to_cache` so subsequent arrivals can reuse it.
+///
+/// Concurrent first-arrivers see `Building(notify)`; they await the
+/// notify and then retry the cache.
+async fn try_get_or_wait_snapshot(
+    topic: &str,
+    sql: &str,
+) -> Option<Arc<Vec<Vec<Vec<u8>>>>> {
+    let key = (topic.to_string(), sql.to_string());
+    let notify = {
+        let mut cache = snapshot_fanout_cache().lock();
+        match cache.get(&key) {
+            Some(SnapshotCacheState::Ready(snap)) if snap.expires_at > Instant::now() => {
+                metrics::counter!("cq_snapshot_cache_hit").increment(1);
+                return Some(snap.batches.clone());
+            }
+            Some(SnapshotCacheState::Building(n)) => {
+                let n = n.clone();
+                drop(cache);
+                n
+            }
+            // Either no entry or an expired Ready — claim it.
+            _ => {
+                let notify = Arc::new(Notify::new());
+                cache.insert(key.clone(), SnapshotCacheState::Building(notify.clone()));
+                metrics::counter!("cq_snapshot_cache_miss").increment(1);
+                return None; // caller will build + publish
+            }
+        }
+    };
+    // Wait for the builder to publish.
+    notify.notified().await;
+    metrics::counter!("cq_snapshot_cache_wait").increment(1);
+    let cache = snapshot_fanout_cache().lock();
+    if let Some(SnapshotCacheState::Ready(snap)) = cache.get(&key) {
+        if snap.expires_at > Instant::now() {
+            return Some(snap.batches.clone());
+        }
+    }
+    None
+}
+
+/// Publish the just-built snapshot into the cache so waiters wake up
+/// and subsequent arrivals within the TTL hit the cached copy.
+fn publish_snapshot_to_cache(topic: &str, sql: &str, batches: Arc<Vec<Vec<Vec<u8>>>>) {
+    let key = (topic.to_string(), sql.to_string());
+    let expires_at = Instant::now() + snapshot_cache_ttl();
+    let mut cache = snapshot_fanout_cache().lock();
+    let notify_to_wake = match cache.get(&key) {
+        Some(SnapshotCacheState::Building(n)) => Some(n.clone()),
+        _ => None,
+    };
+    cache.insert(
+        key,
+        SnapshotCacheState::Ready(CachedSnapshot {
+            batches,
+            expires_at,
+        }),
+    );
+    drop(cache);
+    if let Some(n) = notify_to_wake {
+        n.notify_waiters();
+    }
+}
+
+/// Abandon a Building entry — e.g. when the build itself failed. Wake
+/// any waiters so they fall back to building themselves.
+fn abandon_snapshot_cache_slot(topic: &str, sql: &str) {
+    let key = (topic.to_string(), sql.to_string());
+    let mut cache = snapshot_fanout_cache().lock();
+    let notify_to_wake = match cache.remove(&key) {
+        Some(SnapshotCacheState::Building(n)) => Some(n),
+        _ => None,
+    };
+    drop(cache);
+    if let Some(n) = notify_to_wake {
+        n.notify_waiters();
+    }
+}
 
 /// Aggregate of the per-server registries the router consults. Keeps
 /// the dispatch signature small as we add new resource types (topics,
@@ -1413,33 +1563,29 @@ async fn deliver_streaming_snapshot(
         }
     }
 
-    // Streaming iteration runs on a blocking worker so the column
-    // store's read lock and per-row projection don't tie up the async
-    // runtime. Batches flow through a bounded channel that gives us
-    // pipelined backpressure (writer drains as iterator produces).
-    let (batch_tx, mut batch_rx) =
-        tokio::sync::mpsc::channel::<Vec<serde_json::Map<String, serde_json::Value>>>(4);
-    let topic_for_block = topic.clone();
-    let sql_for_block = sql.clone();
-    let topic_label_for_block = topic_label.clone();
-    let iter_handle: tokio::task::JoinHandle<Result<usize, String>> =
-        tokio::task::spawn_blocking(move || {
-            let mut err: Option<String> = None;
-            let total = topic_for_block
-                .query_streaming(&sql_for_block, batch_size, |batch| {
-                    if err.is_some() {
-                        return;
-                    }
-                    if batch_tx.blocking_send(batch).is_err() {
-                        err = Some("consumer dropped".into());
-                    }
-                })
-                .map_err(|e| format!("query error on {}: {}", topic_label_for_block, e))?;
-            if let Some(e) = err {
-                return Err(e);
-            }
-            Ok(total)
-        });
+    // Snapshot-encoder concurrency cap. Each in-flight snapshot holds
+    // one permit for the duration of `query_streaming + WS drain`.
+    // When the cap is reached, new SOW requests wait here instead of
+    // piling onto the runtime in parallel. Permit is released on
+    // function return (drop scope). Acquisition only fails if the
+    // semaphore was closed — which we never do — so the unwrap is
+    // safe.
+    metrics::gauge!("cq_snapshot_queued").increment(1.0);
+    let _permit = snapshot_encoder_semaphore()
+        .acquire()
+        .await
+        .expect("snapshot semaphore closed");
+    metrics::gauge!("cq_snapshot_queued").decrement(1.0);
+    metrics::gauge!("cq_snapshot_active").increment(1.0);
+    // Decrement on drop so the active count is always accurate even on
+    // early returns.
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            metrics::gauge!("cq_snapshot_active").decrement(1.0);
+        }
+    }
+    let _active_guard = ActiveGuard;
 
     // group_begin carries the row count when known. For the streaming
     // path we don't know it without scanning, so emit it as 0 — the
@@ -1450,35 +1596,141 @@ async fn deliver_streaming_snapshot(
         }
     }
 
+    // Branch on codec: the JSON path uses `query_streaming_json` which
+    // skips the `serde_json::Map<String, Value>` intermediate, writing
+    // each row directly to a `Vec<u8>` in the columnar encoder. Saves
+    // the per-cell `String` key alloc + HashMap bucket overhead that
+    // dominates CPU on wide-row topics. Non-JSON codecs fall back to
+    // the old `Map`-based path; they have different on-wire
+    // serializations and don't share the win.
     let mut batches_sent: usize = 0;
     let mut rows_sent: usize = 0;
-    while let Some(batch) = batch_rx.recv().await {
-        let n = batch.len();
-        if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, batch)) {
-            if tx.send(f).await.is_err() {
-                tracing::warn!(
-                    session = %session_id,
-                    topic = %topic_label,
-                    rows_sent,
-                    "SOW snapshot aborted — session disconnected"
-                );
+    use cq_protocol::serialization::Codec;
+    let total: usize = if matches!(codec, Codec::Json) {
+        // ── JSON fast path with encode-once-fanout cache ─────────
+        //
+        // The cache lets multiple subs that arrive within ~500 ms of
+        // each other with the same (topic, sql) share one encoded
+        // snapshot. On a hit we just iterate the cached `Arc<Vec<
+        // Vec<u8>>>` and stream it to the wire — no encoder runs at
+        // all, no semaphore wait. Misses behave like the pre-cache
+        // path: spawn the encoder, drain batches, then publish the
+        // result so the next subscriber wins the cache.
+        let cached: Option<Arc<Vec<Vec<Vec<u8>>>>> =
+            try_get_or_wait_snapshot(&topic_label, &sql).await;
+
+        let batches: Arc<Vec<Vec<Vec<u8>>>> = if let Some(c) = cached {
+            c
+        } else {
+            // Cache miss — we hold the Building slot. If anything
+            // below fails we abandon it so waiters can retry.
+            let topic_for_block = topic.clone();
+            let sql_for_block = sql.clone();
+            let topic_label_for_block = topic_label.clone();
+            let collected: Result<Vec<Vec<Vec<u8>>>, String> =
+                tokio::task::spawn_blocking(move || {
+                    let mut all: Vec<Vec<Vec<u8>>> = Vec::new();
+                    topic_for_block
+                        .query_streaming_json(&sql_for_block, batch_size, |batch| {
+                            all.push(batch);
+                        })
+                        .map_err(|e| {
+                            format!("query error on {}: {}", topic_label_for_block, e)
+                        })?;
+                    Ok(all)
+                })
+                .await
+                .unwrap_or_else(|_| Err("snapshot task join failed".into()));
+            match collected {
+                Ok(all) => {
+                    let arc = Arc::new(all);
+                    publish_snapshot_to_cache(&topic_label, &sql, arc.clone());
+                    arc
+                }
+                Err(e) => {
+                    abandon_snapshot_cache_slot(&topic_label, &sql);
+                    if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                        let _ = tx.send(f).await;
+                    }
+                    return;
+                }
+            }
+        };
+
+        // Stream every cached batch as a sow_batch frame. Reading the
+        // cache is read-only; encoder ran (or didn't) above.
+        for batch in batches.iter() {
+            let n = batch.len();
+            if let Some(f) = crate::session::build_sow_batch_json_frame(&sub_id, batch) {
+                if tx.send(f).await.is_err() {
+                    tracing::warn!(
+                        session = %session_id,
+                        topic = %topic_label,
+                        rows_sent,
+                        "SOW snapshot aborted — session disconnected"
+                    );
+                    return;
+                }
+            }
+            batches_sent += 1;
+            rows_sent += n;
+        }
+        rows_sent
+    } else {
+        // ── Slow path for non-JSON codecs (bson, msgpack, fix) ─────
+        let (batch_tx, mut batch_rx) =
+            tokio::sync::mpsc::channel::<Vec<serde_json::Map<String, serde_json::Value>>>(4);
+        let topic_for_block = topic.clone();
+        let sql_for_block = sql.clone();
+        let topic_label_for_block = topic_label.clone();
+        let iter_handle: tokio::task::JoinHandle<Result<usize, String>> =
+            tokio::task::spawn_blocking(move || {
+                let mut err: Option<String> = None;
+                let total = topic_for_block
+                    .query_streaming(&sql_for_block, batch_size, |batch| {
+                        if err.is_some() {
+                            return;
+                        }
+                        if batch_tx.blocking_send(batch).is_err() {
+                            err = Some("consumer dropped".into());
+                        }
+                    })
+                    .map_err(|e| {
+                        format!("query error on {}: {}", topic_label_for_block, e)
+                    })?;
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                Ok(total)
+            });
+
+        while let Some(batch) = batch_rx.recv().await {
+            let n = batch.len();
+            if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, batch)) {
+                if tx.send(f).await.is_err() {
+                    tracing::warn!(
+                        session = %session_id,
+                        topic = %topic_label,
+                        rows_sent,
+                        "SOW snapshot aborted — session disconnected"
+                    );
+                    return;
+                }
+            }
+            batches_sent += 1;
+            rows_sent += n;
+        }
+
+        match iter_handle.await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                    let _ = tx.send(f).await;
+                }
                 return;
             }
+            Err(_) => return,
         }
-        batches_sent += 1;
-        rows_sent += n;
-    }
-
-    // Wait for the iterator to finish — surfaces any query error.
-    let total = match iter_handle.await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
-                let _ = tx.send(f).await;
-            }
-            return;
-        }
-        Err(_) => return,
     };
 
     if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
