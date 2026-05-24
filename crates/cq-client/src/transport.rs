@@ -7,7 +7,7 @@
 
 use crate::error::{ClientError, ClientResult};
 use bytes::BytesMut;
-use cq_protocol::codec::{decode_frame, encode_frame};
+use cq_protocol::codec::decode_frame;
 use cq_protocol::serialization::Codec;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -190,17 +190,27 @@ impl Transport {
     /// Send a frame encoded with `codec`. For TCP and TLS, both codec
     /// variants go out as length-prefixed bytes. For WebSocket, JSON
     /// goes out as a Text frame and MessagePack as a Binary frame.
-    pub async fn send(&mut self, codec: Codec, body: &[u8]) -> ClientResult<()> {
+    /// `compression` is the wire-level compression mode negotiated on
+    /// Logon — only honoured for TCP/TLS sends; WebSocket frames
+    /// stay uncompressed at the protocol layer (rely on
+    /// permessage-deflate on the WS extension if compression is
+    /// desired).
+    pub async fn send(
+        &mut self,
+        codec: Codec,
+        body: &[u8],
+        compression: cq_protocol::compression::Compression,
+    ) -> ClientResult<()> {
         match self {
             Transport::Tcp { write, .. } => {
                 let mut out = BytesMut::new();
-                encode_frame(body, &mut out);
+                cq_protocol::codec::encode_frame_with(body, &mut out, compression);
                 write.write_all(&out).await?;
                 Ok(())
             }
             Transport::Tls { write, .. } => {
                 let mut out = BytesMut::new();
-                encode_frame(body, &mut out);
+                cq_protocol::codec::encode_frame_with(body, &mut out, compression);
                 write.write_all(&out).await?;
                 Ok(())
             }
@@ -215,7 +225,9 @@ impl Transport {
                             })?;
                         Message::Text(s.into())
                     }
-                    Codec::MessagePack | Codec::Bson => Message::Binary(body.to_vec().into()),
+                    Codec::MessagePack | Codec::Bson | Codec::Fix => {
+                        Message::Binary(body.to_vec().into())
+                    }
                 };
                 stream.send(msg).await?;
                 Ok(())

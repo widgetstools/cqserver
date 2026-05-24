@@ -1,0 +1,56 @@
+# Aggregate functions over the full table (no GROUP BY). Catches
+# arithmetic semantics, empty-result behaviour (SUM/COUNT on no rows),
+# and NULL handling within aggregates.
+- name: count_star
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30 }
+  query: "SELECT COUNT(*) AS c FROM t"
+  expected_rows:
+    - { c: 3 }
+
+- name: count_star_empty_table
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes: []
+  query: "SELECT COUNT(*) AS c FROM t"
+  expected_rows:
+    - { c: 0 }
+  notes: |
+    ANSI SQL `COUNT(*) FROM <empty>` returns one row with c=0.
+    Pre-fix CQ returned `[]`; the aggregate executor now emits a
+    synthetic single-group row when there's no GROUP BY and the
+    input is empty.
+
+- name: sum_of_values
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30 }
+  query: "SELECT SUM(v) AS s FROM t"
+  expected_rows:
+    - { s: 60 }
+
+- name: min_max
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 50 }
+    - { id: 2, v: 10 }
+    - { id: 3, v: 100 }
+  query: "SELECT MIN(v) AS mn, MAX(v) AS mx FROM t"
+  expected_rows:
+    - { mn: 10, mx: 100 }

@@ -81,7 +81,7 @@ pub enum MutationKind {
 }
 
 /// Event emitted to the evaluator after any mutation to the topic's store.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MutationEvent {
     pub row: u32,
     /// Monotonic sequence assigned at the moment of the write. Forwarded
@@ -89,6 +89,13 @@ pub struct MutationEvent {
     pub sequence: u64,
     /// What kind of mutation triggered this event. See [`MutationKind`].
     pub kind: MutationKind,
+    /// Columns the publisher actually wrote (S46 / review C3). `None`
+    /// means "all columns" — used by full upserts and deletes, where
+    /// every subscription needs to be evaluated. `Some(...)` is set
+    /// by sparse-publish paths (`delta_upsert_map`): the dispatcher
+    /// then routes through `PredicateIndex` to skip subscriptions
+    /// whose predicate references no column in the changed set.
+    pub changed_cols: Option<Vec<usize>>,
 }
 
 /// Internal: schema + store + key index. Schema is held here (not on `Topic`)
@@ -143,11 +150,41 @@ pub struct Topic {
     sub_engine: Mutex<SubscriptionEngine>,
     mutation_tx: Sender<MutationEvent>,
     mutation_rx_holder: Mutex<Option<Receiver<MutationEvent>>>,
+    /// Secondary fan-out for derived consumers (S20 views). Every
+    /// `MutationEvent` that the topic emits on `mutation_tx` is also
+    /// `try_send`-fanned to every registered tap. Senders that fail
+    /// to deliver (closed receiver, full bounded queue) are silently
+    /// pruned on the next write; the regular subscription path is
+    /// unaffected. Bounded senders are used so a slow view runner
+    /// can't unbounded-grow memory on a hot publisher.
+    view_taps: Mutex<Vec<Sender<MutationEvent>>>,
     txlog: Option<Arc<Mutex<TxLogWriter>>>,
     /// Monotonic sequence counter. Persistent topics seed this from the
     /// txlog's `max_sequence` on attach so that post-recovery numbering
     /// continues uninterrupted.
     next_sequence: AtomicU64,
+    /// Highest sequence ACTUALLY APPLIED to the store (live publish OR
+    /// replay). Drives multi-path dedup independently of
+    /// `next_sequence` — the latter gets seeded from the txlog's
+    /// `max_sequence` at `attach_txlog` time, so it can't double as
+    /// the dedup watermark (it would silently suppress every
+    /// recovery replay because `entry.sequence <= seeded next_sequence`
+    /// is true for every entry). Initialized to 0; bumped by replay
+    /// paths and by live `write_store`.
+    last_applied_sequence: AtomicU64,
+    /// S11 — highest sequence the configured replication destination
+    /// has confirmed it applied. Bumped by the shipper's Ack reader;
+    /// awaited by the publish path in sync-replication mode so the
+    /// publisher's ack only returns after the standby has durably
+    /// observed the entry. `0` if no replication is configured or
+    /// no Ack has arrived yet.
+    last_replicated_sequence: AtomicU64,
+    /// S11 — wakeup channel for the await side of the replication
+    /// barrier. The shipper's Ack reader calls `notify_waiters`
+    /// every time it bumps `last_replicated_sequence`; the publish
+    /// path's `await_replicated` loops on the notify until the
+    /// observed value reaches its target.
+    replication_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Topic {
@@ -165,8 +202,12 @@ impl Topic {
             sub_engine: Mutex::new(SubscriptionEngine::new()),
             mutation_tx,
             mutation_rx_holder: Mutex::new(Some(mutation_rx)),
+            view_taps: Mutex::new(Vec::new()),
             txlog: None,
             next_sequence: AtomicU64::new(0),
+            last_applied_sequence: AtomicU64::new(0),
+            last_replicated_sequence: AtomicU64::new(0),
+            replication_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -262,17 +303,29 @@ impl Topic {
         self.config.conflation_ms
     }
 
-    /// Run one pass of TTL expiration: any row whose `last_touched`
-    /// is older than `config.expire_seconds` is deleted via the
-    /// regular `delete()` path (so subscribers receive a `Remove`
-    /// and the txlog records a tombstone). Returns the keys deleted.
+    /// Run one pass of TTL expiration. Any row whose `last_touched`
+    /// is older than `config.expire_seconds` is eligible for delete;
+    /// the actual delete re-checks `last_touched` **under the same
+    /// write lock** that mutates it, so a publish racing the sweeper
+    /// can't lose data:
+    ///
+    /// - Sweep observes K1 expired in its read-lock pass.
+    /// - Sweep releases the read lock.
+    /// - Publisher refreshes K1 under the write lock (bumps
+    ///   `last_touched` to "now").
+    /// - Sweep re-takes the write lock, re-checks K1's
+    ///   `last_touched`: now ≥ ttl is false → SKIP. K1 survives.
+    ///
+    /// Without this re-check (the old code path), the sweep would
+    /// proceed to delete K1 after the publish, silently dropping a
+    /// row the publisher just wrote. Worklog S40 / review C9.
     pub fn sweep_expired(&self) -> Result<Vec<String>, TopicError> {
         let Some(ttl_s) = self.config.expire_seconds else {
             return Ok(Vec::new());
         };
         let now = std::time::Instant::now();
         let ttl = std::time::Duration::from_secs(ttl_s);
-        let expired_keys: Vec<String> = {
+        let candidate_keys: Vec<String> = {
             let state = self.state.read();
             state
                 .key_to_row
@@ -286,17 +339,89 @@ impl Topic {
                 })
                 .collect()
         };
-        for k in &expired_keys {
-            let _ = self.delete(k)?;
+        let mut actually_expired = Vec::with_capacity(candidate_keys.len());
+        for k in &candidate_keys {
+            if self.delete_if_still_expired(k, ttl, now)? {
+                actually_expired.push(k.clone());
+            }
         }
-        if !expired_keys.is_empty() {
+        if !actually_expired.is_empty() {
             metrics::counter!(
                 "cq_topic_ttl_expired_total",
                 "topic" => self.config.name.clone()
             )
-            .increment(expired_keys.len() as u64);
+            .increment(actually_expired.len() as u64);
         }
-        Ok(expired_keys)
+        Ok(actually_expired)
+    }
+
+    /// Delete `key` ONLY if its `last_touched` (read under the same
+    /// write lock that mutates it) still satisfies `now - last_touched
+    /// >= ttl` relative to the sweeper-observed `sweep_observed_at`.
+    /// If the row was republished between the sweep's read-lock scan
+    /// and this call, the re-check fails and the delete is suppressed.
+    /// Returns `true` iff a delete actually happened.
+    fn delete_if_still_expired(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+        sweep_observed_at: std::time::Instant,
+    ) -> Result<bool, TopicError> {
+        let mut state = self.state.write();
+        let Some(row) = state.key_to_row.get(key).copied() else {
+            // Row already gone (e.g., concurrent delete won). Not an
+            // error — just not our responsibility to expire.
+            return Ok(false);
+        };
+        let last_touched = match state.last_touched.get(row as usize) {
+            Some(ts) => *ts,
+            None => return Ok(false),
+        };
+        // Re-check: is the row STILL expired? `last_touched > sweep_observed_at`
+        // means a publish refreshed it after the sweep saw it; bail.
+        // Otherwise use the original sweep timestamp to decide
+        // expiry, not "now" — that way two sweepers that fire close
+        // together don't double-evaluate against a sliding clock.
+        if last_touched > sweep_observed_at {
+            return Ok(false);
+        }
+        if sweep_observed_at.duration_since(last_touched) < ttl {
+            return Ok(false);
+        }
+        // Still expired. Remove key, null row, allocate seq, log,
+        // emit event — all under the write lock we're already
+        // holding. Inlined from `delete()` because we already own
+        // the lock and don't want to drop + re-acquire it.
+        state.key_to_row.remove(key);
+        if !state.secondary_index.is_empty() {
+            let indexed: Vec<usize> = state.secondary_index.indexed_columns().to_vec();
+            for col in indexed {
+                let v = state.store.get(col, row);
+                state.secondary_index.remove(col, &v, row);
+            }
+        }
+        state.store.null_out_row(row);
+
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(log) = &self.txlog {
+            let mut log = log.lock();
+            log.append(seq, self.name(), key, &[])?;
+        }
+        let event = MutationEvent {
+            row,
+            sequence: seq,
+            kind: MutationKind::Delete,
+            // Deletes null every column — and the evaluator's
+            // Delete branch forces `matches = false` regardless of
+            // predicate, so any sub that had this row in its
+            // active set fires. None = "all subs need to be
+            // checked" — index pruning doesn't apply here.
+            changed_cols: None,
+        };
+        let _ = self.mutation_tx.send(event.clone());
+        self.fanout_view_tap(&event);
+        drop(state);
+        Ok(true)
     }
 
     /// Topic's configured TTL, if any. Exposed so the server can
@@ -325,6 +450,48 @@ impl Topic {
     /// is then passed to the evaluator thread.
     pub fn take_mutation_rx(&self) -> Option<Receiver<MutationEvent>> {
         self.mutation_rx_holder.lock().take()
+    }
+
+    /// Attach a secondary tap on this topic's mutation stream. Returns
+    /// a `Receiver` that gets a copy of every subsequent `MutationEvent`
+    /// the topic emits. Used by S20 view runners to wake up and
+    /// re-aggregate; multiple taps are supported (one per view).
+    ///
+    /// `cap` is the bounded queue depth — a slow view runner that
+    /// can't keep up will drop events when its queue fills (the
+    /// metric `cq_topic_view_tap_drops_total` ticks). View runners
+    /// must be coalescing — re-aggregation reads current store state
+    /// every tick, so a dropped tap event just delays the next
+    /// refresh by one tick of the next event the runner does
+    /// observe.
+    pub fn register_view_tap(&self, cap: usize) -> Receiver<MutationEvent> {
+        let (tx, rx) = crossbeam_channel::bounded(cap);
+        self.view_taps.lock().push(tx);
+        rx
+    }
+
+    /// Fan out one mutation event to every registered view tap.
+    /// Best-effort: a tap whose receiver is closed is pruned; a tap
+    /// whose bounded queue is full drops the event and increments the
+    /// drop counter. The hot write path stays non-blocking.
+    fn fanout_view_tap(&self, event: &MutationEvent) {
+        let mut taps = self.view_taps.lock();
+        if taps.is_empty() {
+            return;
+        }
+        let topic_name = self.config.name.clone();
+        taps.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                metrics::counter!(
+                    "cq_topic_view_tap_drops_total",
+                    "topic" => topic_name.clone()
+                )
+                .increment(1);
+                true
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+        });
     }
 
     /// Compute a key from a `values` vector using the current key column
@@ -406,46 +573,103 @@ impl Topic {
 
     // ==================== Write API ====================
 
-    /// Internal store write. Inserts or updates the row identified by the
-    /// key derived from `values`. Optionally emits a `MutationEvent`
-    /// stamped with the given `sequence`. Maintains the secondary
-    /// index transactionally under the same write lock so a concurrent
-    /// reader never sees a half-updated index.
-    fn write_store(&self, values: Vec<Value>, sequence: u64, emit_event: bool) -> u32 {
-        let row = {
-            let mut state = self.state.write();
-            let key = Self::compute_key_with(&values, &state.key_col_indices);
-            let now = std::time::Instant::now();
-            if let Some(key) = &key {
-                if let Some(&existing_row) = state.key_to_row.get(key) {
-                    Self::reindex_row(&mut state, existing_row, &values);
-                    state.store.update_row(existing_row, &values);
-                    if let Some(slot) = state.last_touched.get_mut(existing_row as usize) {
-                        *slot = now;
-                    }
-                    existing_row
-                } else {
-                    let row = state.store.append_row(&values);
-                    state.key_to_row.insert(key.clone(), row);
-                    Self::index_new_row(&mut state, row, &values);
-                    Self::push_last_touched(&mut state, row, now);
-                    row
+    /// Mutation logic shared by the live publish path and the recovery
+    /// replay path. Holds `state.write()` for its entire duration, so the
+    /// secondary index update is transactional w.r.t. concurrent readers.
+    /// Returns the row index that was written or updated.
+    fn commit_values_locked(state: &mut StoreState, values: &[Value]) -> u32 {
+        let key = Self::compute_key_with(values, &state.key_col_indices);
+        let now = std::time::Instant::now();
+        if let Some(key) = &key {
+            if let Some(&existing_row) = state.key_to_row.get(key) {
+                Self::reindex_row(state, existing_row, values);
+                state.store.update_row(existing_row, values);
+                if let Some(slot) = state.last_touched.get_mut(existing_row as usize) {
+                    *slot = now;
                 }
+                existing_row
             } else {
-                let row = state.store.append_row(&values);
-                Self::index_new_row(&mut state, row, &values);
-                Self::push_last_touched(&mut state, row, now);
+                let row = state.store.append_row(values);
+                state.key_to_row.insert(key.clone(), row);
+                Self::index_new_row(state, row, values);
+                Self::push_last_touched(state, row, now);
                 row
             }
-        };
-        if emit_event {
-            let _ = self.mutation_tx.send(MutationEvent {
-                row,
-                sequence,
-                kind: MutationKind::Upsert,
-            });
+        } else {
+            let row = state.store.append_row(values);
+            Self::index_new_row(state, row, values);
+            Self::push_last_touched(state, row, now);
+            row
         }
-        row
+    }
+
+    /// Live publish path. Allocates the sequence and optionally appends
+    /// to the txlog **inside the same `state.write()` lock** that commits
+    /// the row, then emits the `MutationEvent` before releasing.
+    ///
+    /// This is the atomicity boundary the `sow_and_subscribe` contract
+    /// (C1 / S32) relies on: a subscriber holding `state.read()` cannot
+    /// observe `next_sequence = N` without also seeing every mutation
+    /// whose sequence is ≤ N in its snapshot, because all of those
+    /// mutations have already committed under `state.write()`. Setting
+    /// `Subscription::live_start_sequence = captured + 1` then makes the
+    /// evaluator suppress redelivery of any event already covered by the
+    /// snapshot — eliminating both the missed-update and duplicate-Add
+    /// races the contract guards against.
+    ///
+    /// `log_args = Some((key, payload))` — append `(seq, key, payload)`
+    /// to the topic's txlog if one is attached; `None` skips the log
+    /// (test-only typed upsert path).
+    fn write_store(
+        &self,
+        values: Vec<Value>,
+        log_args: Option<(&str, &[u8])>,
+        emit_event: bool,
+    ) -> Result<(u32, u64), TopicError> {
+        self.write_store_with_changed(values, log_args, emit_event, None)
+    }
+
+    fn write_store_with_changed(
+        &self,
+        values: Vec<Value>,
+        log_args: Option<(&str, &[u8])>,
+        emit_event: bool,
+        changed_cols: Option<Vec<usize>>,
+    ) -> Result<(u32, u64), TopicError> {
+        let mut state = self.state.write();
+        // Sequence is allocated under state.write() so subscribers cannot
+        // observe `next_sequence` advance past N without also seeing the
+        // mutation for N in their snapshot. fetch_add returns the prior
+        // value; we use `+ 1` so sequences are 1-based and monotonic.
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some((key, payload)) = log_args {
+            if let Some(log) = &self.txlog {
+                let mut log = log.lock();
+                log.append(seq, self.name(), key, payload)?;
+            }
+        }
+        let row = Self::commit_values_locked(&mut state, &values);
+        if emit_event {
+            let event = MutationEvent {
+                row,
+                sequence: seq,
+                kind: MutationKind::Upsert,
+                changed_cols: changed_cols.clone(),
+            };
+            let _ = self.mutation_tx.send(event.clone());
+            self.fanout_view_tap(&event);
+        }
+        drop(state);
+        Ok((row, seq))
+    }
+
+    /// Recovery replay path. Uses the caller-provided `sequence` (from
+    /// the txlog entry) instead of allocating a new one; never writes to
+    /// the txlog (the entry is already there); never emits a mutation
+    /// event (evaluators aren't running yet during recovery).
+    fn write_store_replay(&self, values: &[Value], _sequence: u64) -> u32 {
+        let mut state = self.state.write();
+        Self::commit_values_locked(&mut state, values)
     }
 
     /// Extend the `last_touched` Vec to cover `row`, setting the
@@ -508,35 +732,26 @@ impl Topic {
         }
     }
 
-    /// Allocate the next sequence and, if a txlog is attached, persist the
-    /// entry with that same sequence under the writer's lock. This keeps
-    /// the txlog's on-disk order monotonic across concurrent writers.
-    fn assign_sequence_and_log(
-        &self,
-        key: &str,
-        payload: &[u8],
-    ) -> Result<u64, TopicError> {
-        if let Some(log) = &self.txlog {
-            let mut log = log.lock();
-            let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-            log.append(seq, self.name(), key, payload)?;
-            Ok(seq)
-        } else {
-            Ok(self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1)
-        }
-    }
 
     fn bump_sequence_to(&self, seq: u64) {
-        let mut current = self.next_sequence.load(Ordering::Relaxed);
-        while current < seq {
-            match self.next_sequence.compare_exchange(
-                current,
-                seq,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
+        // Bump both watermarks: `next_sequence` so subsequent live
+        // publishes don't reuse a sequence the replay already
+        // consumed, and `last_applied_sequence` so the multi-path
+        // dedup gate (`replay_upsert_map`, `replay_delete`)
+        // correctly suppresses re-applications of already-applied
+        // sequences.
+        for atom in [&self.next_sequence, &self.last_applied_sequence] {
+            let mut current = atom.load(Ordering::Relaxed);
+            while current < seq {
+                match atom.compare_exchange(
+                    current,
+                    seq,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
             }
         }
     }
@@ -546,8 +761,10 @@ impl Topic {
     /// typed values can't be losslessly serialized to JSON without going
     /// through the schema. Production publishes should use `upsert_map`.
     pub fn upsert(&self, values: Vec<Value>) -> u32 {
-        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        self.write_store(values, seq, true)
+        let (row, _seq) = self
+            .write_store(values, None, true)
+            .expect("typed upsert path does not write to txlog and cannot error");
+        row
     }
 
     /// Publish from a JSON map. Triggers schema discovery on the first
@@ -577,7 +794,6 @@ impl Topic {
 
         let key = self.compute_key_from_map(flat).unwrap_or_default();
         let payload = serde_json::to_vec(&serde_json::Value::Object(flat.clone()))?;
-        let seq = self.assign_sequence_and_log(&key, &payload)?;
 
         let values: Vec<Value> = {
             let state = self.state.read();
@@ -592,7 +808,11 @@ impl Topic {
                 })
                 .collect()
         };
-        self.write_store(values, seq, true);
+        // Sequence allocation + txlog append + store mutation + event
+        // emission all happen inside write_store under state.write(),
+        // so a concurrent subscriber observing next_sequence will also
+        // see this mutation in its snapshot (S32 atomicity contract).
+        let (_row, seq) = self.write_store(values, Some((&key, &payload)), true)?;
         Ok(seq)
     }
 
@@ -624,12 +844,15 @@ impl Topic {
 
         // Build the fully-merged row + the per-column value vec under
         // one read pass. For columns the publisher supplied: use the
-        // new value. For columns it omitted: read the existing value
-        // from the store (or use Null for a brand-new row).
-        let (values, merged_payload_map) = {
+        // new value AND record the column index in `changed_cols` so
+        // the evaluator's `PredicateIndex` (S46) can skip
+        // subscriptions whose predicates reference no changed
+        // column.
+        let (values, merged_payload_map, changed_cols) = {
             let state = self.state.read();
             let existing_row = state.key_to_row.get(&key).copied();
             let mut payload = serde_json::Map::with_capacity(state.schema.column_count());
+            let mut changed_cols: Vec<usize> = Vec::new();
             let values: Vec<Value> = state
                 .schema
                 .columns()
@@ -640,6 +863,7 @@ impl Topic {
                     if let Some(v) = flat.get(name) {
                         let typed = Value::from_json(v, col.col_type());
                         payload.insert(name.to_string(), typed.to_json());
+                        changed_cols.push(i);
                         typed
                     } else if let Some(row) = existing_row {
                         let typed = state.store.get(i, row);
@@ -652,13 +876,17 @@ impl Topic {
                     }
                 })
                 .collect();
-            (values, payload)
+            (values, payload, changed_cols)
         };
 
         let payload_bytes =
             serde_json::to_vec(&serde_json::Value::Object(merged_payload_map))?;
-        let seq = self.assign_sequence_and_log(&key, &payload_bytes)?;
-        self.write_store(values, seq, true);
+        let (_row, seq) = self.write_store_with_changed(
+            values,
+            Some((&key, &payload_bytes)),
+            true,
+            Some(changed_cols),
+        )?;
         Ok(seq)
     }
 
@@ -674,36 +902,40 @@ impl Topic {
     /// synchronous catch-up, or carrying snapshots inside events; both
     /// are deferred to a future compaction pass.
     pub fn delete(&self, key: &str) -> Result<Option<u64>, TopicError> {
-        // Look up + null out under the state lock first. Also remove
-        // the row from every secondary index it appears in — a deleted
-        // row must never surface from an indexed lookup.
-        let row_opt = {
-            let mut state = self.state.write();
-            match state.key_to_row.remove(key) {
-                Some(row) => {
-                    if !state.secondary_index.is_empty() {
-                        let indexed: Vec<usize> =
-                            state.secondary_index.indexed_columns().to_vec();
-                        for col in indexed {
-                            let v = state.store.get(col, row);
-                            state.secondary_index.remove(col, &v, row);
-                        }
-                    }
-                    state.store.null_out_row(row);
-                    Some(row)
-                }
-                None => None,
-            }
-        };
-        let Some(row) = row_opt else {
+        // Sequence allocation, txlog append, store mutation, and event
+        // emission all happen under a single state.write() lock so a
+        // concurrent subscriber holding state.read() cannot observe
+        // next_sequence advance past the delete's sequence without
+        // also seeing the row already removed from its snapshot
+        // (S32 atomicity contract).
+        let mut state = self.state.write();
+        let Some(row) = state.key_to_row.remove(key) else {
             return Ok(None);
         };
-        let seq = self.assign_sequence_and_log(key, &[])?;
-        let _ = self.mutation_tx.send(MutationEvent {
+        if !state.secondary_index.is_empty() {
+            let indexed: Vec<usize> = state.secondary_index.indexed_columns().to_vec();
+            for col in indexed {
+                let v = state.store.get(col, row);
+                state.secondary_index.remove(col, &v, row);
+            }
+        }
+        state.store.null_out_row(row);
+
+        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(log) = &self.txlog {
+            let mut log = log.lock();
+            log.append(seq, self.name(), key, &[])?;
+        }
+
+        let event = MutationEvent {
             row,
             sequence: seq,
             kind: MutationKind::Delete,
-        });
+            changed_cols: None,
+        };
+        let _ = self.mutation_tx.send(event.clone());
+        self.fanout_view_tap(&event);
+        drop(state);
         Ok(Some(seq))
     }
 
@@ -720,7 +952,9 @@ impl Topic {
         // (e.g., A→B and A→C→B in an active/active topology) can
         // arrive twice. Apply once-only by gating on the topic's
         // sequence high-water.
-        if sequence <= self.current_sequence() && self.current_sequence() > 0 {
+        if sequence <= self.last_applied_sequence.load(Ordering::Acquire)
+            && self.last_applied_sequence.load(Ordering::Acquire) > 0
+        {
             metrics::counter!(
                 "cq_topic_replay_dedup_total",
                 "topic" => self.config.name.clone()
@@ -749,14 +983,16 @@ impl Topic {
                 })
                 .collect()
         };
-        self.write_store(values, sequence, false);
+        self.write_store_replay(&values, sequence);
         self.bump_sequence_to(sequence);
     }
 
     /// Recovery-only delete. Nulls the row if present; updates the
     /// sequence high-water mark.
     pub fn replay_delete(&self, sequence: u64, key: &str) {
-        if sequence <= self.current_sequence() && self.current_sequence() > 0 {
+        if sequence <= self.last_applied_sequence.load(Ordering::Acquire)
+            && self.last_applied_sequence.load(Ordering::Acquire) > 0
+        {
             metrics::counter!(
                 "cq_topic_replay_dedup_total",
                 "topic" => self.config.name.clone()
@@ -793,7 +1029,9 @@ impl Topic {
 
     /// Variant that takes the originating mutation kind, so the engine
     /// can emit `Oof` for predicate-flip exits vs `Remove` for real
-    /// deletes (see [`MutationKind`]).
+    /// deletes (see [`MutationKind`]). Iterates every registered
+    /// subscription — used by full-row publishes, deletes, recovery
+    /// replay, and tests that don't know the changed-column set.
     pub fn evaluate_row_kind(
         &self,
         row: u32,
@@ -805,7 +1043,49 @@ impl Topic {
         engine.evaluate_row_kind(row, sequence, &state.store, kind)
     }
 
+    /// Index-routed variant (S46 / review C3): only evaluates
+    /// subscriptions whose predicate references at least one of the
+    /// columns in `changed_cols`. Used by the sparse-publish path
+    /// (`delta_upsert_map`) to skip work for subscriptions that
+    /// can't possibly be affected by the mutation. `None` for
+    /// `changed_cols` falls through to the all-subs path, so this
+    /// is a strict superset of `evaluate_row_kind`'s semantics.
+    pub fn evaluate_row_kind_indexed(
+        &self,
+        row: u32,
+        sequence: u64,
+        kind: MutationKind,
+        changed_cols: Option<&[usize]>,
+    ) -> Vec<Delta> {
+        let state = self.state.read();
+        let mut engine = self.sub_engine.lock();
+        engine.evaluate_row_kind_indexed(row, sequence, &state.store, kind, changed_cols)
+    }
+
     // ==================== Query API ====================
+
+    /// Execute a pre-parsed query against this topic's store, with
+    /// the tombstone filter applied at the aggregate level. View
+    /// runners (S20) use this on every source mutation to recompute
+    /// their aggregate output; threading the topic's live-rows
+    /// bitmap into the aggregate executor ensures tombstoned source
+    /// rows don't bucket into a phantom null-key group.
+    ///
+    /// For non-aggregate queries, behaves the same as
+    /// `execute_query_with_index` — the row-oriented path's tombstone
+    /// filter is applied separately by `Topic::query` so an opt-out
+    /// caller (e.g. internal cross-checks) can still read raw rows.
+    pub fn execute_parsed_query(&self, parsed: &ParsedQuery) -> QueryResult {
+        let state = self.state.read();
+        let live_rows: roaring::RoaringBitmap =
+            state.key_to_row.values().copied().collect();
+        crate::query::execute_query_with_index_filtered(
+            parsed,
+            &state.store,
+            Some(&state.secondary_index),
+            Some(&live_rows),
+        )
+    }
 
     pub fn query(&self, sql: &str) -> Result<QueryResult, QueryError> {
         let state = self.state.read();
@@ -817,19 +1097,36 @@ impl Topic {
         );
         // Tombstone filter: rows removed via `delete()` or TTL sweep
         // are nulled in place (the row index isn't reused) and so
-        // still surface in the raw store scan. Drop them here by
-        // re-deriving the row's key and checking live `key_to_row`.
-        // Skip for aggregate queries — they emit one row per group
-        // key, not per source row, so the key-based filter doesn't
-        // apply.
-        let is_aggregate = parsed.is_aggregate() || !parsed.group_by.is_empty();
-        if !is_aggregate && !self.config.key_fields.is_empty() {
-            let live_keys: std::collections::HashSet<&String> = state.key_to_row.keys().collect();
-            result.rows.retain(|row| {
-                self.compute_key_from_map(row)
-                    .map(|k| live_keys.contains(&k))
-                    .unwrap_or(false)
-            });
+        // still surface in the raw store scan. Drop them by row-
+        // index lookup against `state.key_to_row`'s value set —
+        // robust against projections that omit the key column
+        // (the pre-fix code re-derived the key from the projection
+        // and silently dropped every row when that re-derivation
+        // returned `None`).
+        //
+        // Skip for aggregate queries AND pivot/unpivot queries —
+        // their output rows are synthesized (one row per group key
+        // or one row per (input_row × source_col)), not in lockstep
+        // with `state.store` row indices, so per-source-row
+        // tombstone semantics don't apply.
+        let synth_output = parsed.is_aggregate()
+            || !parsed.group_by.is_empty()
+            || parsed.is_pivot();
+        if !synth_output && !self.config.key_fields.is_empty() {
+            let live_rows: std::collections::HashSet<u32> =
+                state.key_to_row.values().copied().collect();
+            // Walk rows + source_rows in lockstep; retain only
+            // entries whose source row index is still live.
+            let mut kept_rows = Vec::with_capacity(result.rows.len());
+            let mut kept_src = Vec::with_capacity(result.source_rows.len());
+            for (row_map, src) in result.rows.into_iter().zip(result.source_rows.into_iter()) {
+                if live_rows.contains(&src) {
+                    kept_rows.push(row_map);
+                    kept_src.push(src);
+                }
+            }
+            result.rows = kept_rows;
+            result.source_rows = kept_src;
             result.total_matches = result.rows.len();
         }
         Ok(result)
@@ -870,18 +1167,22 @@ impl Topic {
                 &state.store,
                 Some(&state.secondary_index),
             );
-            // Drop tombstoned rows (same filter as `query()`).
-            // Aggregate queries are exempt — their output is one row
-            // per group key, not per source row.
+            // Drop tombstoned rows by row-index lookup (same filter
+            // shape as `query()` — robust against projections that
+            // omit the key column).
             let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
             if !is_aggregate && !self.config.key_fields.is_empty() {
-                let live_keys: std::collections::HashSet<&String> =
-                    state.key_to_row.keys().collect();
-                result.rows.retain(|row| {
-                    self.compute_key_from_map(row)
-                        .map(|k| live_keys.contains(&k))
-                        .unwrap_or(false)
-                });
+                let live_rows: std::collections::HashSet<u32> =
+                    state.key_to_row.values().copied().collect();
+                let mut kept_rows = Vec::with_capacity(result.rows.len());
+                for (row_map, src) in
+                    result.rows.into_iter().zip(result.source_rows.iter().copied())
+                {
+                    if live_rows.contains(&src) {
+                        kept_rows.push(row_map);
+                    }
+                }
+                result.rows = kept_rows;
             }
             let total = result.rows.len();
             drop(state);
@@ -973,14 +1274,72 @@ impl Topic {
     ) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, ParsedQuery), QueryError> {
         let state = self.state.read();
         let query = parse_query(sql, &state.schema)?;
-        let result = execute_query(&query, &state.store);
+        let mut result = execute_query(&query, &state.store);
+        // Drop tombstoned rows from the snapshot by row-index
+        // lookup — same shape as `query()` / streaming. Robust to
+        // projections that exclude the key column. Aggregate /
+        // GROUP BY queries skip this filter (their output rows
+        // don't map to a single source row).
+        let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
+        if !is_aggregate && !self.config.key_fields.is_empty() {
+            let live_rows: std::collections::HashSet<u32> =
+                state.key_to_row.values().copied().collect();
+            let mut kept = Vec::with_capacity(result.rows.len());
+            for (row_map, src) in
+                result.rows.into_iter().zip(result.source_rows.iter().copied())
+            {
+                if live_rows.contains(&src) {
+                    kept.push(row_map);
+                }
+            }
+            result.rows = kept;
+        }
+        // Capture sequence high-water UNDER state.read(). Writers
+        // increment next_sequence INSIDE state.write() (see
+        // write_store + delete), so the value we observe here is ≥
+        // every sequence whose mutation is already visible in
+        // `state.store` — equivalently, every sequence whose
+        // mutation is included in the snapshot we just executed.
+        // Setting live_start = captured + 1 makes the evaluator
+        // suppress redelivery of those events (which are still
+        // queued on mutation_tx) while passing every strictly-newer
+        // event through. This is the S32 / C1 atomicity contract.
+        let captured = self.next_sequence.load(Ordering::SeqCst);
         let mut engine = self.sub_engine.lock();
-        let mut sub = Subscription::new(sub_id.clone(), query.clone());
+        let mut sub =
+            Subscription::new(sub_id.clone(), query.clone()).with_live_start(captured + 1);
         if sparse {
             sub = sub.into_sparse(state.key_col_indices.clone());
         }
-        engine.add(sub);
-        engine.seed_active_set(&sub_id, &state.store);
+        // S19: continuous-aggregate subscriptions seed their
+        // `last_emitted` map from the initial snapshot, then re-run
+        // on every mutation. The evaluator's aggregate branch
+        // computes the diff and emits per-group deltas.
+        if is_aggregate {
+            let mut sub_with_agg = sub.into_aggregating();
+            // Pre-populate last_emitted with the snapshot rows so
+            // the first post-subscribe mutation only emits *real*
+            // changes (Add for new groups, Update on shifted
+            // aggregates, Remove on vanished). Without this seed,
+            // the first event would re-emit every snapshot group
+            // as an Add — duplicating the snapshot delivery.
+            let group_names: Vec<String> = sub_with_agg
+                .query
+                .group_by
+                .iter()
+                .map(|&i| state.schema.column_name(i).to_string())
+                .collect();
+            if let Some(agg) = sub_with_agg.aggregate.as_mut() {
+                for row in &result.rows {
+                    let k = crate::subscription::group_key_canonical(row, &group_names);
+                    agg.last_emitted.insert(k, row.clone());
+                }
+            }
+            engine.add(sub_with_agg);
+        } else {
+            engine.add(sub);
+            engine.seed_active_set(&sub_id, &state.store);
+        }
         let snapshot_rows = if send_keys_only_snapshot {
             let key_names: Vec<String> = state
                 .key_col_indices
@@ -1037,11 +1396,98 @@ impl Topic {
     }
 
     pub fn unsubscribe(&self, sub_id: &str) {
-        self.sub_engine.lock().remove(sub_id);
+        let mut engine = self.sub_engine.lock();
+        // Flip the closed flag BEFORE removing the entry. Any evaluator
+        // pass that already captured a reference to this sub from the
+        // engine (we hold the lock so this can't be in progress, but
+        // belt + braces — keeps the close-then-remove ordering
+        // explicit) sees the flag and bails out of work for it.
+        engine.mark_closed(sub_id);
+        engine.remove(sub_id);
     }
 
     pub fn unsubscribe_prefix(&self, prefix: &str) {
         self.sub_engine.lock().remove_by_prefix(prefix);
+    }
+
+    /// Mark a subscription as closed without removing the engine
+    /// entry. Cheap; safe to call from a disconnect handler that may
+    /// race with the evaluator. The next event evaluator pass skips
+    /// the sub, and the next [`reap_closed_subscriptions`] call
+    /// drops it. See S38 / review C8.
+    pub fn close_subscription(&self, sub_id: &str) -> bool {
+        self.sub_engine.lock().mark_closed(sub_id)
+    }
+
+    /// Drop every subscription whose `closed` flag is set. Intended to
+    /// be invoked periodically (e.g., once per second from a per-topic
+    /// reaper task) and after large disconnect storms.
+    pub fn reap_closed_subscriptions(&self) -> usize {
+        self.sub_engine.lock().reap_closed()
+    }
+
+    /// Subscribe with an active-set cap (S42 / C11). Beyond the cap,
+    /// the sub is closed with reason `TooManyMatches` and the
+    /// client is expected to narrow its filter.
+    pub fn subscribe_with_cap(
+        &self,
+        sub_id: String,
+        sql: &str,
+        max_active: u32,
+    ) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, ParsedQuery), QueryError> {
+        let state = self.state.read();
+        let query = parse_query(sql, &state.schema)?;
+        let mut result = execute_query(&query, &state.store);
+        let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
+        if !is_aggregate && !self.config.key_fields.is_empty() {
+            let live_rows: std::collections::HashSet<u32> =
+                state.key_to_row.values().copied().collect();
+            let mut kept = Vec::with_capacity(result.rows.len());
+            for (row_map, src) in
+                result.rows.into_iter().zip(result.source_rows.iter().copied())
+            {
+                if live_rows.contains(&src) {
+                    kept.push(row_map);
+                }
+            }
+            result.rows = kept;
+        }
+        let captured = self.next_sequence.load(Ordering::SeqCst);
+        let mut engine = self.sub_engine.lock();
+        let sub = Subscription::new(sub_id.clone(), query.clone())
+            .with_live_start(captured + 1)
+            .with_max_active(max_active);
+        engine.add(sub);
+        engine.seed_active_set(&sub_id, &state.store);
+        Ok((result.rows, query))
+    }
+
+    /// Read the active-set size of a subscription. Returns `None` if
+    /// the subscription doesn't exist (or has been reaped). Intended
+    /// for tests and memory-bound assertions.
+    pub fn subscription_active_set_size(&self, sub_id: &str) -> Option<u64> {
+        self.sub_engine
+            .lock()
+            .get(sub_id)
+            .map(|s| s.active_set.len())
+    }
+
+    /// Read the close reason of a subscription, if it has been
+    /// closed via an enforcement path (today: `TooManyMatches`).
+    pub fn subscription_close_reason(
+        &self,
+        sub_id: &str,
+    ) -> Option<crate::subscription::CloseReason> {
+        self.sub_engine
+            .lock()
+            .get(sub_id)
+            .and_then(|s| s.close_reason())
+    }
+
+    /// Read the closed-ness of a subscription. Useful for tests that
+    /// publish, then observe whether the cap fired.
+    pub fn subscription_is_closed(&self, sub_id: &str) -> Option<bool> {
+        self.sub_engine.lock().get(sub_id).map(|s| s.is_closed())
     }
 
     // ==================== Stats ====================
@@ -1059,6 +1505,44 @@ impl Topic {
             "capacity": state.store.capacity(),
             "schemaDiscovered": !is_placeholder_schema(&state.schema),
         })
+    }
+
+    // ==================== S11 replication barrier ====================
+
+    /// Highest sequence the replication destination has confirmed it
+    /// applied. `0` if no replication is configured or no Ack has
+    /// landed yet. The async wait helper lives in `cq-transport`
+    /// (which has tokio as a dependency); cq-core exposes the
+    /// observable atomic + a notify so the caller can `await` on it.
+    pub fn last_replicated_sequence(&self) -> u64 {
+        self.last_replicated_sequence.load(Ordering::Acquire)
+    }
+
+    /// Mark sequence `seq` as replicated (monotonic — `seq < current`
+    /// is a no-op). Called by the replication shipper's Ack reader.
+    /// Wakes every task currently awaiting via `replication_notify_handle`.
+    pub fn mark_replicated(&self, seq: u64) {
+        let mut cur = self.last_replicated_sequence.load(Ordering::Relaxed);
+        while seq > cur {
+            match self.last_replicated_sequence.compare_exchange(
+                cur,
+                seq,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        self.replication_notify.notify_waiters();
+    }
+
+    /// Cheap clone of the shared `Notify`. Callers (router publish
+    /// path) hold this + the `last_replicated_sequence` accessor to
+    /// implement the async barrier without dragging tokio into
+    /// cq-core's compile-time dep tree.
+    pub fn replication_notify_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.replication_notify.clone()
     }
 }
 

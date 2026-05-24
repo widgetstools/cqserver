@@ -25,6 +25,9 @@ async fn archived_segments_replay_on_restart() {
             auth: None,
             // Tiny segment so a handful of publishes cause rotation.
             txlog_archive: Some(TxLogArchiveOpts::new(256)),
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

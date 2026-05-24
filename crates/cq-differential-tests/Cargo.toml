@@ -1,0 +1,19 @@
+[package]
+name = "cq-differential-tests"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cq-core = { path = "../cq-core" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = { workspace = true }
+anyhow.workspace = true
+
+# DuckDB reference engine. Bundled so the test crate has no external
+# install requirement — DuckDB is compiled from C++ source on first
+# build. First build is slow (5-10 min); subsequent rebuilds are
+# cached. CI caches `target/` to keep this off the hot loop.
+duckdb = { workspace = true }
+
+[dev-dependencies]

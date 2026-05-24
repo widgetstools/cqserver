@@ -1,0 +1,62 @@
+# LIKE pattern matching. % = any-substring; _ = single-character.
+#
+# Projections include the key column (`id`) to work around the
+# pre-existing `Topic::query` tombstone-filter bug (see KNOWN ISSUES
+# in AMPS_WORKLOG.md).
+- name: like_prefix
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+    - { id: 3, name: "Anne" }
+  query: "SELECT id, name FROM t WHERE name LIKE 'A%'"
+  expected_rows:
+    - { id: 1, name: "Alice" }
+    - { id: 3, name: "Anne" }
+
+- name: like_suffix
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Carlos" }
+    - { id: 3, name: "Bob" }
+  query: "SELECT id, name FROM t WHERE name LIKE '%os'"
+  expected_rows:
+    - { id: 2, name: "Carlos" }
+
+- name: like_contains
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Carlos" }
+    - { id: 3, name: "Allen" }
+  query: "SELECT id, name FROM t WHERE name LIKE '%l%'"
+  expected_rows:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Carlos" }
+    - { id: 3, name: "Allen" }
+
+- name: like_underscore_single_char
+  schema:
+    - { name: id, type: long }
+    - { name: code, type: string }
+  key: id
+  publishes:
+    - { id: 1, code: "AB1" }
+    - { id: 2, code: "AB12" }
+    - { id: 3, code: "AC1" }
+  query: "SELECT id, code FROM t WHERE code LIKE 'AB_'"
+  expected_rows:
+    - { id: 1, code: "AB1" }
+  notes: |
+    `_` matches exactly one character — id=2 ("AB12") should NOT
+    match because it has 2 chars after "AB".

@@ -21,14 +21,18 @@
 //! ```
 
 pub mod admin;
+pub mod bookmark;
 pub mod client;
 pub mod error;
+pub mod publish_store;
 pub mod subscription;
 pub mod transport;
 
 pub use admin::AdminClient;
+pub use bookmark::{LocalBookmarkError, LocalBookmarkStore};
 pub use client::{Client, ClientConfig};
 pub use error::ClientError;
+pub use publish_store::{LocalPublishError, LocalPublishStore, PendingPublish};
 pub use subscription::{Delta, DeltaKind, Subscription};
 pub use transport::{tls_client_config_dangerous_no_verify, tls_client_config_with_roots};
 

@@ -1,0 +1,48 @@
+# NULL handling. This is where engines most often disagree on edge
+# cases. Tests document the ANSI SQL semantics that CQ aims for.
+#
+# Projections include the key column (`id`) to work around the
+# pre-existing `Topic::query` tombstone-filter bug (see KNOWN ISSUES
+# in AMPS_WORKLOG.md).
+- name: where_is_null
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: null }
+    - { id: 3, name: "Bob" }
+  query: "SELECT id, name FROM t WHERE name IS NULL"
+  expected_rows:
+    - { id: 2, name: null }
+
+- name: where_is_not_null
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: null }
+    - { id: 3, name: "Bob" }
+  query: "SELECT id, name FROM t WHERE name IS NOT NULL"
+  expected_rows:
+    - { id: 1, name: "Alice" }
+    - { id: 3, name: "Bob" }
+
+- name: equality_does_not_match_null
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: null }
+  query: "SELECT id, name FROM t WHERE name = 'Alice'"
+  expected_rows:
+    - { id: 1, name: "Alice" }
+  notes: |
+    A NULL `name` must not match `name = 'Alice'` even though ANSI
+    SQL says NULL = X is itself NULL (which is treated as false in
+    a WHERE clause).

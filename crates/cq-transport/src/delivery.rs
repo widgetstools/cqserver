@@ -143,35 +143,92 @@ pub fn deliver_delta_cached(
         }
     };
 
-    match route.tx.try_send(frame) {
-        Ok(()) => {
-            metrics::counter!("cq_deltas_delivered_total").increment(1);
-            // Update server-side bookmark store so MOST_RECENT
-            // resumption works across reconnects. Only meaningful
-            // when both client_name and store are set on the route.
-            if let (Some(cname), Some(store)) =
-                (route.client_name.as_deref(), route.bookmark_store.as_ref())
-            {
-                crate::router::record_bookmark(store, cname, &route.topic, delta.sequence);
+    // S21: route through spillover when the route has one attached
+    // AND either (a) there's already a backlog (preserve order) or
+    // (b) the queue is full. Without (a), live frames could skip
+    // ahead of backlogged ones and reach the consumer out of order.
+    let must_spill = route
+        .spillover
+        .as_ref()
+        .is_some_and(|sp| !sp.is_empty());
+    if !must_spill {
+        match route.tx.try_send(frame.clone()) {
+            Ok(()) => {
+                metrics::counter!("cq_deltas_delivered_total").increment(1);
+                // Update server-side bookmark store so MOST_RECENT
+                // resumption works across reconnects. Only meaningful
+                // when both client_name and store are set on the route.
+                if let (Some(cname), Some(store)) =
+                    (route.client_name.as_deref(), route.bookmark_store.as_ref())
+                {
+                    crate::router::record_bookmark(
+                        store,
+                        cname,
+                        &route.topic,
+                        delta.sequence,
+                    );
+                }
+                route
+                    .last_seq
+                    .fetch_max(delta.sequence, Ordering::Relaxed);
+                return;
             }
-            route
-                .last_seq
-                .fetch_max(delta.sequence, Ordering::Relaxed);
-        }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            route.dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("cq_deltas_dropped_total", "reason" => "queue_full").increment(1);
-            tracing::warn!(
-                sub = %delta.subscription_id,
-                topic = %route.topic,
-                "Delta queue full; dropping (consumer can't keep up)"
-            );
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            metrics::counter!("cq_deltas_dropped_total", "reason" => "receiver_closed")
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Fall through to spillover handling below.
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!(
+                    "cq_deltas_dropped_total",
+                    "reason" => "receiver_closed"
+                )
                 .increment(1);
-            tracing::debug!(sub = %delta.subscription_id, "Delta receiver closed");
+                tracing::debug!(
+                    sub = %delta.subscription_id,
+                    "Delta receiver closed"
+                );
+                return;
+            }
         }
+    }
+    // Either the queue was Full or the route already has spillover
+    // backlog. If spillover is wired up, append; otherwise count as a
+    // hard drop (legacy behaviour).
+    if let Some(sp) = route.spillover.as_ref() {
+        match sp.write_frame(&frame) {
+            Ok(()) => {
+                metrics::counter!("cq_spillover_writes_total").increment(1);
+            }
+            Err(crate::spillover::SpilloverError::OverCap { .. }) => {
+                route.dropped.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!(
+                    "cq_deltas_dropped_total",
+                    "reason" => "spillover_over_cap"
+                )
+                .increment(1);
+            }
+            Err(e) => {
+                route.dropped.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!(
+                    "cq_deltas_dropped_total",
+                    "reason" => "spillover_io"
+                )
+                .increment(1);
+                tracing::warn!(
+                    sub = %delta.subscription_id,
+                    error = %e,
+                    "Spillover write failed; dropping frame"
+                );
+            }
+        }
+    } else {
+        route.dropped.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("cq_deltas_dropped_total", "reason" => "queue_full")
+            .increment(1);
+        tracing::warn!(
+            sub = %delta.subscription_id,
+            topic = %route.topic,
+            "Delta queue full; dropping (consumer can't keep up)"
+        );
     }
 }
 

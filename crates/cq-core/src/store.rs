@@ -12,10 +12,36 @@
 //!
 //! - **Writes** (append / update) must be externally synchronized — typically
 //!   one writer thread per topic, or a lock in the `Topic` wrapper.
+//!
+//! # Per-row seqlock (S33 / review concern C2)
+//!
+//! `row_versions[row]` follows a strict odd/even seqlock convention:
+//!
+//! - Even → row is **consistent**: every column reflects the same logical
+//!   write. The numeric value is the count of completed writes × 2.
+//! - Odd  → a writer is **mid-mutation**: at least one column has been
+//!   updated to its new value but the write isn't complete.
+//!
+//! A writer flips the version to odd, fences, writes every changed column,
+//! fences, then flips it to even-plus-two. A reader using
+//! [`ColumnStore::read_row_consistent`] takes the version both before and
+//! after its read, retrying until it observes the same even value on both
+//! sides. This eliminates the "column tear" race the C2 review concern
+//! warns about — a reader cannot see a mix of old and new column values
+//! for the same row, even on architectures with relaxed memory ordering
+//! and even if the parent `state.write()` lock is bypassed in a future
+//! lock-free reader path.
+//!
+//! Today, all reads go through `Topic::*` methods that hold
+//! `state.read()`, which already serializes against `state.write()` and
+//! makes column tear impossible. The seqlock is forward-prep: an
+//! evaluator that wants to skip the parent lock can call
+//! `read_row_consistent` and get the same guarantee from per-row
+//! versioning alone.
 
 use crate::schema::{ColumnMapping, ColumnType, Schema};
 use compact_str::CompactString;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Sentinel values for "null" in primitive columns.
@@ -181,6 +207,56 @@ impl ColumnStore {
         self.row_versions[row as usize].load(Ordering::Acquire)
     }
 
+    /// Read row `row` under the per-row seqlock — see the crate-level
+    /// "Per-row seqlock" doc above. `f` is invoked at least once, and
+    /// re-invoked from scratch until two version reads (one before, one
+    /// after `f`) observe the same even value. The return value of `f`
+    /// from that consistent observation is returned to the caller.
+    ///
+    /// `f` MUST be pure with respect to the columns it reads: any value
+    /// it captures from a torn read will be discarded when the retry
+    /// loop detects the version mismatch, so side effects are observable
+    /// even though their inputs were inconsistent. Limit `f` to gathering
+    /// column values into a local result.
+    ///
+    /// Callers that already hold `state.read()` on the parent
+    /// `StoreState` don't need this — `state.write()` serializes
+    /// mutation, so column tear is impossible by lock. Use this for
+    /// lock-free reader paths (e.g., future per-CPU shard scans or
+    /// JIT-compiled predicate paths that bypass the parent lock).
+    pub fn read_row_consistent<F, R>(&self, row: u32, f: F) -> R
+    where
+        F: Fn(&Self, u32) -> R,
+    {
+        let r = row as usize;
+        loop {
+            let v1 = self.row_versions[r].load(Ordering::Acquire);
+            if v1 % 2 != 0 {
+                // Writer is mid-mutation — spin briefly and retry.
+                std::hint::spin_loop();
+                continue;
+            }
+            fence(Ordering::Acquire);
+            let result = f(self, row);
+            fence(Ordering::Acquire);
+            let v2 = self.row_versions[r].load(Ordering::Acquire);
+            if v1 == v2 {
+                return result;
+            }
+            // Version moved during the read — discard and retry. We
+            // don't need to back off: writers stamp the new even
+            // value before releasing, so the next iteration sees
+            // either an even version (proceed) or an odd one (spin).
+        }
+    }
+
+    /// True iff `row` is in the "consistent" state (even version stamp).
+    /// Mostly for tests and assertions; production reader paths should
+    /// use [`read_row_consistent`] instead of polling this.
+    pub fn row_version_is_committed(&self, row: u32) -> bool {
+        self.row_versions[row as usize].load(Ordering::Acquire) % 2 == 0
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -321,6 +397,19 @@ impl ColumnStore {
             self.grow();
         }
 
+        let r = row as usize;
+        // Fresh slot: per-row version starts at 0. Begin the seqlock
+        // critical section by flipping to odd (1) before any column
+        // write. A concurrent `read_row_consistent` will spin until
+        // we reach the even completion stamp below.
+        debug_assert_eq!(
+            self.row_versions[r].load(Ordering::Relaxed),
+            0,
+            "append_row slot {row} not in expected even=0 state — was the slot reused?"
+        );
+        self.row_versions[r].store(1, Ordering::Release);
+        fence(Ordering::Release);
+
         // Write all column values
         for (col_idx, value) in values.iter().enumerate() {
             if col_idx < self.mappings.len() {
@@ -328,9 +417,12 @@ impl ColumnStore {
             }
         }
 
-        // Stamp version
-        let version = self.global_version.fetch_add(1, Ordering::AcqRel) + 1;
-        self.row_versions[row as usize].store(version, Ordering::Release);
+        // Close the seqlock critical section. Release fence + even
+        // stamp publishes the column writes to any reader that loads
+        // this version with Acquire.
+        fence(Ordering::Release);
+        self.row_versions[r].store(2, Ordering::Release);
+        self.global_version.fetch_add(1, Ordering::AcqRel);
 
         // Make the row visible to readers (must be last)
         self.row_count.store(row + 1, Ordering::Release);
@@ -342,30 +434,53 @@ impl ColumnStore {
     /// — distinct from `update_row` which interprets `Value::Null` as
     /// "skip this field".
     pub fn null_out_row(&mut self, row: u32) {
+        let r = row as usize;
+        let v = self.row_versions[r].load(Ordering::Relaxed);
+        debug_assert!(
+            v % 2 == 0,
+            "null_out_row on row {row}: version {v} is odd (concurrent writer?)"
+        );
+        // Phase 1: mark write in progress.
+        self.row_versions[r].store(v + 1, Ordering::Release);
+        fence(Ordering::Release);
+        // Phase 2: column writes.
         for (col_idx, m) in self.mappings.iter().enumerate() {
-            let r = row as usize;
             match m.kind {
                 ColumnType::Double => self.double_cols[m.array_index][r] = NULL_DOUBLE,
                 ColumnType::Long => self.long_cols[m.array_index][r] = NULL_LONG,
                 ColumnType::Int => self.int_cols[m.array_index][r] = NULL_INT,
                 ColumnType::String => self.string_cols[m.array_index][r] = None,
             }
-            let _ = col_idx; // silence unused
+            let _ = col_idx;
         }
-        let version = self.global_version.fetch_add(1, Ordering::AcqRel) + 1;
-        self.row_versions[row as usize].store(version, Ordering::Release);
+        // Phase 3: publish completion.
+        fence(Ordering::Release);
+        self.row_versions[r].store(v + 2, Ordering::Release);
+        self.global_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Update an existing row in place.
     pub fn update_row(&mut self, row: u32, values: &[Value]) {
+        let r = row as usize;
+        let v = self.row_versions[r].load(Ordering::Relaxed);
+        debug_assert!(
+            v % 2 == 0,
+            "update_row on row {row}: version {v} is odd (concurrent writer?)"
+        );
+        // Seqlock: flip to odd before any column store, fence, write,
+        // fence, flip to even-plus-two.
+        self.row_versions[r].store(v + 1, Ordering::Release);
+        fence(Ordering::Release);
+
         for (col_idx, value) in values.iter().enumerate() {
             if col_idx < self.mappings.len() && !matches!(value, Value::Null) {
                 self.set(col_idx, row, value);
             }
         }
 
-        let version = self.global_version.fetch_add(1, Ordering::AcqRel) + 1;
-        self.row_versions[row as usize].store(version, Ordering::Release);
+        fence(Ordering::Release);
+        self.row_versions[r].store(v + 2, Ordering::Release);
+        self.global_version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Get a full row as a JSON map (for snapshot/delta delivery).

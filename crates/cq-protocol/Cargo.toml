@@ -11,3 +11,4 @@ thiserror.workspace = true
 compact_str.workspace = true
 rmp-serde.workspace = true
 bson.workspace = true
+zstd.workspace = true

@@ -49,6 +49,17 @@ pub enum Command {
     Pause,
     /// Resume a paused subscription. Carries `sub_id`.
     Resume,
+    /// Server → client schema-change announcement (S44).
+    ///
+    /// The payload lives in `CqMessage::schema_change` and carries
+    /// the list of added columns, removed columns, and a monotonic
+    /// per-subscription schema version. Emitted by the server
+    /// **before** any data delta whose body references the new
+    /// columns — so clients always learn about a column before they
+    /// have to bind a value to it. Used today for dynamic PIVOT
+    /// (S45 follow-up) and any future operator whose result schema
+    /// changes mid-stream.
+    SchemaChange,
 }
 
 /// Acknowledgment level requested by client.

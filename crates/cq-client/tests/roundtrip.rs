@@ -55,6 +55,7 @@ async fn spawn_test_server() -> (String, Arc<DashMap<String, SharedTopic>>) {
         auth: Arc::new(AuthStore::disabled()),
         sow_batch_size: cq_transport::session::DEFAULT_SOW_BATCH_SIZE,
         bookmark_store: cq_transport::router::new_bookmark_store(),
+        spillover: None,
     };
     tokio::spawn(async move {
         loop {

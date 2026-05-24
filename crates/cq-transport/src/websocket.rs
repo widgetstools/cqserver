@@ -27,6 +27,8 @@ pub struct WsConfig {
     pub sow_batch_size: usize,
     /// Shared MOST_RECENT bookmark store. See `TcpConfig::bookmark_store`.
     pub bookmark_store: Option<crate::router::BookmarkStore>,
+    /// S21 spillover configuration. See `TcpConfig::spillover`.
+    pub spillover: Option<crate::router::SpilloverContext>,
 }
 
 impl Default for WsConfig {
@@ -37,6 +39,7 @@ impl Default for WsConfig {
             outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: None,
+            spillover: None,
         }
     }
 }
@@ -66,6 +69,7 @@ pub async fn start_ws_server(
             auth: auth.clone(),
             sow_batch_size: config.sow_batch_size,
             bookmark_store: bookmark_store.clone(),
+            spillover: config.spillover.clone(),
         };
         let queue_capacity = config.outbound_queue_capacity;
 

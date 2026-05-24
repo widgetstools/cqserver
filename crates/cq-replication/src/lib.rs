@@ -17,6 +17,7 @@
 //! topic from `last_seq + 1`. Subsequent frames are `ReplFrame::Entry`
 //! records.
 
+pub mod filter;
 pub mod receiver;
 pub mod shipper;
 

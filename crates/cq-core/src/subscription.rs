@@ -171,6 +171,62 @@ pub struct Subscription {
     /// the live path must not duplicate the historical events that the
     /// replay already covered.
     pub live_start_sequence: u64,
+    /// Cancellation flag — set when the subscriber disconnects or
+    /// explicitly unsubscribes. Once set, the evaluator skips this
+    /// sub on every subsequent event and the next `reap_closed` pass
+    /// drops it from the engine. `Arc<AtomicBool>` so the close
+    /// signal can be raised from outside the engine lock (e.g., from
+    /// the transport layer's disconnect handler) without contending
+    /// for the engine mutex. See S38 / review concern C8.
+    pub closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Optional cap on the active-set size. `None` means unbounded
+    /// (current default). When set, the evaluator marks the sub
+    /// closed (reason `TooManyMatches`) the moment an Add would
+    /// push the active set past the cap. The client gets the
+    /// reason via `close_reason` and can either narrow its filter
+    /// or accept the bound. See S42 / review concern C11.
+    pub max_active: Option<u32>,
+    /// Reason the sub was closed, if known. Populated by enforcement
+    /// paths (today: `TooManyMatches`). Read by the transport layer
+    /// when emitting the terminate-subscription frame.
+    pub close_reason: std::sync::Arc<parking_lot::Mutex<Option<CloseReason>>>,
+    /// Continuous-aggregate state (S19). `Some` iff the query has
+    /// aggregates or a GROUP BY. The evaluator's aggregate-mode
+    /// branch re-runs `execute_aggregate_query` on every mutation
+    /// and diffs against the previously-emitted per-group output
+    /// to produce Add/Update/Remove deltas keyed by group.
+    pub aggregate: Option<AggregateSubState>,
+}
+
+/// Snapshot of the last-emitted aggregate output, keyed by a
+/// canonical group-key string (JSON of the GROUP BY columns).
+#[derive(Default, Clone)]
+pub struct AggregateSubState {
+    /// Last-emitted row per group. Canonical key (see
+    /// `group_key_canonical`) → JSON map of the group's row.
+    pub last_emitted: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Canonicalize a group-by row's identity for diffing. Picks only
+/// the group-by columns in declared order and serializes them as
+/// JSON. Stable regardless of value ordering inside the row map.
+pub fn group_key_canonical(
+    row: &serde_json::Map<String, serde_json::Value>,
+    group_by_col_names: &[String],
+) -> String {
+    let mut parts: Vec<(&str, &serde_json::Value)> = Vec::with_capacity(group_by_col_names.len());
+    for n in group_by_col_names {
+        let v = row.get(n).unwrap_or(&serde_json::Value::Null);
+        parts.push((n.as_str(), v));
+    }
+    serde_json::to_string(&parts).unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The subscription's active set hit `max_active`. Client should
+    /// narrow its filter and re-subscribe.
+    TooManyMatches,
 }
 
 impl Subscription {
@@ -188,7 +244,53 @@ impl Subscription {
             last_snapshot: HashMap::new(),
             topn,
             live_start_sequence: 0,
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_active: None,
+            close_reason: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            aggregate: None,
         }
+    }
+
+    /// Enable continuous-aggregate mode (S19). Activated by the
+    /// subscribe path when the query has aggregates or a GROUP BY;
+    /// the evaluator's aggregate branch re-runs the aggregate
+    /// executor on each event and emits per-group diff deltas.
+    pub fn into_aggregating(mut self) -> Self {
+        self.aggregate = Some(AggregateSubState::default());
+        self
+    }
+
+    /// Cap the subscription's active-set size. Once the active set
+    /// would grow past `cap`, the evaluator marks this sub closed
+    /// with reason `TooManyMatches` instead of inserting. `None`
+    /// (the default) means unbounded.
+    pub fn with_max_active(mut self, cap: u32) -> Self {
+        self.max_active = Some(cap);
+        self
+    }
+
+    /// Last-known close reason, if any.
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        *self.close_reason.lock()
+    }
+
+    /// Cheap clone of the cancellation flag. Hand to a session /
+    /// transport-layer handle so it can mark the sub closed on
+    /// client disconnect without acquiring `sub_engine.lock()`.
+    pub fn close_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.closed.clone()
+    }
+
+    /// True iff the subscription has been marked closed. Cheap atomic
+    /// load; safe to call from the hot evaluator path.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set the cancellation flag. Idempotent.
+    pub fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Convert this subscription to sparse-delta mode with the given
@@ -308,6 +410,95 @@ fn key_only_payload(
     out
 }
 
+/// S19: continuous-aggregate evaluation. Re-runs the aggregate
+/// executor against the current store, diffs the result against
+/// `sub.aggregate.last_emitted`, and emits one delta per affected
+/// group:
+///
+/// - **Add** — group key not in `last_emitted` (new group).
+/// - **Update** — group key present but its aggregate values changed.
+/// - **Remove** — group key in `last_emitted` but no longer present
+///   in the current result (last row of that group was removed).
+///
+/// The aggregate executor is invoked with NO secondary index — group
+/// state needs every row, and the existing aggregate path doesn't
+/// honor index hints anyway.
+///
+/// This is the "lazy" implementation: O(rows) per event. The truly
+/// incremental form (track per-row contribution, subtract on remove,
+/// add on insert) is a follow-up for SUM/COUNT/AVG; MIN/MAX
+/// fundamentally need a scan on remove so lazy is the right shape
+/// for those.
+fn evaluate_aggregating(
+    sub: &mut Subscription,
+    sequence: u64,
+    store: &ColumnStore,
+    deltas: &mut Vec<Delta>,
+) {
+    let agg_state = sub
+        .aggregate
+        .as_mut()
+        .expect("evaluate_aggregating called without aggregate state");
+    // Re-run the aggregate executor. This is the heavy part.
+    let result = crate::query::execute_query_with_index(&sub.query, store, None);
+
+    // Build canonical group-key → row map for the current output.
+    let schema = store.schema();
+    let group_names: Vec<String> = sub
+        .query
+        .group_by
+        .iter()
+        .map(|&i| schema.column_name(i).to_string())
+        .collect();
+    let mut current: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        HashMap::with_capacity(result.rows.len());
+    for row in result.rows {
+        let k = group_key_canonical(&row, &group_names);
+        current.insert(k, row);
+    }
+
+    // Emit Add / Update for groups in current.
+    for (k, row) in &current {
+        match agg_state.last_emitted.get(k) {
+            None => deltas.push(Delta {
+                subscription_id: sub.id.clone(),
+                delta_type: DeltaType::Add,
+                row: 0,
+                sequence,
+                row_data: std::sync::Arc::new(row.clone()),
+                encoded_body_json: None,
+            }),
+            Some(prev) if prev != row => deltas.push(Delta {
+                subscription_id: sub.id.clone(),
+                delta_type: DeltaType::Update,
+                row: 0,
+                sequence,
+                row_data: std::sync::Arc::new(row.clone()),
+                encoded_body_json: None,
+            }),
+            _ => {}
+        }
+    }
+    // Emit Remove for groups in last_emitted but not in current.
+    for (k, prev) in &agg_state.last_emitted {
+        if !current.contains_key(k) {
+            deltas.push(Delta {
+                subscription_id: sub.id.clone(),
+                delta_type: DeltaType::Remove,
+                row: 0,
+                sequence,
+                // Body carries the last-known group payload so the
+                // client knows WHICH group is gone — the group-by
+                // columns identify it.
+                row_data: std::sync::Arc::new(prev.clone()),
+                encoded_body_json: None,
+            });
+        }
+    }
+
+    agg_state.last_emitted = current;
+}
+
 /// TOP-N evaluation for a single mutation event. Updates the subscription's
 /// `ranked` set with the mutated row's new key (or removes it if the
 /// predicate no longer matches), recomputes the visible top-N window,
@@ -407,30 +598,78 @@ fn evaluate_topn(
 /// Manages all active subscriptions for a single topic.
 pub struct SubscriptionEngine {
     subscriptions: HashMap<String, Subscription>,
+    /// Reverse-index from column id to subscription ids whose
+    /// predicate references that column (S46 / review concern C3).
+    /// Used by `evaluate_row_kind` to skip subscriptions that
+    /// cannot possibly be affected by a sparse mutation that
+    /// touches a disjoint column set.
+    predicate_index: crate::predicate_index::PredicateIndex,
 }
 
 impl SubscriptionEngine {
     pub fn new() -> Self {
         SubscriptionEngine {
             subscriptions: HashMap::new(),
+            predicate_index: crate::predicate_index::PredicateIndex::new(),
         }
     }
 
     /// Register a new subscription. Returns the subscription ID.
     /// The caller should separately compute and deliver the initial snapshot.
     pub fn add(&mut self, sub: Subscription) {
+        self.predicate_index.add(&sub.id, &sub.query.predicate);
         self.subscriptions.insert(sub.id.clone(), sub);
     }
 
     /// Remove a subscription by ID.
     pub fn remove(&mut self, id: &str) -> Option<Subscription> {
+        self.predicate_index.remove(id);
         self.subscriptions.remove(id)
     }
 
     /// Remove all subscriptions whose ID starts with a given prefix
     /// (e.g., session-based cleanup).
     pub fn remove_by_prefix(&mut self, prefix: &str) {
+        let to_drop: Vec<String> = self
+            .subscriptions
+            .keys()
+            .filter(|id| id.starts_with(prefix))
+            .cloned()
+            .collect();
+        for id in &to_drop {
+            self.predicate_index.remove(id);
+        }
         self.subscriptions.retain(|id, _| !id.starts_with(prefix));
+    }
+
+    /// Mark the named subscription as closed without removing it. The
+    /// next event evaluator pass will skip it (see `evaluate_row_kind`);
+    /// the next `reap_closed` pass will drop it. Returns `true` if the
+    /// subscription existed.
+    pub fn mark_closed(&mut self, id: &str) -> bool {
+        if let Some(sub) = self.subscriptions.get(id) {
+            sub.close();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop every subscription whose `closed` flag is set. Returns the
+    /// number reaped. Cheap to call periodically (e.g., from a
+    /// per-topic background tick or after a known disconnect storm).
+    pub fn reap_closed(&mut self) -> usize {
+        let to_drop: Vec<String> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, sub)| sub.is_closed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &to_drop {
+            self.predicate_index.remove(id);
+            self.subscriptions.remove(id);
+        }
+        to_drop.len()
     }
 
     /// Seed the active set for a subscription by scanning the store.
@@ -441,8 +680,22 @@ impl SubscriptionEngine {
             let schema_cols = store.schema().column_count();
             let proj = effective_projection(&sub.query, schema_cols);
             let row_count = store.row_count();
+            let cap = sub.max_active;
             for row in 0..row_count {
                 if sub.query.predicate.matches(store, row) {
+                    // S42 / C11: enforce active-set cap on the
+                    // snapshot too. If the matching snapshot is
+                    // already past the cap, we close the sub and
+                    // stop seeding — the client gets a no-snapshot
+                    // start + `TooManyMatches` close reason, which
+                    // is the right signal to narrow the filter.
+                    if let Some(c) = cap {
+                        if sub.active_set.len() >= c as u64 {
+                            *sub.close_reason.lock() = Some(CloseReason::TooManyMatches);
+                            sub.close();
+                            return;
+                        }
+                    }
                     sub.active_set.insert(row);
                     if sub.sparse {
                         let snap = snapshot_columns(store, row, &proj);
@@ -482,13 +735,31 @@ impl SubscriptionEngine {
     /// Variant of `evaluate_row` that takes the originating mutation
     /// kind. Lets the engine emit `Oof` for predicate-flip exits
     /// (`MutationKind::Upsert`) versus `Remove` for actual deletes
-    /// (`MutationKind::Delete`).
+    /// (`MutationKind::Delete`). Iterates every registered
+    /// subscription.
     pub fn evaluate_row_kind(
         &mut self,
         row: u32,
         sequence: u64,
         store: &ColumnStore,
         kind: crate::topic::MutationKind,
+    ) -> Vec<Delta> {
+        self.evaluate_row_kind_indexed(row, sequence, store, kind, None)
+    }
+
+    /// Index-routed variant (S46 / review C3). When `changed_cols`
+    /// is `Some(cols)`, restricts the per-sub loop to subscriptions
+    /// whose predicate references at least one column in `cols`
+    /// (plus any "always" subs whose predicate is `True`). When
+    /// `None`, iterates every registered subscription — equivalent
+    /// to `evaluate_row_kind`.
+    pub fn evaluate_row_kind_indexed(
+        &mut self,
+        row: u32,
+        sequence: u64,
+        store: &ColumnStore,
+        kind: crate::topic::MutationKind,
+        changed_cols: Option<&[usize]>,
     ) -> Vec<Delta> {
         let mut deltas = Vec::new();
         let schema_cols = store.schema().column_count();
@@ -508,10 +779,43 @@ impl SubscriptionEngine {
             a
         };
 
-        for sub in self.subscriptions.values_mut() {
+        // Determine the set of sub IDs to evaluate. When the caller
+        // passes `changed_cols`, the `PredicateIndex` returns only
+        // subs whose predicate references at least one of those
+        // columns (plus "always" subs with no column refs). When
+        // `None`, we iterate every registered sub (equivalent to
+        // pre-S46 behavior). Collected up-front because the loop
+        // body holds `&mut sub` from `self.subscriptions`, which
+        // can't coexist with a borrow into `self.predicate_index`.
+        let affected_ids: Vec<String> = match changed_cols {
+            Some(cols) => self.predicate_index.affected(Some(cols)),
+            None => self.subscriptions.keys().cloned().collect(),
+        };
+        for id in &affected_ids {
+            let Some(sub) = self.subscriptions.get_mut(id) else { continue };
+            // Cancellation gate (S38 / C8): if the client has
+            // disconnected or unsubscribed, skip every per-event
+            // computation for this sub. The entry is removed
+            // outright on the next `reap_closed` pass; here we
+            // only need to avoid wasted predicate eval and Arc
+            // bumping while the sub is in the closed→reaped
+            // window.
+            if sub.is_closed() {
+                continue;
+            }
             // Bookmark-replay subs skip live events that fall inside the
             // window the replay already covered.
             if sequence < sub.live_start_sequence {
+                continue;
+            }
+            // S19: continuous-aggregate subs re-run the aggregate
+            // executor against the current store, diff against
+            // their last-emitted per-group state, and emit
+            // Add/Update/Remove deltas per affected group. The
+            // row-oriented logic below doesn't apply — group state
+            // changes don't map to a single source row.
+            if sub.aggregate.is_some() {
+                evaluate_aggregating(sub, sequence, store, &mut deltas);
                 continue;
             }
             if sub.topn.is_some() {
@@ -530,6 +834,19 @@ impl SubscriptionEngine {
             let was_active = sub.active_set.contains(row);
 
             if matches && !was_active {
+                // S42 / C11: enforce the optional active-set cap. If
+                // adding `row` would exceed `max_active`, mark the
+                // sub closed with reason `TooManyMatches` and don't
+                // emit any further deltas for it. The next event
+                // sees `is_closed()` and skips. The transport layer
+                // reads `close_reason` to emit a terminate frame.
+                if let Some(cap) = sub.max_active {
+                    if sub.active_set.len() >= cap as u64 {
+                        *sub.close_reason.lock() = Some(CloseReason::TooManyMatches);
+                        sub.close();
+                        continue;
+                    }
+                }
                 sub.active_set.insert(row);
                 let row_data = if sub.query.projection.is_empty() {
                     full_row(&mut shared_full_row)
@@ -697,6 +1014,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         // Seed: row 0 is already in store and matches predicate.
         let sub = Subscription::new("s1".into(), query).into_sparse(vec![0]);
@@ -733,6 +1052,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         engine.add(Subscription::new("s1".into(), query).into_sparse(vec![0]));
         engine.seed_active_set("s1", &store);
@@ -770,6 +1091,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         engine.add(Subscription::new("s1".into(), query).into_sparse(vec![0]));
         engine.seed_active_set("s1", &store);
@@ -804,6 +1127,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         engine.add(Subscription::new("s1".into(), query));
         engine.seed_active_set("s1", &store);
@@ -840,6 +1165,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         let sub = Subscription::new("sub-1".into(), query);
         engine.add(sub);
@@ -898,6 +1225,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         engine.add(Subscription::new("s".into(), query));
         engine.seed_active_set("s", &store);
@@ -939,6 +1268,8 @@ mod tests {
             limit: None,
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         engine.add(Subscription::new("s".into(), query));
         engine.seed_active_set("s", &store);
@@ -978,6 +1309,8 @@ mod tests {
             limit: Some(limit),
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         }
     }
 
@@ -1047,6 +1380,8 @@ mod tests {
             limit: Some(2),
             aggregates: Vec::new(),
             group_by: Vec::new(),
+            pivot: None,
+            unpivot: None,
         };
         engine.add(Subscription::new("s1".into(), query));
         engine.seed_active_set("s1", &store);

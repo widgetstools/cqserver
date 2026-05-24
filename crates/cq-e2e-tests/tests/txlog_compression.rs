@@ -22,6 +22,9 @@ async fn compressed_archive_segments_replay_on_restart() {
             queues: Vec::new(),
             auth: None,
             txlog_archive: Some(TxLogArchiveOpts::new(256).with_compression()),
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

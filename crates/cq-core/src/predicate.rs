@@ -83,6 +83,23 @@ pub enum CompiledPredicate {
         col: usize,
         values: HashSet<CompactString>,
     },
+    /// `col IN (1, 2, 3)` for `Long` and `Int` columns. Pre-S46 the
+    /// compiler always emitted `InString` regardless of column type;
+    /// applying that to a numeric column then panicked in
+    /// `ColumnStore::get_string` because the array_index pointed at
+    /// the string-arena slot that didn't exist for the numeric column.
+    InLong {
+        col: usize,
+        values: std::collections::HashSet<i64>,
+    },
+    /// `col IN (1.0, 2.5)` for `Double` columns. F64 doesn't implement
+    /// `Hash` so we key the set by `to_bits()` — exact-bitpattern
+    /// equality, matching SQL `=` semantics on floats (NaN never
+    /// matches anything, including itself).
+    InDouble {
+        col: usize,
+        values: std::collections::HashSet<u64>,
+    },
     Like {
         col: usize,
         pattern: regex::Regex,
@@ -156,6 +173,64 @@ pub enum CompiledPredicate {
     True,
 }
 
+impl CompiledPredicate {
+    /// Collect every column index referenced by this predicate. Used by
+    /// `PredicateIndex` (S46 / review concern C3) — a sparse update
+    /// that only touches columns C can skip evaluation for any
+    /// subscription whose predicate doesn't reference any column in C.
+    ///
+    /// Returns a sorted dedup'd `Vec<usize>` (small N — typical
+    /// predicates touch 1-5 columns; Vec is cheaper than HashSet).
+    pub fn referenced_columns(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.collect_referenced(&mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn collect_referenced(&self, out: &mut Vec<usize>) {
+        use CompiledPredicate::*;
+        match self {
+            EqDouble { col, .. }
+            | NeqDouble { col, .. }
+            | LtDouble { col, .. }
+            | LeDouble { col, .. }
+            | GtDouble { col, .. }
+            | GeDouble { col, .. }
+            | BetweenDouble { col, .. }
+            | EqLong { col, .. }
+            | NeqLong { col, .. }
+            | LtLong { col, .. }
+            | LeLong { col, .. }
+            | GtLong { col, .. }
+            | GeLong { col, .. }
+            | BetweenLong { col, .. }
+            | EqString { col, .. }
+            | NeqString { col, .. }
+            | InString { col, .. }
+            | InLong { col, .. }
+            | InDouble { col, .. }
+            | Like { col, .. }
+            | EqStringFn { col, .. }
+            | NeqStringFn { col, .. }
+            | LikeStringFn { col, .. }
+            | LengthCmp { col, .. }
+            | IsNull { col }
+            | IsNotNull { col } => out.push(*col),
+            EqStringExpr { expr, .. } | NeqStringExpr { expr, .. } | LikeStringExpr { expr, .. } => {
+                expr.referenced_columns(out);
+            }
+            And(a, b) | Or(a, b) => {
+                a.collect_referenced(out);
+                b.collect_referenced(out);
+            }
+            Not(inner) => inner.collect_referenced(out),
+            True => {}
+        }
+    }
+}
+
 /// Case-folding transform used by `UPPER` / `LOWER` predicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StringFn {
@@ -186,6 +261,28 @@ pub enum StringExpr {
 }
 
 impl StringExpr {
+    /// Collect every column index referenced by this expression
+    /// (transitively through Upper/Lower/Substr/Concat). Used by
+    /// `PredicateIndex` (S46 / C3) to route mutations: a sparse
+    /// update that touches column set C only needs to evaluate
+    /// subscriptions whose predicate references at least one
+    /// column in C.
+    pub fn referenced_columns(&self, out: &mut Vec<usize>) {
+        match self {
+            StringExpr::Col(c) => out.push(*c),
+            StringExpr::Lit(_) => {}
+            StringExpr::Upper(inner) | StringExpr::Lower(inner) => {
+                inner.referenced_columns(out);
+            }
+            StringExpr::Substr { inner, .. } => inner.referenced_columns(out),
+            StringExpr::Concat(parts) => {
+                for p in parts {
+                    p.referenced_columns(out);
+                }
+            }
+        }
+    }
+
     /// Evaluate the expression against `row`. Returns `None` only when
     /// a referenced column is null *and* the expression doesn't define
     /// a defaulting rule (e.g., `Col(c)` returns `None` on null;
@@ -331,6 +428,22 @@ impl CompiledPredicate {
                 store.get_string(*col, row).map_or(false, |s| {
                     values.contains(&CompactString::new(s))
                 })
+            }
+            CompiledPredicate::InLong { col, values } => {
+                let v = store.get_long(*col, row);
+                if v == crate::store::NULL_LONG {
+                    return false;
+                }
+                values.contains(&v)
+            }
+            CompiledPredicate::InDouble { col, values } => {
+                let v = store.get_double(*col, row);
+                if v.is_nan() {
+                    // SQL `IN` returns UNKNOWN for NULL/NaN — treated
+                    // as false in a WHERE clause.
+                    return false;
+                }
+                values.contains(&v.to_bits())
             }
             CompiledPredicate::Like { col, pattern } => {
                 store.get_string(*col, row).map_or(false, |s| pattern.is_match(s))
@@ -596,11 +709,36 @@ pub fn compile_expr(
             negated,
         } => {
             let col = resolve_column(col_expr, schema)?;
-            let values: HashSet<CompactString> = list
-                .iter()
-                .map(|e| extract_string_value(e).map(CompactString::new))
-                .collect::<Result<_, _>>()?;
-            let pred = CompiledPredicate::InString { col, values };
+            // Pick the compiled variant based on the COLUMN's type,
+            // not the literal type. SQL is type-strict here — `IN`
+            // against a numeric column with string literals should
+            // be a parse error anyway, but we'd rather surface that
+            // as `InvalidLiteral` (caught below by the per-type
+            // extractor) than panic in `get_string` on the wrong
+            // column arena (the pre-S46 bug this fix closes).
+            let pred = match schema.column_type(col) {
+                ColumnType::String => {
+                    let values: HashSet<CompactString> = list
+                        .iter()
+                        .map(|e| extract_string_value(e).map(CompactString::new))
+                        .collect::<Result<_, _>>()?;
+                    CompiledPredicate::InString { col, values }
+                }
+                ColumnType::Long | ColumnType::Int => {
+                    let values: std::collections::HashSet<i64> = list
+                        .iter()
+                        .map(extract_i64)
+                        .collect::<Result<_, _>>()?;
+                    CompiledPredicate::InLong { col, values }
+                }
+                ColumnType::Double => {
+                    let values: std::collections::HashSet<u64> = list
+                        .iter()
+                        .map(|e| extract_f64(e).map(|f| f.to_bits()))
+                        .collect::<Result<_, _>>()?;
+                    CompiledPredicate::InDouble { col, values }
+                }
+            };
             if *negated {
                 Ok(CompiledPredicate::Not(Box::new(pred)))
             } else {
@@ -1046,7 +1184,7 @@ fn resolve_column(
 }
 
 /// Extract a string value from a SQL literal.
-fn extract_string_value(expr: &sqlparser::ast::Expr) -> Result<String, PredicateError> {
+pub(crate) fn extract_string_value(expr: &sqlparser::ast::Expr) -> Result<String, PredicateError> {
     match expr {
         sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan { value, .. }) => match value {
             sqlparser::ast::Value::SingleQuotedString(s) => Ok(s.clone()),
@@ -1059,14 +1197,14 @@ fn extract_string_value(expr: &sqlparser::ast::Expr) -> Result<String, Predicate
 }
 
 /// Extract a f64 from a SQL literal.
-fn extract_f64(expr: &sqlparser::ast::Expr) -> Result<f64, PredicateError> {
+pub(crate) fn extract_f64(expr: &sqlparser::ast::Expr) -> Result<f64, PredicateError> {
     let s = extract_string_value(expr)?;
     s.parse::<f64>()
         .map_err(|_| PredicateError::InvalidLiteral(format!("Cannot parse '{}' as f64", s)))
 }
 
 /// Extract an i64 from a SQL literal.
-fn extract_i64(expr: &sqlparser::ast::Expr) -> Result<i64, PredicateError> {
+pub(crate) fn extract_i64(expr: &sqlparser::ast::Expr) -> Result<i64, PredicateError> {
     let s = extract_string_value(expr)?;
     s.parse::<i64>()
         .map_err(|_| PredicateError::InvalidLiteral(format!("Cannot parse '{}' as i64", s)))

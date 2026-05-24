@@ -5,12 +5,14 @@
 
 mod admin;
 mod config;
+mod logging;
 mod watch;
 
 use admin::{start_admin_server, AdminState};
-use config::{ColumnTypeSpec, ReplicationRole, TopicEntry, TxLogFsyncConfig};
+use config::{ColumnTypeSpec, ReplicationRole, TopicEntry, TxLogFsyncConfig, ViewEntry};
 use cq_core::schema::{ColumnType, Schema};
 use cq_core::topic::{SharedTopic, Topic, TopicConfig};
+use cq_core::view::{spawn_view_runner, View};
 use cq_replication::{receiver as repl_recv, shipper as repl_ship};
 use cq_transport::auth::{AuthStore, User};
 use cq_transport::delivery::spawn_evaluator;
@@ -31,16 +33,23 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,cq_core=debug,cq_transport=debug".into()),
-        )
-        .init();
+    // Load the config FIRST so the logging section can drive tracing
+    // sink installation. Bootstrapping issue: before logging is up,
+    // we can't surface errors via tracing — `load_config` returns
+    // them straight to stderr via the `?` operator instead.
+    let (server_config, config_dir) = config::load_config()?;
+
+    // Install tracing sinks from `[logging]`. Errors opening
+    // individual sink files are returned so we can warn about them
+    // post-install (other sinks may still have come up); failure to
+    // install ANY layer falls back to a stderr default inside
+    // `logging::install`.
+    let sink_errors = logging::install(&server_config.logging);
+    for e in &sink_errors {
+        warn!(error = %e, "Logging sink failed to install");
+    }
 
     info!("CQServer starting...");
-
-    let (server_config, config_dir) = config::load_config()?;
 
     // Install the Prometheus recorder before any metrics calls happen.
     let prom_handle = PrometheusBuilder::new()
@@ -176,6 +185,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(topics = topics.len(), "Topic registry initialized");
 
+    // S20 materialized views. Each view declares an aggregate query
+    // over an existing source topic; the server creates the view
+    // topic, registers it in the same `topics` map (so subscribers
+    // find it via the regular subscribe path), spawns the view
+    // runner thread, and spawns the view topic's own evaluator
+    // thread so its subscribers see row-level deltas as the view's
+    // SOW changes.
+    for view_cfg in &server_config.views {
+        match init_view(view_cfg, &topics, registry.clone()) {
+            Ok(handle) => {
+                evaluator_handles.push(handle);
+                info!(
+                    view = %view_cfg.name,
+                    source = %view_cfg.source,
+                    "Materialized view ready"
+                );
+            }
+            Err(e) => {
+                return Err(format!(
+                    "view '{}': {}",
+                    view_cfg.name, e
+                )
+                .into());
+            }
+        }
+    }
+
+    info!(
+        topics = topics.len(),
+        views = server_config.views.len(),
+        "Topic + view registry ready"
+    );
+
     let ws_topics = topics.clone();
     let tcp_topics = topics.clone();
     let ws_registry = registry.clone();
@@ -218,12 +260,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // transports — a client that reconnects over either TCP or
     // WebSocket finds its previous high-water on the same map.
     let bookmark_store = cq_transport::router::new_bookmark_store();
+    // S21 spillover, when configured: every subscription gets a
+    // per-route overflow file under `[transport.spillover.directory]`.
+    let spillover_ctx = server_config.transport.spillover.as_ref().map(|sp| {
+        let dir = PathBuf::from(&sp.directory);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(
+                directory = %dir.display(),
+                error = %e,
+                "Failed to create spillover directory; disabling spillover"
+            );
+        }
+        info!(
+            directory = %dir.display(),
+            max_bytes_per_sub = sp.max_bytes_per_sub,
+            "Spillover enabled"
+        );
+        cq_transport::router::SpilloverContext {
+            directory: dir,
+            max_bytes_per_sub: sp.max_bytes_per_sub,
+        }
+    });
     let ws_config = WsConfig {
         listen_addr: server_config.websocket_addr.clone(),
         path: server_config.websocket_path.clone(),
         outbound_queue_capacity: outbound_capacity,
         sow_batch_size,
         bookmark_store: Some(bookmark_store.clone()),
+        spillover: spillover_ctx.clone(),
     };
     let tcp_config = TcpConfig {
         listen_addr: server_config.tcp_addr.clone(),
@@ -231,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sow_batch_size,
         tls_acceptor,
         bookmark_store: Some(bookmark_store),
+        spillover: spillover_ctx,
     };
 
     let heartbeat_cfg = HeartbeatConfig {
@@ -263,10 +328,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let auth = Arc::new(AuthStore::new(server_config.auth.required, auth_users));
+    let mut auth_store = AuthStore::new(server_config.auth.required, auth_users);
+    if let Some(jwt_cfg) = &server_config.auth.jwt {
+        let validator = cq_transport::auth::JwtValidator::new_hs256(
+            jwt_cfg.secret.as_bytes(),
+            jwt_cfg.issuer.as_deref(),
+            jwt_cfg.audience.as_deref(),
+            &jwt_cfg.username_claim,
+            &jwt_cfg.entitlements_claim,
+        );
+        auth_store = auth_store.with_jwt(validator);
+        info!(
+            issuer = ?jwt_cfg.issuer,
+            audience = ?jwt_cfg.audience,
+            username_claim = %jwt_cfg.username_claim,
+            entitlements_claim = %jwt_cfg.entitlements_claim,
+            "JWT validator configured"
+        );
+    }
+    let auth = Arc::new(auth_store);
     info!(
         required = auth.required,
         users = auth.user_count(),
+        jwt = auth.has_jwt(),
         "Auth configured"
     );
 
@@ -277,6 +361,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter(|t| t.persist)
         .map(|t| (t.name.clone(), log_path_for(&txlog_dir, &t.name)))
+        .collect();
+    // S11 — hand the per-topic SharedTopic refs to the shipper so its
+    // Ack reader can bump `last_replicated_sequence` on every Ack.
+    let repl_topic_refs: std::collections::HashMap<String, SharedTopic> = topics
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
     info!(role = ?repl_role, "Replication role");
 
@@ -337,6 +427,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_config.replication.listen.clone(),
             repl_topics_for_ship,
             topics.clone(),
+            server_config.replication.filter.clone(),
+            server_config.replication.transform.clone(),
+            repl_topic_refs,
         ) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "Replication failed");
@@ -440,6 +533,9 @@ async fn run_replication(
     listen: Option<String>,
     ship_topics: Vec<(String, PathBuf)>,
     standby_topics: Arc<DashMap<String, SharedTopic>>,
+    filter: Option<cq_replication::filter::FilterSpec>,
+    transform: Option<cq_replication::filter::TransformSpec>,
+    topic_refs: std::collections::HashMap<String, SharedTopic>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match role {
         ReplicationRole::Standalone => {
@@ -452,6 +548,9 @@ async fn run_replication(
             let cfg = repl_ship::ShipperConfig {
                 peer,
                 topics: ship_topics,
+                filter,
+                transform,
+                topic_refs,
                 ..Default::default()
             };
             repl_ship::run(cfg)
@@ -546,6 +645,64 @@ fn init_topic(
         "Topic initialised"
     );
     Ok(Arc::new(topic))
+}
+
+/// Stand up one materialized view declared in config. Resolves the
+/// source topic, parses + compiles the view SQL, builds the view
+/// topic with a derived schema, registers it in the global `topics`
+/// map alongside regular topics, attaches a tap on the source for
+/// re-aggregation wake-ups, spawns the view runner thread, and
+/// spawns the view topic's own evaluator so subscribers see deltas.
+fn init_view(
+    cfg: &ViewEntry,
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    registry: cq_transport::session::SessionRegistry,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    if topics.contains_key(&cfg.name) {
+        return Err(format!(
+            "view name `{}` collides with an existing topic",
+            cfg.name
+        ));
+    }
+    let source = topics
+        .get(&cfg.source)
+        .map(|e| e.value().clone())
+        .ok_or_else(|| format!("source topic `{}` not found", cfg.source))?;
+
+    let (view_topic, query, group_by_names) = View::build_view_topic(
+        &source,
+        &cfg.sql,
+        cfg.name.clone(),
+        cfg.initial_capacity,
+    )
+    .map_err(|e| format!("build view topic: {}", e))?;
+    let view_topic_arc = Arc::new(view_topic);
+
+    // Take the view topic's own mutation receiver before anyone else
+    // can race for it; this is the receiver the view-topic evaluator
+    // will read so view subscribers get row-level deltas as the view
+    // SOW changes.
+    let view_topic_rx = view_topic_arc
+        .take_mutation_rx()
+        .expect("freshly-created view topic must have an rx");
+
+    let tap_rx = source.register_view_tap(cfg.tap_capacity);
+
+    let view = View::new(source, view_topic_arc.clone(), query, group_by_names)
+        .map_err(|e| format!("instantiate view: {}", e))?;
+
+    // The view's runner thread keeps the view SOW in sync with the
+    // source; the view-topic evaluator dispatches deltas to view
+    // subscribers. Both run for the process lifetime.
+    let _runner = spawn_view_runner(view, tap_rx);
+    let evaluator_handle = cq_transport::delivery::spawn_evaluator(
+        view_topic_arc.clone(),
+        view_topic_rx,
+        registry,
+    );
+
+    topics.insert(cfg.name.clone(), view_topic_arc);
+    Ok(evaluator_handle)
 }
 
 /// Build a topic's `Schema` from its `TopicEntry`. Precedence:

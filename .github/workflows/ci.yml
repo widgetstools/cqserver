@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Standard cargo test across the workspace. Excludes loom-cfg-gated
+  # tests (those compile to empty binaries without --cfg loom).
+  unit-and-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  # Loom exhaustively model-checks concurrent code. Single-threaded
+  # because loom serializes its own scheduler.
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom tests
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test --release -p cq-core --test 'loom_*' -- --test-threads 1
+
+  # Property tests with a beefier case budget than the default 256.
+  proptest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run property tests
+        env:
+          PROPTEST_CASES: "2000"
+        run: cargo test --release -p cq-core --test 'prop_*'
+
+  # Differential SQL tests vs DuckDB. Bundled DuckDB compiles from
+  # C++ on first build (~1 min on a clean cache; cached after that
+  # by `Swatinem/rust-cache@v2`).
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p cq-differential-tests
+
+  # Perf benchmarks + regression guard rail (S37 / review C12).
+  # Runs the cq-core criterion benches and pipes their bencher-format
+  # output into github-action-benchmark, which compares against the
+  # last commit on `main` and fails the PR if any bench is > 105% of
+  # baseline (5% slower).
+  bench-regression:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run criterion benches in bencher mode
+        run: |
+          cargo bench --bench store_bench --bench filter_eval --bench subscribe_register \
+            -- --output-format bencher | tee bench.txt
+      - name: Compare to baseline + fail on >5% regression
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: bench.txt
+          fail-on-alert: true
+          alert-threshold: '105%'
+          comment-on-alert: true
+          # Don't push to a gh-pages branch — keep the artifact local
+          # to the PR.  Switch to `auto-push: true` once a baseline
+          # branch convention is established.
+          auto-push: false

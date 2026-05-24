@@ -130,6 +130,103 @@ impl User {
 pub struct AuthStore {
     pub required: bool,
     users: HashMap<String, User>,
+    /// S16 JWT validator. When `Some`, the `Logon` handler can also
+    /// accept a `data.token` field instead of `user`/`password`;
+    /// the token is verified via `verify_jwt` and the matched user
+    /// is built from its claims. Static `users` and JWT validation
+    /// coexist — operators can use either path on a per-Logon
+    /// basis. `None` disables the JWT route.
+    jwt: Option<JwtValidator>,
+}
+
+/// S16 — JWT validator. Holds the decoding key + the claim names the
+/// server should consult for username and entitlements. Constructed
+/// once at startup from `[auth.jwt]` config.
+pub struct JwtValidator {
+    decoding_key: jsonwebtoken::DecodingKey,
+    validation: jsonwebtoken::Validation,
+    pub username_claim: String,
+    pub entitlements_claim: String,
+}
+
+impl std::fmt::Debug for JwtValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtValidator")
+            .field("username_claim", &self.username_claim)
+            .field("entitlements_claim", &self.entitlements_claim)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JwtValidator {
+    /// Build an HS256 validator. `issuer` and `audience` are optional;
+    /// when set, the corresponding `iss`/`aud` claims are also
+    /// validated.
+    pub fn new_hs256(
+        secret: &[u8],
+        issuer: Option<&str>,
+        audience: Option<&str>,
+        username_claim: &str,
+        entitlements_claim: &str,
+    ) -> Self {
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        if let Some(iss) = issuer {
+            validation.set_issuer(&[iss]);
+        } else {
+            // No iss claim required by default — clear the
+            // requirement that `iss` matches (jsonwebtoken's default).
+            validation.iss = None;
+        }
+        if let Some(aud) = audience {
+            validation.set_audience(&[aud]);
+        } else {
+            // Don't require the audience claim either.
+            validation.validate_aud = false;
+        }
+        Self {
+            decoding_key: jsonwebtoken::DecodingKey::from_secret(secret),
+            validation,
+            username_claim: username_claim.to_string(),
+            entitlements_claim: entitlements_claim.to_string(),
+        }
+    }
+
+    /// Verify a JWT and extract a `User`. The username is read from
+    /// `username_claim` (default `"sub"`); the entitlement list is
+    /// read from `entitlements_claim` (default `"entitlements"`).
+    /// Returns `None` on signature failure, expired tokens, claim
+    /// missing, or malformed entitlement strings.
+    pub fn verify(&self, token: &str) -> Option<User> {
+        let claims: serde_json::Value = jsonwebtoken::decode::<serde_json::Value>(
+            token,
+            &self.decoding_key,
+            &self.validation,
+        )
+        .map(|t| t.claims)
+        .ok()?;
+        let username = claims
+            .get(&self.username_claim)
+            .and_then(|v| v.as_str())?
+            .to_string();
+        let entitlement_strs: Vec<String> = match claims.get(&self.entitlements_claim) {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            None => Vec::new(),
+            _ => return None,
+        };
+        let mut parsed = Vec::with_capacity(entitlement_strs.len());
+        for e in &entitlement_strs {
+            parsed.push(Entitlement::parse(e)?);
+        }
+        Some(User {
+            username,
+            password_hash: String::new(), // unused for JWT-authenticated sessions
+            entitlements: parsed,
+            row_filter: None,
+        })
+    }
 }
 
 impl AuthStore {
@@ -141,14 +238,36 @@ impl AuthStore {
         AuthStore {
             required,
             users: map,
+            jwt: None,
         }
+    }
+
+    /// Attach a JWT validator. Builder-style for ergonomic
+    /// construction from the server's startup path.
+    pub fn with_jwt(mut self, jwt: JwtValidator) -> Self {
+        self.jwt = Some(jwt);
+        self
     }
 
     pub fn disabled() -> Self {
         AuthStore {
             required: false,
             users: HashMap::new(),
+            jwt: None,
         }
+    }
+
+    /// True iff a JWT validator is configured. The Logon handler
+    /// consults this to decide whether to accept a `data.token`
+    /// payload in addition to (or instead of) `user`/`password`.
+    pub fn has_jwt(&self) -> bool {
+        self.jwt.is_some()
+    }
+
+    /// Verify a JWT and produce the matched user. Returns `None` if
+    /// no validator is configured or the token is invalid.
+    pub fn verify_jwt(&self, token: &str) -> Option<User> {
+        self.jwt.as_ref().and_then(|j| j.verify(token))
     }
 
     pub fn user_count(&self) -> usize {
@@ -247,5 +366,109 @@ mod tests {
         assert!(store.verify("bob", "hunter2").is_some());
         assert!(store.verify("bob", "wrong").is_none());
         assert!(store.verify("nobody", "hunter2").is_none());
+    }
+
+    fn issue_jwt(secret: &[u8], claims: serde_json::Value) -> String {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret),
+        )
+        .expect("encode test JWT")
+    }
+
+    #[test]
+    fn jwt_valid_token_extracts_user_and_entitlements() {
+        let secret = b"shhh-very-secret";
+        let validator = JwtValidator::new_hs256(
+            secret,
+            None,
+            None,
+            "sub",
+            "entitlements",
+        );
+        let claims = serde_json::json!({
+            "sub": "alice",
+            "entitlements": ["publish:/orders", "subscribe:/market-*"],
+            "exp": (chrono_unix_now() + 3600) as i64,
+        });
+        let token = issue_jwt(secret, claims);
+        let u = validator.verify(&token).expect("valid token should pass");
+        assert_eq!(u.username, "alice");
+        assert!(u.can(Op::Publish, "/orders"));
+        assert!(u.can(Op::Subscribe, "/market-data"));
+        assert!(!u.can(Op::Publish, "/market-data"));
+    }
+
+    #[test]
+    fn jwt_invalid_signature_rejected() {
+        let secret = b"shhh";
+        let validator = JwtValidator::new_hs256(secret, None, None, "sub", "entitlements");
+        let token = issue_jwt(b"wrong-secret", serde_json::json!({
+            "sub": "alice",
+            "entitlements": [],
+            "exp": (chrono_unix_now() + 3600) as i64,
+        }));
+        assert!(validator.verify(&token).is_none());
+    }
+
+    #[test]
+    fn jwt_expired_token_rejected() {
+        let secret = b"shhh";
+        let validator = JwtValidator::new_hs256(secret, None, None, "sub", "entitlements");
+        // 2 hours past expiry — well outside jsonwebtoken's default
+        // 60-second `leeway` so the clock-skew tolerance can't mask the
+        // expiry.
+        let token = issue_jwt(secret, serde_json::json!({
+            "sub": "alice",
+            "entitlements": [],
+            "exp": (chrono_unix_now() - 7200) as i64,
+        }));
+        assert!(validator.verify(&token).is_none());
+    }
+
+    #[test]
+    fn jwt_issuer_mismatch_rejected() {
+        let secret = b"shhh";
+        let validator = JwtValidator::new_hs256(
+            secret,
+            Some("trusted-issuer"),
+            None,
+            "sub",
+            "entitlements",
+        );
+        let token = issue_jwt(secret, serde_json::json!({
+            "iss": "other-issuer",
+            "sub": "alice",
+            "entitlements": [],
+            "exp": (chrono_unix_now() + 3600) as i64,
+        }));
+        assert!(validator.verify(&token).is_none());
+    }
+
+    #[test]
+    fn jwt_store_routes_verify_through_validator() {
+        let secret = b"abc";
+        let validator = JwtValidator::new_hs256(secret, None, None, "sub", "entitlements");
+        let store = AuthStore::new(true, vec![]).with_jwt(validator);
+        assert!(store.has_jwt());
+        let token = issue_jwt(secret, serde_json::json!({
+            "sub": "carol",
+            "entitlements": ["*:*"],
+            "exp": (chrono_unix_now() + 3600) as i64,
+        }));
+        let u = store.verify_jwt(&token).expect("token should validate");
+        assert_eq!(u.username, "carol");
+        assert!(u.can(Op::Publish, "/anything"));
+    }
+
+    /// Tiny helper — returns current unix epoch seconds. We avoid
+    /// pulling chrono just for this; use std::time directly.
+    fn chrono_unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 }

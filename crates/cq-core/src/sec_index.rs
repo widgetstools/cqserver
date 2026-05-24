@@ -24,7 +24,7 @@
 use crate::store::{Value, NULL_DOUBLE, NULL_INT, NULL_LONG};
 use compact_str::CompactString;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Indexable value. Mirrors `Value` but is `Eq + Hash`. Returned as
 /// `None` for nulls — the caller is expected to skip null
@@ -58,26 +58,118 @@ impl IxKey {
     }
 }
 
-/// Set of secondary indexes for one topic. Internally a flat
-/// `HashMap<(col_idx, IxKey), RoaringBitmap>` for the indexed columns;
-/// the column set is fixed at topic construction (from config).
+/// Ordered range-index key (S30). Mirrors `IxKey` but implements
+/// `Ord` correctly for ranged lookups — including `f64` via a
+/// total-order encoding (sign-bit flip for positives, all-bits flip
+/// for negatives) so a BTreeMap walk in key order matches numeric
+/// order. NaN is filtered out at maintenance time (treated as null,
+/// same as `IxKey`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RangeKey {
+    Int(i32),
+    Long(i64),
+    /// `f64` encoded into a u64 such that the natural `u64` order
+    /// matches the `f64` total order.
+    DoubleOrdered(u64),
+    String(CompactString),
+}
+
+/// Encode an `f64` into a `u64` whose `Ord` matches the `f64` total
+/// order. Standard trick: flip the sign bit for non-negatives, flip
+/// every bit for negatives. NaN is unsupported (the caller must
+/// filter it out — see `RangeKey::from_value`).
+#[inline]
+fn f64_to_ordered_bits(f: f64) -> u64 {
+    let bits = f.to_bits();
+    if bits & (1u64 << 63) == 0 {
+        // Non-negative: flip the sign bit so all positives > all negatives.
+        bits ^ (1u64 << 63)
+    } else {
+        // Negative: flip every bit so larger magnitude maps to smaller u64.
+        !bits
+    }
+}
+
+impl RangeKey {
+    /// Build a `RangeKey` from a stored `Value`. Returns `None` for
+    /// nulls / NaN (same exclusion rules as `IxKey::from_value`).
+    pub fn from_value(v: &Value) -> Option<RangeKey> {
+        match v {
+            Value::Null => None,
+            Value::String(None) => None,
+            Value::String(Some(s)) => Some(RangeKey::String(s.clone())),
+            Value::Long(n) if *n == NULL_LONG => None,
+            Value::Long(n) => Some(RangeKey::Long(*n)),
+            Value::Int(n) if *n == NULL_INT => None,
+            Value::Int(n) => Some(RangeKey::Int(*n)),
+            Value::Double(d) if d.is_nan() || *d == NULL_DOUBLE => None,
+            Value::Double(d) => Some(RangeKey::DoubleOrdered(f64_to_ordered_bits(*d))),
+        }
+    }
+
+    /// Build from a typed integer literal (i64). Used by the planner
+    /// when the parsed predicate's RHS is a numeric literal — the
+    /// column's actual type is decided at lookup time.
+    pub fn from_long(n: i64) -> RangeKey {
+        RangeKey::Long(n)
+    }
+
+    /// Build from a typed integer literal (i32).
+    pub fn from_int(n: i32) -> RangeKey {
+        RangeKey::Int(n)
+    }
+
+    /// Build from a typed double literal. Caller filters NaN.
+    pub fn from_double(d: f64) -> Option<RangeKey> {
+        if d.is_nan() {
+            None
+        } else {
+            Some(RangeKey::DoubleOrdered(f64_to_ordered_bits(d)))
+        }
+    }
+
+    /// Build from a string literal.
+    pub fn from_string(s: &str) -> RangeKey {
+        RangeKey::String(CompactString::new(s))
+    }
+}
+
+/// Set of secondary indexes for one topic. Each indexed column gets
+/// **two** parallel inner maps:
+///
+///   - A `HashMap<IxKey, RoaringBitmap>` for equality lookups
+///     (`col = lit`, `col IN (...)`).
+///   - A `BTreeMap<RangeKey, RoaringBitmap>` for ordered/range
+///     lookups (`col > lit`, `col BETWEEN a AND b`) — S30. The
+///     BTreeMap's natural key order matches numeric (and lex)
+///     ordering, so a range walk produces rows in order.
+///
+/// Both maps are maintained in lockstep on every `add` / `remove`
+/// call. The column set is fixed at topic construction (from config).
 pub struct SecondaryIndex {
     /// Schema-column indices that are indexed. Same order as config
     /// supplies them.
     indexed_cols: Vec<usize>,
-    /// One inner map per indexed column.
+    /// Equality maps: one inner map per indexed column.
     by_col: HashMap<usize, HashMap<IxKey, RoaringBitmap>>,
+    /// Range maps: one BTreeMap per indexed column. The B-tree's key
+    /// ordering matches numeric ordering (see `RangeKey`), so
+    /// `range(lo..=hi)` returns matching rows in column-value order.
+    range_by_col: HashMap<usize, BTreeMap<RangeKey, RoaringBitmap>>,
 }
 
 impl SecondaryIndex {
     pub fn new(indexed_cols: Vec<usize>) -> Self {
         let mut by_col = HashMap::with_capacity(indexed_cols.len());
+        let mut range_by_col = HashMap::with_capacity(indexed_cols.len());
         for &c in &indexed_cols {
             by_col.insert(c, HashMap::new());
+            range_by_col.insert(c, BTreeMap::new());
         }
         Self {
             indexed_cols,
             by_col,
+            range_by_col,
         }
     }
 
@@ -95,32 +187,48 @@ impl SecondaryIndex {
         self.indexed_cols.iter().any(|&c| c == col)
     }
 
-    /// Add a `(col, value) → row` mapping. No-op for null values or
-    /// uncovered columns.
+    /// Add a `(col, value) → row` mapping to BOTH the equality and
+    /// range indexes. No-op for null values or uncovered columns.
     pub fn add(&mut self, col: usize, value: &Value, row: u32) {
-        let Some(inner) = self.by_col.get_mut(&col) else {
-            return;
-        };
-        let Some(key) = IxKey::from_value(value) else {
-            return;
-        };
-        inner.entry(key).or_default().insert(row);
+        // Equality side.
+        if let Some(inner) = self.by_col.get_mut(&col) {
+            if let Some(key) = IxKey::from_value(value) {
+                inner.entry(key).or_default().insert(row);
+            }
+        }
+        // Range side.
+        if let Some(inner) = self.range_by_col.get_mut(&col) {
+            if let Some(rkey) = RangeKey::from_value(value) {
+                inner.entry(rkey).or_default().insert(row);
+            }
+        }
     }
 
-    /// Remove a `(col, value) → row` mapping. No-op for null values
-    /// or uncovered columns. The empty-bitmap entry is dropped so
-    /// the map doesn't accumulate zombies under churn.
+    /// Remove a `(col, value) → row` mapping from BOTH indexes.
+    /// No-op for null values or uncovered columns. Empty-bitmap
+    /// entries are dropped so neither map accumulates zombies
+    /// under churn.
     pub fn remove(&mut self, col: usize, value: &Value, row: u32) {
-        let Some(inner) = self.by_col.get_mut(&col) else {
-            return;
-        };
-        let Some(key) = IxKey::from_value(value) else {
-            return;
-        };
-        if let Some(rows) = inner.get_mut(&key) {
-            rows.remove(row);
-            if rows.is_empty() {
-                inner.remove(&key);
+        // Equality side.
+        if let Some(inner) = self.by_col.get_mut(&col) {
+            if let Some(key) = IxKey::from_value(value) {
+                if let Some(rows) = inner.get_mut(&key) {
+                    rows.remove(row);
+                    if rows.is_empty() {
+                        inner.remove(&key);
+                    }
+                }
+            }
+        }
+        // Range side.
+        if let Some(inner) = self.range_by_col.get_mut(&col) {
+            if let Some(rkey) = RangeKey::from_value(value) {
+                if let Some(rows) = inner.get_mut(&rkey) {
+                    rows.remove(row);
+                    if rows.is_empty() {
+                        inner.remove(&rkey);
+                    }
+                }
             }
         }
     }
@@ -140,6 +248,74 @@ impl SecondaryIndex {
     pub fn rows_for_key(&self, col: usize, key: &IxKey) -> Option<&RoaringBitmap> {
         let inner = self.by_col.get(&col)?;
         inner.get(key)
+    }
+
+    /// True iff this column has a range index (S30). For now the
+    /// range index is built for every indexed column, so this is
+    /// just `covers(col)`. Kept as a distinct method so future
+    /// configs that selectively enable range indexing can flip
+    /// behavior without touching call sites.
+    pub fn has_range(&self, col: usize) -> bool {
+        self.range_by_col.contains_key(&col)
+    }
+
+    /// Range-lookup: returns the union of row bitmaps for every key
+    /// in `[lo, hi]` (closed at both ends). `lo = None` means
+    /// "from the smallest key"; `hi = None` means "to the largest."
+    /// Both `None` returns every row across the indexed column —
+    /// equivalent to an `IS NOT NULL` lookup.
+    pub fn rows_in_range(
+        &self,
+        col: usize,
+        lo: Option<RangeKey>,
+        hi: Option<RangeKey>,
+    ) -> Option<RoaringBitmap> {
+        let inner = self.range_by_col.get(&col)?;
+        let mut out = RoaringBitmap::new();
+        let iter: Box<dyn Iterator<Item = (&RangeKey, &RoaringBitmap)>> = match (&lo, &hi) {
+            (Some(l), Some(h)) => Box::new(inner.range(l.clone()..=h.clone())),
+            (Some(l), None) => Box::new(inner.range(l.clone()..)),
+            (None, Some(h)) => Box::new(inner.range(..=h.clone())),
+            (None, None) => Box::new(inner.iter()),
+        };
+        for (_, bm) in iter {
+            out |= bm;
+        }
+        Some(out)
+    }
+
+    /// Convenience: rows whose indexed-column value is strictly
+    /// greater than `lo`. Implemented via `rows_in_range` with the
+    /// next-larger-key trick (BTreeMap exposes only inclusive
+    /// bounds via `Range<K>`; we use a half-open variant here).
+    pub fn rows_greater_than(
+        &self,
+        col: usize,
+        lo: RangeKey,
+    ) -> Option<RoaringBitmap> {
+        let inner = self.range_by_col.get(&col)?;
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut out = RoaringBitmap::new();
+        for (_, bm) in inner.range((Excluded(lo), Unbounded)) {
+            out |= bm;
+        }
+        Some(out)
+    }
+
+    /// Convenience: rows whose indexed-column value is strictly
+    /// less than `hi`.
+    pub fn rows_less_than(
+        &self,
+        col: usize,
+        hi: RangeKey,
+    ) -> Option<RoaringBitmap> {
+        let inner = self.range_by_col.get(&col)?;
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut out = RoaringBitmap::new();
+        for (_, bm) in inner.range((Unbounded, Excluded(hi))) {
+            out |= bm;
+        }
+        Some(out)
     }
 }
 

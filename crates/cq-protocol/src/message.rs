@@ -1,6 +1,7 @@
 //! CQServer message format — the envelope for all client-server communication.
 
 use crate::command::{AckType, Command, Status};
+use crate::schema_change::SchemaChangeBody;
 use serde::{Deserialize, Serialize};
 
 /// A CQServer message (client → server or server → client).
@@ -124,6 +125,33 @@ pub struct CqMessage {
     /// the message (possibly to a different consumer).
     #[serde(rename = "did", skip_serializing_if = "Option::is_none")]
     pub delivery_id: Option<u64>,
+
+    /// Structured payload for `Command::SchemaChange` frames (S44).
+    /// `None` on every other command — kept Optional so older
+    /// clients deserializing a SchemaChange-free wire byte stream
+    /// don't see an unknown field.
+    #[serde(rename = "sc", skip_serializing_if = "Option::is_none")]
+    pub schema_change: Option<SchemaChangeBody>,
+
+    /// S28 wire-protocol version negotiation. On `Logon`, clients send
+    /// the set of protocol versions they support; the server picks the
+    /// highest mutually supported and echoes it back as a single-entry
+    /// vec on the ack. Both sides then know which version is active.
+    /// Absent on every non-Logon frame (the negotiated version is
+    /// stored per-session). Older clients/servers that don't send this
+    /// field default to version 1.
+    #[serde(rename = "pv", skip_serializing_if = "Option::is_none")]
+    pub protocol_versions: Option<Vec<u32>>,
+
+    /// S27 wire-compression negotiation. On `Logon`, clients send a
+    /// preference-ordered list of compression algorithms; the server
+    /// picks the first one it supports and echoes it back as a
+    /// single-entry vec on the ack. Absent on every non-Logon frame.
+    /// Pre-S27 clients that omit this field negotiate to
+    /// [`crate::compression::DEFAULT_LEGACY_COMPRESSION`] (i.e.
+    /// `Compression::None`).
+    #[serde(rename = "comp", skip_serializing_if = "Option::is_none")]
+    pub compressions: Option<Vec<crate::compression::Compression>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -155,6 +183,24 @@ impl CqMessage {
             client_name: None,
             send_keys: false,
             delivery_id: None,
+            schema_change: None,
+            protocol_versions: None,
+            compressions: None,
+        }
+    }
+
+    /// Construct a `SchemaChange` frame for `sub_id` carrying `body`.
+    /// The frame is server-emitted; clients deserialize and surface
+    /// it via the SDK's schema-change callback. See [`crate::schema_change`].
+    pub fn schema_change_msg(
+        sub_id: &str,
+        body: SchemaChangeBody,
+    ) -> Self {
+        CqMessage {
+            command: Command::SchemaChange,
+            sub_id: Some(sub_id.to_string()),
+            schema_change: Some(body),
+            ..CqMessage::new(Command::SchemaChange)
         }
     }
 

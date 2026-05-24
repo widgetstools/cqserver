@@ -48,6 +48,79 @@ pub struct ParsedQuery {
     /// `!aggregates.is_empty()` = implicit single-group (e.g.
     /// `SELECT COUNT(*) FROM t WHERE ...`).
     pub group_by: Vec<usize>,
+    /// Static-PIVOT spec (S43). `Some` iff the FROM clause was a
+    /// `PIVOT (...) FOR col IN (lit, lit, ...)` and routes the
+    /// executor to the pivot path.
+    pub pivot: Option<ParsedPivot>,
+    /// UNPIVOT spec (S43). `Some` iff the FROM clause was
+    /// `UNPIVOT (val FOR name IN (c1, c2, ...))`. Mutually
+    /// exclusive with `pivot`.
+    pub unpivot: Option<ParsedUnpivot>,
+}
+
+/// Compiled `PIVOT (...) FOR col IN (lit, lit, ...)` spec.
+#[derive(Debug, Clone)]
+pub struct ParsedPivot {
+    /// One or more aggregates pivoted across the value list. Multi-
+    /// measure pivots have len > 1 (e.g.,
+    /// `PIVOT (SUM(qty), SUM(notional) FOR desk IN ('A', 'B'))`).
+    pub aggregates: Vec<AggregateSpec>,
+    /// Column whose distinct values become output column names.
+    pub pivot_col: usize,
+    /// Static IN-list of pivot values. The output has one column
+    /// per (value, agg) pair (or just per value when there's one
+    /// aggregate). Rows whose pivot column value isn't in the
+    /// list are silently dropped — matches Snowflake/BigQuery.
+    ///
+    /// **Dynamic pivots** (`FOR col IN ANY`) leave this empty;
+    /// the executor does a first pass over the candidate rows to
+    /// discover the distinct pivot values, then runs the regular
+    /// bucketing path against the discovered set.
+    pub pivot_values: Vec<PivotLiteral>,
+    /// `true` when the pivot value set is `IN ANY` (S45 dynamic
+    /// PIVOT) — the executor discovers values from the data
+    /// instead of consuming a literal list. `false` for the
+    /// static-list form (S43).
+    pub dynamic: bool,
+    /// Anchor columns: every column NOT referenced by an aggregate
+    /// and NOT the pivot column. The output has one row per
+    /// distinct anchor-key tuple.
+    pub anchor_cols: Vec<usize>,
+}
+
+/// One literal in a static PIVOT IN-list, typed to match the column.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PivotLiteral {
+    String(compact_str::CompactString),
+    Long(i64),
+    Double(u64), // f64.to_bits()
+}
+
+impl PivotLiteral {
+    /// Stringify for output column naming. `'A'` becomes `"A"`,
+    /// `100` becomes `"100"`. Matches Snowflake conventions.
+    pub fn as_column_label(&self) -> String {
+        match self {
+            PivotLiteral::String(s) => s.to_string(),
+            PivotLiteral::Long(n) => n.to_string(),
+            PivotLiteral::Double(bits) => f64::from_bits(*bits).to_string(),
+        }
+    }
+}
+
+/// Compiled `UNPIVOT (val FOR name IN (c1, c2, ...))` spec.
+#[derive(Debug, Clone)]
+pub struct ParsedUnpivot {
+    /// Name of the output column that holds the pivot value (one
+    /// per source-column-and-row).
+    pub value_col_name: String,
+    /// Name of the output column that holds the source column name.
+    pub name_col_name: String,
+    /// Source columns to unpivot (by index in the schema).
+    pub source_cols: Vec<usize>,
+    /// Anchor columns: every column NOT in `source_cols`. Each
+    /// output row carries these plus (name, value).
+    pub anchor_cols: Vec<usize>,
 }
 
 /// Aggregate function variants. `Count` with `col = None` is `COUNT(*)`.
@@ -89,6 +162,12 @@ impl ParsedQuery {
     pub fn is_aggregate(&self) -> bool {
         !self.aggregates.is_empty()
     }
+
+    /// True if the FROM clause was a PIVOT/UNPIVOT (S43). Routes the
+    /// executor to the pivot/unpivot path.
+    pub fn is_pivot(&self) -> bool {
+        self.pivot.is_some() || self.unpivot.is_some()
+    }
 }
 
 /// Result of a query execution.
@@ -96,6 +175,17 @@ impl ParsedQuery {
 pub struct QueryResult {
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     pub total_matches: usize,
+    /// Source row indices into the underlying `ColumnStore`, in
+    /// lockstep with `rows`. Populated by the row-oriented
+    /// (non-aggregate) execution path so the tombstone filter
+    /// downstream can drop nulled-out rows by row-index lookup
+    /// instead of by re-deriving the key from the projection — the
+    /// pre-fix approach broke whenever the projection excluded the
+    /// key column (see Known Issue closed by S46-followup).
+    ///
+    /// Aggregate queries leave this empty: their output rows are
+    /// per-group synthesized, not per-source-row.
+    pub source_rows: Vec<u32>,
 }
 
 /// Parse a SQL string into a `ParsedQuery`.
@@ -125,9 +215,59 @@ fn parse_select(
     };
 
     // --- FROM clause → topic name ---
+    // PIVOT and UNPIVOT (S43) get their own parse-and-return path
+    // below since they carry significant out-of-band state (pivot
+    // spec, source columns) that the rest of the SELECT pipeline
+    // wouldn't otherwise know what to do with.
     let topic = if let Some(from) = select.from.first() {
         match &from.relation {
             TableFactor::Table { name, .. } => name.to_string(),
+            TableFactor::Pivot {
+                table,
+                aggregate_functions,
+                value_column,
+                value_source,
+                ..
+            } => {
+                let inner_name = match table.as_ref() {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(QueryError::ParseError(
+                        "PIVOT over non-table FROM (e.g. subquery) not yet supported".into(),
+                    )),
+                };
+                return parse_pivot_query(
+                    select,
+                    query,
+                    schema,
+                    inner_name,
+                    aggregate_functions,
+                    value_column,
+                    value_source,
+                );
+            }
+            TableFactor::Unpivot {
+                table,
+                value,
+                name: name_col,
+                columns,
+                ..
+            } => {
+                let inner_name = match table.as_ref() {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(QueryError::ParseError(
+                        "UNPIVOT over non-table FROM (e.g. subquery) not yet supported".into(),
+                    )),
+                };
+                return parse_unpivot_query(
+                    select,
+                    query,
+                    schema,
+                    inner_name,
+                    value,
+                    name_col,
+                    columns,
+                );
+            }
             _ => return Err(QueryError::ParseError("Unsupported FROM".into())),
         }
     } else {
@@ -177,6 +317,237 @@ fn parse_select(
         limit,
         aggregates,
         group_by,
+        pivot: None,
+        unpivot: None,
+    })
+}
+
+/// Parse a `SELECT ... FROM t PIVOT (agg(col) FOR pivot_col IN (lit, lit, ...))` query.
+/// Returns a `ParsedQuery` with `pivot: Some(...)` set; `execute_pivot_query`
+/// handles the rest.
+fn parse_pivot_query(
+    select: &sqlparser::ast::Select,
+    query: &sqlparser::ast::Query,
+    schema: &Schema,
+    topic: String,
+    aggregate_functions: &[sqlparser::ast::ExprWithAlias],
+    value_column: &[sqlparser::ast::Ident],
+    value_source: &sqlparser::ast::PivotValueSource,
+) -> Result<ParsedQuery, QueryError> {
+    use sqlparser::ast::PivotValueSource;
+
+    // 1. Aggregates — at least one, in declaration order.
+    if aggregate_functions.is_empty() {
+        return Err(QueryError::ParseError(
+            "PIVOT requires at least one aggregate function".into(),
+        ));
+    }
+    let mut aggs: Vec<AggregateSpec> = Vec::with_capacity(aggregate_functions.len());
+    for ew in aggregate_functions {
+        let alias = ew.alias.as_ref().map(|a| a.value.clone());
+        let spec = parse_aggregate_call(&ew.expr, schema, alias.as_deref())?
+            .ok_or_else(|| {
+                QueryError::ParseError(format!(
+                    "PIVOT measures must be aggregate calls (SUM/COUNT/AVG/MIN/MAX); got {:?}",
+                    ew.expr
+                ))
+            })?;
+        aggs.push(spec);
+    }
+
+    // 2. Pivot column — single ident expected.
+    let pivot_col_name = match value_column {
+        [ident] => ident.value.clone(),
+        _ => {
+            return Err(QueryError::ParseError(format!(
+                "PIVOT supports a single pivot column today; got {} ({:?})",
+                value_column.len(),
+                value_column
+            )))
+        }
+    };
+    let pivot_col = schema
+        .index_of(&pivot_col_name)
+        .ok_or_else(|| QueryError::UnknownColumn(pivot_col_name.clone()))?;
+
+    // 3. Pivot values — static list (S43) or dynamic ANY (S45).
+    // Subquery-driven value sources still defer to a follow-up.
+    let (pivot_values, dynamic) = match value_source {
+        PivotValueSource::List(items) => {
+            (parse_pivot_value_list(items, schema, pivot_col)?, false)
+        }
+        PivotValueSource::Any(_order_by) => {
+            // ORDER BY inside ANY would let the caller pin the
+            // output column order; we ignore it today and sort
+            // discovered values in their natural ordering. The
+            // proptest's reference walks the same ordering.
+            (Vec::new(), true)
+        }
+        PivotValueSource::Subquery(_) => {
+            return Err(QueryError::NotYetImplemented(
+                "PIVOT with subquery value source not yet supported".into(),
+            ));
+        }
+    };
+
+    // 4. Anchor columns = every schema column NOT in (pivot_col,
+    // aggregate input cols). This is the natural Snowflake/BigQuery
+    // convention: the user doesn't declare anchor cols explicitly.
+    let mut excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    excluded.insert(pivot_col);
+    for a in &aggs {
+        if let Some(c) = a.col {
+            excluded.insert(c);
+        }
+    }
+    let anchor_cols: Vec<usize> = (0..schema.column_count())
+        .filter(|c| !excluded.contains(c))
+        .collect();
+
+    // 5. WHERE clause — applies pre-pivot.
+    let predicate = if let Some(where_expr) = &select.selection {
+        compile_expr(where_expr, schema).map_err(QueryError::PredicateError)?
+    } else {
+        CompiledPredicate::True
+    };
+
+    // 6. SELECT is required to be `*` today — output columns are
+    // determined by the pivot spec, not by an explicit projection.
+    if !matches!(select.projection.as_slice(), [sqlparser::ast::SelectItem::Wildcard(_)]) {
+        return Err(QueryError::ParseError(
+            "PIVOT currently requires `SELECT * FROM ... PIVOT(...)`. Explicit projection over pivot output is a follow-up."
+                .into(),
+        ));
+    }
+
+    // 7. ORDER BY / LIMIT on pivot output — not yet supported.
+    if query.order_by.is_some() || query.limit_clause.is_some() {
+        return Err(QueryError::NotYetImplemented(
+            "ORDER BY / LIMIT on PIVOT output not yet supported".into(),
+        ));
+    }
+
+    let pivot = ParsedPivot {
+        aggregates: aggs,
+        pivot_col,
+        pivot_values,
+        dynamic,
+        anchor_cols,
+    };
+
+    Ok(ParsedQuery {
+        topic,
+        projection: Vec::new(),
+        predicate,
+        order_by: Vec::new(),
+        limit: None,
+        aggregates: Vec::new(),
+        group_by: Vec::new(),
+        pivot: Some(pivot),
+        unpivot: None,
+    })
+}
+
+/// Parse the IN-list of a static PIVOT. Each literal must be
+/// representable in the pivot column's type — `'A'` for a string
+/// column, `1` for a long column, `1.5` for a double column.
+fn parse_pivot_value_list(
+    items: &[sqlparser::ast::ExprWithAlias],
+    schema: &Schema,
+    pivot_col: usize,
+) -> Result<Vec<PivotLiteral>, QueryError> {
+    use crate::schema::ColumnType;
+    let col_type = schema.column_type(pivot_col);
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let lit = match col_type {
+            ColumnType::String => PivotLiteral::String(
+                crate::predicate::extract_string_value(&it.expr)
+                    .map(compact_str::CompactString::new)
+                    .map_err(QueryError::PredicateError)?,
+            ),
+            ColumnType::Long | ColumnType::Int => PivotLiteral::Long(
+                crate::predicate::extract_i64(&it.expr).map_err(QueryError::PredicateError)?,
+            ),
+            ColumnType::Double => PivotLiteral::Double(
+                crate::predicate::extract_f64(&it.expr)
+                    .map_err(QueryError::PredicateError)?
+                    .to_bits(),
+            ),
+        };
+        out.push(lit);
+    }
+    Ok(out)
+}
+
+/// Parse an `UNPIVOT (val FOR name IN (c1, c2, ...))` query.
+fn parse_unpivot_query(
+    select: &sqlparser::ast::Select,
+    query: &sqlparser::ast::Query,
+    schema: &Schema,
+    topic: String,
+    value: &sqlparser::ast::Ident,
+    name_col: &sqlparser::ast::Ident,
+    columns: &[sqlparser::ast::Ident],
+) -> Result<ParsedQuery, QueryError> {
+    // Source columns — each must exist in the schema. Order is the
+    // order the user listed them; the executor preserves it when
+    // exploding rows.
+    let mut source_cols: Vec<usize> = Vec::with_capacity(columns.len());
+    for ident in columns {
+        let idx = schema
+            .index_of(&ident.value)
+            .ok_or_else(|| QueryError::UnknownColumn(ident.value.clone()))?;
+        source_cols.push(idx);
+    }
+    if source_cols.is_empty() {
+        return Err(QueryError::ParseError(
+            "UNPIVOT requires at least one source column".into(),
+        ));
+    }
+
+    // Anchor columns = every schema column NOT in source_cols.
+    let excluded: std::collections::HashSet<usize> = source_cols.iter().copied().collect();
+    let anchor_cols: Vec<usize> = (0..schema.column_count())
+        .filter(|c| !excluded.contains(c))
+        .collect();
+
+    // WHERE clause applies pre-explosion.
+    let predicate = if let Some(where_expr) = &select.selection {
+        compile_expr(where_expr, schema).map_err(QueryError::PredicateError)?
+    } else {
+        CompiledPredicate::True
+    };
+
+    if !matches!(select.projection.as_slice(), [sqlparser::ast::SelectItem::Wildcard(_)]) {
+        return Err(QueryError::ParseError(
+            "UNPIVOT currently requires `SELECT * FROM ... UNPIVOT(...)`. Explicit projection over unpivot output is a follow-up."
+                .into(),
+        ));
+    }
+    if query.order_by.is_some() || query.limit_clause.is_some() {
+        return Err(QueryError::NotYetImplemented(
+            "ORDER BY / LIMIT on UNPIVOT output not yet supported".into(),
+        ));
+    }
+
+    let unpivot = ParsedUnpivot {
+        value_col_name: value.value.clone(),
+        name_col_name: name_col.value.clone(),
+        source_cols,
+        anchor_cols,
+    };
+
+    Ok(ParsedQuery {
+        topic,
+        projection: Vec::new(),
+        predicate,
+        order_by: Vec::new(),
+        limit: None,
+        aggregates: Vec::new(),
+        group_by: Vec::new(),
+        pivot: None,
+        unpivot: Some(unpivot),
     })
 }
 
@@ -408,7 +779,14 @@ fn parse_order_by(
 /// path) or the full row range. The caller iterates over `.iter()`
 /// and evaluates the predicate on each.
 pub enum CandidateRows<'a> {
+    /// Borrowed bitmap from the equality index (zero-copy fast path).
     Bitmap(&'a roaring::RoaringBitmap),
+    /// Owned bitmap — the range-index path computes its union by
+    /// walking the B-tree, which produces a fresh `RoaringBitmap`.
+    /// Variant kept distinct from `Bitmap` so the equality path
+    /// stays allocation-free.
+    OwnedBitmap(roaring::RoaringBitmap),
+    /// Full row scan: every row in `[0, n)`.
     Full(u32),
 }
 
@@ -417,6 +795,7 @@ impl<'a> CandidateRows<'a> {
     pub fn upper_bound(&self) -> usize {
         match self {
             CandidateRows::Bitmap(b) => b.len() as usize,
+            CandidateRows::OwnedBitmap(b) => b.len() as usize,
             CandidateRows::Full(n) => *n as usize,
         }
     }
@@ -424,6 +803,11 @@ impl<'a> CandidateRows<'a> {
     pub fn for_each(&self, mut f: impl FnMut(u32)) {
         match self {
             CandidateRows::Bitmap(b) => {
+                for row in b.iter() {
+                    f(row);
+                }
+            }
+            CandidateRows::OwnedBitmap(b) => {
                 for row in b.iter() {
                     f(row);
                 }
@@ -448,6 +832,7 @@ pub fn plan_candidates<'a>(
     index: Option<&'a SecondaryIndex>,
 ) -> CandidateRows<'a> {
     if let Some(ix) = index {
+        // Equality fast path (cheaper — direct HashMap hit).
         if let Some((col, key)) = find_index_hint(&query.predicate, ix) {
             metrics::counter!("cq_query_index_hits_total").increment(1);
             if let Some(b) = ix.rows_for_key(col, &key) {
@@ -456,6 +841,15 @@ pub fn plan_candidates<'a>(
             // Hit but empty — represent as an empty range so the
             // caller's iteration yields nothing.
             return CandidateRows::Full(0);
+        }
+        // S30 range fast path — `<`, `>`, `BETWEEN` on indexed
+        // numeric/string columns. Returns an owned bitmap (B-tree
+        // walks construct a fresh union), so we wrap it in
+        // `CandidateRows::OwnedBitmap` below.
+        if let Some(bm) = find_range_hint(&query.predicate, ix) {
+            metrics::counter!("cq_query_index_hits_total").increment(1);
+            metrics::counter!("cq_query_range_index_hits_total").increment(1);
+            return CandidateRows::OwnedBitmap(bm);
         }
     }
     metrics::counter!("cq_query_full_scans_total").increment(1);
@@ -486,6 +880,66 @@ fn find_index_hint(pred: &CompiledPredicate, index: &SecondaryIndex) -> Option<(
     }
 }
 
+/// S30: walk the predicate looking for a range clause (`<`, `>`,
+/// `<=`, `>=`, `BETWEEN`) over an indexed column. Returns the
+/// candidate row bitmap from `SecondaryIndex`'s range maps, or
+/// `None` if no qualifying clause is found.
+fn find_range_hint(
+    pred: &CompiledPredicate,
+    index: &SecondaryIndex,
+) -> Option<roaring::RoaringBitmap> {
+    use crate::sec_index::RangeKey;
+    match pred {
+        // BETWEEN — closed interval.
+        CompiledPredicate::BetweenLong { col, low, high } if index.has_range(*col) => {
+            index.rows_in_range(*col, Some(RangeKey::Long(*low)), Some(RangeKey::Long(*high)))
+        }
+        CompiledPredicate::BetweenDouble { col, low, high } if index.has_range(*col) => {
+            let lo = RangeKey::from_double(*low)?;
+            let hi = RangeKey::from_double(*high)?;
+            index.rows_in_range(*col, Some(lo), Some(hi))
+        }
+        // Open `>`.
+        CompiledPredicate::GtLong { col, value } if index.has_range(*col) => {
+            index.rows_greater_than(*col, RangeKey::Long(*value))
+        }
+        CompiledPredicate::GtDouble { col, value } if index.has_range(*col) => {
+            let v = RangeKey::from_double(*value)?;
+            index.rows_greater_than(*col, v)
+        }
+        // Half-open `>=` — `rows_in_range(Some(v), None)`.
+        CompiledPredicate::GeLong { col, value } if index.has_range(*col) => {
+            index.rows_in_range(*col, Some(RangeKey::Long(*value)), None)
+        }
+        CompiledPredicate::GeDouble { col, value } if index.has_range(*col) => {
+            let v = RangeKey::from_double(*value)?;
+            index.rows_in_range(*col, Some(v), None)
+        }
+        // Open `<`.
+        CompiledPredicate::LtLong { col, value } if index.has_range(*col) => {
+            index.rows_less_than(*col, RangeKey::Long(*value))
+        }
+        CompiledPredicate::LtDouble { col, value } if index.has_range(*col) => {
+            let v = RangeKey::from_double(*value)?;
+            index.rows_less_than(*col, v)
+        }
+        // Half-open `<=` — `rows_in_range(None, Some(v))`.
+        CompiledPredicate::LeLong { col, value } if index.has_range(*col) => {
+            index.rows_in_range(*col, None, Some(RangeKey::Long(*value)))
+        }
+        CompiledPredicate::LeDouble { col, value } if index.has_range(*col) => {
+            let v = RangeKey::from_double(*value)?;
+            index.rows_in_range(*col, None, Some(v))
+        }
+        // Recurse into AND branches — either side can be the range
+        // hint. Skip OR / NOT (need full eval); skip non-range leaves.
+        CompiledPredicate::And(a, b) => {
+            find_range_hint(a, index).or_else(|| find_range_hint(b, index))
+        }
+        _ => None,
+    }
+}
+
 /// Convenience alias to keep query callers from needing to import
 /// `compact_str` for the rare case they hand-build literals.
 #[allow(dead_code)]
@@ -508,10 +962,32 @@ pub fn execute_query_with_index(
     store: &ColumnStore,
     index: Option<&SecondaryIndex>,
 ) -> QueryResult {
+    execute_query_with_index_filtered(query, store, index, None)
+}
+
+/// Like `execute_query_with_index` but pre-filters the candidate row
+/// set by a caller-supplied "live rows" bitmap. Used by S20 view
+/// runners so the aggregate executor doesn't bucket tombstoned source
+/// rows into a phantom null-key group. The bitmap is intersected with
+/// the planner's chosen candidates before predicate evaluation; pass
+/// `None` for the historical "all rows the planner returns" behaviour.
+pub fn execute_query_with_index_filtered(
+    query: &ParsedQuery,
+    store: &ColumnStore,
+    index: Option<&SecondaryIndex>,
+    live_rows: Option<&roaring::RoaringBitmap>,
+) -> QueryResult {
+    // PIVOT / UNPIVOT take dedicated paths — see pivot.rs.
+    if query.pivot.is_some() {
+        return crate::pivot::execute_pivot_query(query, store);
+    }
+    if query.unpivot.is_some() {
+        return crate::pivot::execute_unpivot_query(query, store);
+    }
     // Aggregate queries take a separate execution path: per-row work
     // updates aggregator state instead of building per-row output.
     if query.is_aggregate() || !query.group_by.is_empty() {
-        return execute_aggregate_query(query, store, index);
+        return execute_aggregate_query(query, store, index, live_rows);
     }
 
     let candidates = plan_candidates(query, store, index);
@@ -558,6 +1034,11 @@ pub fn execute_query_with_index(
     QueryResult {
         rows,
         total_matches,
+        // `matching_rows` is the post-sort, post-limit list of row
+        // indices the projection just walked — in lockstep with
+        // `rows`. Callers (Topic::query + streaming + subscribe)
+        // use this to apply the tombstone filter by row index.
+        source_rows: matching_rows,
     }
 }
 
@@ -605,7 +1086,7 @@ impl GroupKeyPart {
 /// `MIN`/`MAX`/`AVG` return null on an empty group rather than `0` or
 /// the default bounds.
 #[derive(Debug)]
-enum AggState {
+pub enum AggState {
     Count(u64),
     SumI(i128, bool),       // (running, seen_any)
     SumF(f64, bool),
@@ -621,7 +1102,7 @@ enum AggState {
 impl AggState {
     /// Build the initial state for an aggregate, given the column
     /// type (or `None` for COUNT(*)).
-    fn init(func: AggFn, col_type: Option<crate::schema::ColumnType>) -> AggState {
+    pub fn init(func: AggFn, col_type: Option<crate::schema::ColumnType>) -> AggState {
         use crate::schema::ColumnType;
         match (func, col_type) {
             (AggFn::Count, _) => AggState::Count(0),
@@ -655,7 +1136,7 @@ impl AggState {
 
     /// Update with one row's value for the aggregate's input column.
     /// `None` represents `COUNT(*)` (no column read).
-    fn update(&mut self, v: Option<&Value>) {
+    pub fn update(&mut self, v: Option<&Value>) {
         match self {
             AggState::Count(n) => {
                 match v {
@@ -751,7 +1232,7 @@ impl AggState {
         }
     }
 
-    fn finalize(&self) -> serde_json::Value {
+    pub fn finalize(&self) -> serde_json::Value {
         match self {
             AggState::Count(n) => serde_json::Value::from(*n),
             AggState::SumI(acc, seen) => {
@@ -815,6 +1296,7 @@ fn execute_aggregate_query(
     query: &ParsedQuery,
     store: &ColumnStore,
     index: Option<&SecondaryIndex>,
+    live_rows: Option<&roaring::RoaringBitmap>,
 ) -> QueryResult {
     let candidates = plan_candidates(query, store, index);
     let schema = store.schema();
@@ -838,6 +1320,11 @@ fn execute_aggregate_query(
     let mut group_order: Vec<Vec<GroupKeyPart>> = Vec::new();
 
     candidates.for_each(|row| {
+        if let Some(live) = live_rows {
+            if !live.contains(row) {
+                return;
+            }
+        }
         if !query.predicate.matches(store, row) {
             return;
         }
@@ -871,8 +1358,25 @@ fn execute_aggregate_query(
     // is deterministic across runs of identical input — distinct from
     // sorted, which the user can request via ORDER BY (we materialize
     // the result and post-sort below).
+    //
+    // ANSI SQL special case (closes the Known Issue
+    // `count_star_empty_table`): when there is NO `GROUP BY` and at
+    // least one aggregate, an empty input MUST still produce exactly
+    // one output row — every aggregate's "no observations" value.
+    // `COUNT(*) FROM <empty>` is 1 row with `c = 0`. `SUM` returns
+    // NULL on empty (handled by `AggState::finalize`).
     let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
         Vec::with_capacity(group_order.len());
+    let empty_implicit_group =
+        group_order.is_empty() && group_cols.is_empty() && !query.aggregates.is_empty();
+    if empty_implicit_group {
+        let mut row_map = serde_json::Map::new();
+        for (i, spec) in query.aggregates.iter().enumerate() {
+            let state = AggState::init(spec.func, agg_col_types[i]);
+            row_map.insert(spec.alias.clone(), state.finalize());
+        }
+        rows.push(row_map);
+    }
     for key in &group_order {
         let states = groups.get(key).expect("group must exist");
         let mut row_map = serde_json::Map::new();
@@ -916,6 +1420,12 @@ fn execute_aggregate_query(
     QueryResult {
         rows,
         total_matches,
+        // Aggregate output rows synthesize per-group state — they
+        // don't correspond to specific source rows. Leave empty;
+        // the tombstone filter at the Topic layer skips this path
+        // (aggregate output isn't subject to per-row tombstone
+        // semantics anyway).
+        source_rows: Vec::new(),
     }
 }
 
@@ -993,6 +1503,14 @@ pub enum QueryError {
     UnknownColumn(String),
     #[error("Predicate error: {0}")]
     PredicateError(#[from] PredicateError),
+    /// Parser recognized a feature that the executor doesn't yet
+    /// support. Distinct from `ParseError` so callers can surface a
+    /// "coming soon" message instead of a "your SQL is malformed"
+    /// message. Used today by the S43 PIVOT/UNPIVOT parser
+    /// scaffold; remove the variant (or specialize the message) once
+    /// the executor lands.
+    #[error("Not yet implemented: {0}")]
+    NotYetImplemented(String),
 }
 
 #[cfg(test)]

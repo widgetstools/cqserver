@@ -29,3 +29,4 @@ axum.workspace = true
 [dev-dependencies]
 tower = "0.5"
 http-body-util = "0.1"
+tempfile.workspace = true

@@ -15,6 +15,14 @@ pub struct ServerConfig {
     pub heartbeat_idle_timeout_s: u64,
     #[serde(default)]
     pub topics: Vec<TopicEntry>,
+    /// S20 materialized views. Each `ViewEntry` declares a derived
+    /// topic populated by a continuous SELECT-GROUP-BY against an
+    /// underlying source topic. View topics are themselves
+    /// subscribable; the server spawns one per-view runner thread that
+    /// re-aggregates on every source mutation and applies the diff to
+    /// the view's SOW.
+    #[serde(default)]
+    pub views: Vec<ViewEntry>,
     #[serde(default)]
     pub queues: Vec<QueueEntry>,
     #[serde(default)]
@@ -25,6 +33,12 @@ pub struct ServerConfig {
     pub replication: ReplicationConfig,
     #[serde(default)]
     pub transport: TransportConfig,
+    /// S25 — per-target tracing sinks. When empty (or absent), the
+    /// server installs the historical single-stderr layer driven by
+    /// `RUST_LOG`. When populated, each entry becomes a layer in the
+    /// tracing-subscriber Registry; events are routed by `target`.
+    #[serde(default)]
+    pub logging: crate::logging::LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +66,33 @@ pub struct TransportConfig {
     /// handing it to the framing handler. Clients connect with rustls.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// S21 slow-consumer disk spillover. When set, every subscription
+    /// gets a per-route overflow file under `directory`; queue-full
+    /// events spill to disk instead of dropping, and a background
+    /// drain task replays the backlog as the consumer catches up.
+    /// `None` keeps the legacy "drop on full" behaviour.
+    #[serde(default)]
+    pub spillover: Option<SpilloverConfig>,
+}
+
+/// S21 spillover configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpilloverConfig {
+    /// Directory under which per-subscription overflow files live.
+    /// The server creates it on startup if missing.
+    pub directory: String,
+    /// Maximum bytes per subscription's overflow file. Writes past
+    /// this are dropped (and counted via `cq_deltas_dropped_total{reason="spillover_over_cap"}`).
+    #[serde(default = "default_spillover_max_bytes")]
+    pub max_bytes_per_sub: u64,
+}
+
+fn default_spillover_max_bytes() -> u64 {
+    // 64 MiB per subscription by default. Generous enough to absorb
+    // multi-minute hiccups on a typical wire rate; tunable per
+    // deployment.
+    64 * 1024 * 1024
 }
 
 /// TLS settings for the TCP transport.
@@ -132,6 +173,7 @@ impl Default for TransportConfig {
             sow_batch_size: default_sow_batch_size(),
             slow_consumer: SlowConsumerConfig::default(),
             tls: None,
+            spillover: None,
         }
     }
 }
@@ -155,6 +197,15 @@ pub struct ReplicationConfig {
     /// `role = standby`.
     #[serde(default)]
     pub listen: Option<String>,
+    /// S12 — optional per-destination filter. Only applies when
+    /// `role = primary`. Drops entries whose JSON payload doesn't
+    /// match `column = value`. Tombstones always ship.
+    #[serde(default)]
+    pub filter: Option<cq_replication::filter::FilterSpec>,
+    /// S12 — optional per-destination transform. Strips the listed
+    /// JSON fields from outbound entries.
+    #[serde(default)]
+    pub transform: Option<cq_replication::filter::TransformSpec>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -190,6 +241,48 @@ pub struct AuthConfig {
     pub required: bool,
     #[serde(default)]
     pub users: Vec<UserConfig>,
+    /// S16 JWT validator. When `Some`, the server treats the
+    /// `Logon` frame's `data.token` field as a JWT and authenticates
+    /// based on its claims. Static `[[auth.users]]` are also
+    /// honoured; this is purely additive — a JWT logon path is
+    /// available in addition to the password path. Per-deployment
+    /// operators typically pick one mode and don't populate both.
+    #[serde(default)]
+    pub jwt: Option<JwtConfig>,
+}
+
+/// S16 JWT validator config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JwtConfig {
+    /// Shared secret used to validate HS256 tokens. Future revisions
+    /// may add asymmetric-key support (RS256 etc.); for now we only
+    /// support HS256 because it keeps the deployment story to a
+    /// single secret value.
+    pub secret: String,
+    /// Optional issuer claim ("iss") the token must carry. When set,
+    /// tokens with a missing or non-matching `iss` are rejected.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Optional audience claim ("aud") the token must carry.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Claim name to read the user's entitlements from. Defaults to
+    /// `"entitlements"` (a JSON string array). Same shape as the
+    /// static `entitlements = [...]` field in `[[auth.users]]`.
+    #[serde(default = "default_jwt_entitlements_claim")]
+    pub entitlements_claim: String,
+    /// Claim name to read the username from. Defaults to `"sub"`
+    /// (the standard JWT subject claim).
+    #[serde(default = "default_jwt_username_claim")]
+    pub username_claim: String,
+}
+
+fn default_jwt_entitlements_claim() -> String {
+    "entitlements".into()
+}
+
+fn default_jwt_username_claim() -> String {
+    "sub".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -329,6 +422,42 @@ fn default_capacity() -> usize {
     100_000
 }
 
+/// S20 materialized-view declaration. A view's `source` must reference
+/// another topic in the same config. The `sql` is parsed against the
+/// source topic's schema and MUST be an aggregate query
+/// (`SELECT ... GROUP BY ...`). The view's schema is derived from the
+/// SELECT clause; its key fields default to the `GROUP BY` columns.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewEntry {
+    /// Name of the view topic (must not collide with any `topics` entry).
+    pub name: String,
+    /// Name of the source topic the view aggregates over.
+    pub source: String,
+    /// SELECT-GROUP-BY query (the `FROM` clause is interpreted as the
+    /// source topic; the parser tolerates an arbitrary identifier).
+    pub sql: String,
+    /// Initial capacity hint for the view topic's SOW. Defaults to a
+    /// modest 10K — views usually have far fewer rows than their
+    /// underlying source.
+    #[serde(default = "default_view_capacity")]
+    pub initial_capacity: usize,
+    /// Bounded depth of the view's tap channel on the source topic.
+    /// A backlogged view runner can't apply backpressure to publishers;
+    /// instead old events are dropped (with a metric) and the next
+    /// refresh catches up by reading current source state. Defaults
+    /// to a comfortable 1024.
+    #[serde(default = "default_view_tap_capacity")]
+    pub tap_capacity: usize,
+}
+
+fn default_view_capacity() -> usize {
+    10_000
+}
+
+fn default_view_tap_capacity() -> usize {
+    1024
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
@@ -362,11 +491,13 @@ impl Default for ServerConfig {
                     expire_seconds: None,
                 },
             ],
+            views: Vec::new(),
             queues: Vec::new(),
             txlog: TxLogConfig::default(),
             auth: AuthConfig::default(),
             replication: ReplicationConfig::default(),
             transport: TransportConfig::default(),
+            logging: crate::logging::LoggingConfig::default(),
         }
     }
 }

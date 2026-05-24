@@ -27,6 +27,9 @@ async fn pause_then_resume_resumes_replay_from_same_point() {
             queues: Vec::new(),
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

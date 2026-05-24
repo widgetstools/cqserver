@@ -20,7 +20,9 @@ use crate::session::{
 };
 use bytes::BytesMut;
 use cq_core::topic::SharedTopic;
-use cq_protocol::codec::{decode_frame, encode_frame};
+use cq_protocol::codec::decode_frame;
+#[cfg(test)]
+use cq_protocol::codec::encode_frame;
 use cq_protocol::message::CqMessage;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -49,6 +51,11 @@ pub struct TcpConfig {
     /// listeners (e.g. TCP + WebSocket on the same server) can set
     /// it explicitly.
     pub bookmark_store: Option<crate::router::BookmarkStore>,
+    /// S21 spillover configuration. When `Some(_)`, every subscription
+    /// the router creates is backed by a per-route disk overflow log
+    /// + drain task; queue-full events spill to disk instead of
+    /// dropping. `None` keeps the legacy "drop on full" behaviour.
+    pub spillover: Option<crate::router::SpilloverContext>,
 }
 
 impl Default for TcpConfig {
@@ -59,6 +66,7 @@ impl Default for TcpConfig {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             tls_acceptor: None,
             bookmark_store: None,
+            spillover: None,
         }
     }
 }
@@ -92,6 +100,7 @@ pub async fn start_tcp_server(
             auth: auth.clone(),
             sow_batch_size: config.sow_batch_size,
             bookmark_store: bookmark_store.clone(),
+            spillover: config.spillover.clone(),
         };
         let queue_capacity = config.outbound_queue_capacity;
         let tls_acceptor = config.tls_acceptor.clone();
@@ -140,11 +149,22 @@ async fn handle_tcp_connection<S>(
     let (tx, mut rx) = mpsc::channel::<OutboundFrame>(queue_capacity);
     let mut session = Session::new(remote, tx);
 
+    // S27: clone the session's compression handle so the write task
+    // can read the currently-negotiated compression on every frame
+    // without holding the Session lock. Atomic load is cheap.
+    let compression_slot = session.compression.clone();
     let write_handle = tokio::spawn(async move {
         let mut out = BytesMut::new();
         while let Some(frame) = rx.recv().await {
             out.clear();
-            encode_frame(frame.as_bytes(), &mut out);
+            let compression = crate::session::compression_from_u8(
+                compression_slot.load(std::sync::atomic::Ordering::Acquire),
+            );
+            cq_protocol::codec::encode_frame_with(
+                frame.as_bytes(),
+                &mut out,
+                compression,
+            );
             if let Err(e) = write_half.write_all(&out).await {
                 warn!(error = %e, "TCP write error");
                 break;
@@ -263,6 +283,7 @@ mod tests {
             auth: std::sync::Arc::new(crate::auth::AuthStore::disabled()),
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -383,6 +404,7 @@ mod tests {
             auth: std::sync::Arc::new(crate::auth::AuthStore::disabled()),
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -489,6 +511,7 @@ mod tests {
             auth: std::sync::Arc::new(crate::auth::AuthStore::disabled()),
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
         };
         let server = tokio::spawn(async move {
             loop {
@@ -681,6 +704,7 @@ mod tests {
             auth: auth.clone(),
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -826,6 +850,7 @@ mod tests {
             auth: std::sync::Arc::new(crate::auth::AuthStore::disabled()),
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
         };
         let server = tokio::spawn(async move {
             loop {

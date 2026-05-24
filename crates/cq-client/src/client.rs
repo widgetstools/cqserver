@@ -40,6 +40,27 @@ struct ClientInner {
     out_tx: mpsc::UnboundedSender<CqMessage>,
     pending: Arc<DashMap<String, oneshot::Sender<CqMessage>>>,
     subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>>,
+    /// S28 — wire-protocol version this connection negotiated on its
+    /// last successful `Logon`. Defaults to
+    /// [`cq_protocol::version::DEFAULT_LEGACY_VERSION`] until
+    /// negotiation completes (so unauthenticated tests that never
+    /// call `logon` still get a sensible value). Exposed via
+    /// [`Client::protocol_version`].
+    protocol_version: Arc<std::sync::atomic::AtomicU32>,
+    /// S27 — wire-compression algorithm this connection negotiated.
+    /// Shared with the driver loop so frames are encoded with the
+    /// current setting. Encoded as a `u8` for cheap atomic
+    /// load/store (see helpers in `transport::compression_*`).
+    compression: Arc<std::sync::atomic::AtomicU8>,
+    /// S18 — optional persistent bookmark store. When set, every
+    /// `Subscription` this client creates carries a handle so its
+    /// `next_delta` records the high-water sequence per topic.
+    bookmark_store: parking_lot::RwLock<Option<crate::bookmark::LocalBookmarkStore>>,
+    /// S17 — optional persistent publish buffer. When set, every
+    /// `publish` records into the store before sending, then drops
+    /// the entry on a successful ack. A reconnect-after-crash can
+    /// replay surviving entries via `replay_publish_store`.
+    publish_store: parking_lot::RwLock<Option<crate::publish_store::LocalPublishStore>>,
     /// `cid → completion signal` for one-shot SOW (snapshot) responses.
     /// The driver fires this when it sees the matching `GroupEnd`.
     snapshot_completions: Arc<DashMap<String, oneshot::Sender<()>>>,
@@ -108,6 +129,7 @@ impl Client {
         let pending_subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>> =
             Arc::new(DashMap::new());
 
+        let compression = Arc::new(std::sync::atomic::AtomicU8::new(0)); // None
         let inner = Arc::new(ClientInner {
             out_tx,
             pending: pending.clone(),
@@ -115,6 +137,12 @@ impl Client {
             snapshot_completions: snapshot_completions.clone(),
             snapshot_buffers: snapshot_buffers.clone(),
             pending_subs: pending_subs.clone(),
+            protocol_version: Arc::new(std::sync::atomic::AtomicU32::new(
+                cq_protocol::version::DEFAULT_LEGACY_VERSION,
+            )),
+            compression: compression.clone(),
+            bookmark_store: parking_lot::RwLock::new(None),
+            publish_store: parking_lot::RwLock::new(None),
             next_cid: AtomicU64::new(1),
             codec: cfg.codec,
             ack_timeout: cfg.ack_timeout,
@@ -129,6 +157,7 @@ impl Client {
             snapshot_buffers,
             pending_subs,
             cfg.codec,
+            compression,
         ));
         Client { inner }
     }
@@ -184,16 +213,146 @@ impl Client {
         creds.insert("user".into(), Value::String(user.into()));
         creds.insert("password".into(), Value::String(password.into()));
         m.data = Some(Value::Object(creds));
-        self.rpc(m).await?;
+        m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
+        m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        let resp = self.rpc(m).await?;
+        self.capture_negotiated(&resp);
         Ok(())
+    }
+
+    /// S16 — authenticate using a JWT bearer token instead of
+    /// username + password. The server must have a JWT validator
+    /// configured (`[auth.jwt]`); on success the user identity and
+    /// entitlements come from the token's claims.
+    pub async fn logon_jwt(&self, token: &str) -> ClientResult<()> {
+        let mut m = CqMessage::new(Command::Logon);
+        let mut creds = Map::new();
+        creds.insert("token".into(), Value::String(token.into()));
+        m.data = Some(Value::Object(creds));
+        m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
+        m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        let resp = self.rpc(m).await?;
+        self.capture_negotiated(&resp);
+        Ok(())
+    }
+
+    /// Send an anonymous version-negotiation handshake. Useful when
+    /// `auth.required = false` on the server — the client still wants
+    /// to know which protocol version is active. Returns the
+    /// negotiated version.
+    pub async fn handshake_protocol(&self) -> ClientResult<u32> {
+        let mut m = CqMessage::new(Command::Logon);
+        m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
+        m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        let resp = self.rpc(m).await?;
+        self.capture_negotiated(&resp);
+        Ok(self.protocol_version())
+    }
+
+    /// Wire-protocol version this connection negotiated on its last
+    /// successful Logon. Defaults to
+    /// [`cq_protocol::version::DEFAULT_LEGACY_VERSION`] until a
+    /// Logon (or `handshake_protocol`) completes.
+    pub fn protocol_version(&self) -> u32 {
+        self.inner
+            .protocol_version
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Active wire compression algorithm for this connection.
+    pub fn compression(&self) -> cq_protocol::compression::Compression {
+        compression_from_u8(self.inner.compression.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// S18 — attach a persistent bookmark store to this Client.
+    /// Subsequent `sow_and_subscribe` / `subscribe` calls that omit
+    /// an explicit `bookmark` consult the store; deltas with a
+    /// sequence are recorded back to the store as they arrive. Call
+    /// [`crate::Subscription::persist_bookmark`] before disconnect
+    /// (or shutdown) to flush the in-memory map to disk.
+    pub fn set_bookmark_store(&self, store: crate::bookmark::LocalBookmarkStore) {
+        *self.inner.bookmark_store.write() = Some(store);
+    }
+
+    /// Clone of the attached bookmark store, if any. Useful for tests
+    /// that need to assert the recorded high-water from the outside.
+    pub fn bookmark_store(&self) -> Option<crate::bookmark::LocalBookmarkStore> {
+        self.inner.bookmark_store.read().clone()
+    }
+
+    /// S17 — attach a persistent publish buffer. Every subsequent
+    /// `publish` records into the store before sending; the entry is
+    /// dropped on a successful ack. After a reconnect, call
+    /// [`Client::replay_publish_store`] to flush surviving entries
+    /// to the server.
+    pub fn set_publish_store(&self, store: crate::publish_store::LocalPublishStore) {
+        *self.inner.publish_store.write() = Some(store);
+    }
+
+    /// Clone of the attached publish store, if any.
+    pub fn publish_store(&self) -> Option<crate::publish_store::LocalPublishStore> {
+        self.inner.publish_store.read().clone()
+    }
+
+    /// S17 — replay every pending entry in the publish store back
+    /// through the wire. Used by callers that reconnect after a
+    /// crash: each surviving entry is `publish`-ed again (which
+    /// records + acks + completes through the normal path). Returns
+    /// the number of entries replayed.
+    pub async fn replay_publish_store(&self) -> ClientResult<usize> {
+        let store = match self.inner.publish_store.read().clone() {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        let pending = store.pending();
+        let n = pending.len();
+        for entry in pending {
+            // Each call goes through the normal `publish` which
+            // records + completes via the store. To avoid duplicating
+            // the entry under a new id, drop the original entry
+            // first; if the publish fails the caller can persist +
+            // retry — at-least-once.
+            store.complete(entry.id);
+            self.publish(&entry.topic, entry.data).await?;
+        }
+        Ok(n)
+    }
+
+    fn capture_negotiated(&self, resp: &CqMessage) {
+        if let Some(versions) = resp.protocol_versions.as_ref() {
+            if let Some(&v) = versions.first() {
+                self.inner
+                    .protocol_version
+                    .store(v, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if let Some(comps) = resp.compressions.as_ref() {
+            if let Some(&c) = comps.first() {
+                self.inner
+                    .compression
+                    .store(compression_to_u8(c), std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     /// Publish a JSON record. Returns the assigned monotonic sequence.
     pub async fn publish(&self, topic: &str, data: Value) -> ClientResult<u64> {
+        // S17: when a publish store is attached, record the publish
+        // before sending it. The id is purely client-local — used to
+        // drop the entry from the store on a successful ack.
+        let store_id = {
+            let store = self.inner.publish_store.read();
+            store.as_ref().map(|s| s.record(topic, data.clone()))
+        };
         let mut m = CqMessage::new(Command::Publish);
         m.topic = Some(topic.into());
         m.data = Some(data);
         let resp = self.rpc(m).await?;
+        if let Some(id) = store_id {
+            if let Some(store) = self.inner.publish_store.read().as_ref() {
+                store.complete(id);
+            }
+        }
         Ok(resp.sequence.unwrap_or(0))
     }
 
@@ -312,6 +471,29 @@ impl Client {
         self.subscribe_inner(Command::SowAndSubscribe, topic, filter, bookmark).await
     }
 
+    /// Subscribe with a full SQL query (S19 / continuous aggregates).
+    /// Required for `SELECT ... GROUP BY ...` subscriptions since
+    /// the filter+options form can't express GROUP BY. The initial
+    /// snapshot is the aggregate output; subsequent deltas carry
+    /// per-group Add / Update / Remove as the underlying SOW state
+    /// shifts.
+    pub async fn sow_and_subscribe_sql(
+        &self,
+        topic: &str,
+        sql: &str,
+    ) -> ClientResult<Subscription> {
+        self.subscribe_extended(
+            Command::SowAndSubscribe,
+            topic,
+            None,
+            SubscribeExtras {
+                sql: Some(sql.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// Subscribe with timestamp-based replay: every txlog entry with
     /// wall-clock timestamp >= `since_epoch_ms` is replayed, then the
     /// stream transitions to live. Requires the topic to be
@@ -364,11 +546,24 @@ impl Client {
         command: Command,
         topic: &str,
         filter: Option<&str>,
-        extras: SubscribeExtras,
+        mut extras: SubscribeExtras,
     ) -> ClientResult<Subscription> {
         let (tx, rx) = mpsc::unbounded_channel();
         let cid = self.next_cid();
         self.inner.pending_subs.insert(cid.clone(), tx);
+
+        // S18: if the SDK has a bookmark store AND the caller didn't
+        // explicitly pass a bookmark, populate it from the persistent
+        // store. The server replays everything strictly newer than
+        // the stored sequence.
+        let bm_store = self.inner.bookmark_store.read().clone();
+        if extras.bookmark.is_none() {
+            if let Some(store) = &bm_store {
+                if let Some(stored) = store.get(topic) {
+                    extras.bookmark = Some(stored);
+                }
+            }
+        }
 
         let mut m = CqMessage::new(command);
         m.command_id = Some(cid.clone());
@@ -391,6 +586,9 @@ impl Client {
         if extras.send_keys {
             m.send_keys = true;
         }
+        if let Some(sql) = &extras.sql {
+            m.sql = Some(sql.clone());
+        }
         let ack = match self.rpc_with_cid(m, cid.clone()).await {
             Ok(a) => a,
             Err(e) => {
@@ -402,7 +600,13 @@ impl Client {
             .sub_id
             .ok_or_else(|| ClientError::UnexpectedResponse("missing sub_id in ack".into()))?;
         let last_seq = Arc::new(AtomicU64::new(extras.bookmark.unwrap_or(0)));
-        Ok(Subscription { sub_id, rx, last_seq })
+        Ok(Subscription {
+            sub_id,
+            rx,
+            last_seq,
+            topic: topic.to_string(),
+            bookmark_store: bm_store,
+        })
     }
 
     pub async fn delta_subscribe(
@@ -482,6 +686,10 @@ struct SubscribeExtras {
     most_recent: bool,
     client_name: Option<String>,
     send_keys: bool,
+    /// Full SQL passed verbatim to the server. Required for
+    /// continuous-aggregate subscriptions (`SELECT ... GROUP BY ...`)
+    /// since the options/filter shape can't express GROUP BY.
+    sql: Option<String>,
 }
 
 impl Client {
@@ -500,6 +708,14 @@ impl Client {
         let (tx, rx) = mpsc::unbounded_channel();
         let cid = self.next_cid();
         self.inner.pending_subs.insert(cid.clone(), tx);
+
+        // S18: if the SDK has a bookmark store AND the caller didn't
+        // explicitly pass a bookmark, populate it from the persistent
+        // store.
+        let bm_store = self.inner.bookmark_store.read().clone();
+        let bookmark = bookmark.or_else(|| {
+            bm_store.as_ref().and_then(|s| s.get(topic))
+        });
 
         let mut m = CqMessage::new(command);
         m.command_id = Some(cid.clone());
@@ -523,7 +739,13 @@ impl Client {
             .sub_id
             .ok_or_else(|| ClientError::UnexpectedResponse("missing sub_id in ack".into()))?;
         let last_seq = Arc::new(AtomicU64::new(bookmark.unwrap_or(0)));
-        Ok(Subscription { sub_id, rx, last_seq })
+        Ok(Subscription {
+            sub_id,
+            rx,
+            last_seq,
+            topic: topic.to_string(),
+            bookmark_store: bm_store,
+        })
     }
 
     pub async fn unsubscribe(&self, sub_id: &str) -> ClientResult<()> {
@@ -555,6 +777,22 @@ impl Client {
     }
 }
 
+/// Convert the in-memory `Compression` to the atomic-byte
+/// representation used by the driver loop.
+fn compression_to_u8(c: cq_protocol::compression::Compression) -> u8 {
+    match c {
+        cq_protocol::compression::Compression::None => 0,
+        cq_protocol::compression::Compression::Zstd => 1,
+    }
+}
+
+fn compression_from_u8(b: u8) -> cq_protocol::compression::Compression {
+    match b {
+        1 => cq_protocol::compression::Compression::Zstd,
+        _ => cq_protocol::compression::Compression::None,
+    }
+}
+
 async fn driver_loop(
     mut transport: Transport,
     mut out_rx: mpsc::UnboundedReceiver<CqMessage>,
@@ -564,6 +802,7 @@ async fn driver_loop(
     snapshot_buffers: Arc<DashMap<String, Mutex<Vec<Map<String, Value>>>>>,
     pending_subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>>,
     codec: Codec,
+    compression_slot: Arc<std::sync::atomic::AtomicU8>,
 ) {
     loop {
         tokio::select! {
@@ -577,7 +816,10 @@ async fn driver_loop(
                         continue;
                     }
                 };
-                if let Err(e) = transport.send(codec, &bytes).await {
+                let compression = compression_from_u8(
+                    compression_slot.load(std::sync::atomic::Ordering::Acquire),
+                );
+                if let Err(e) = transport.send(codec, &bytes, compression).await {
                     tracing::warn!(error = %e, "send failed; closing");
                     return;
                 }
@@ -654,6 +896,7 @@ fn handle_inbound(
                             sequence: msg.sequence,
                             data: m.clone(),
                             delivery_id: None,
+                            schema_change: None,
                         });
                     }
                 }
@@ -679,6 +922,7 @@ fn handle_inbound(
                             sequence: None,
                             data: m.clone(),
                             delivery_id: None,
+                            schema_change: None,
                         });
                     }
                 }
@@ -713,6 +957,28 @@ fn handle_inbound(
                         sequence: msg.sequence,
                         data,
                         delivery_id: msg.delivery_id,
+                        schema_change: None,
+                    });
+                }
+            }
+        }
+        Command::SchemaChange => {
+            // Server announces a schema change for this subscription.
+            // Surface via the same delta stream — callers
+            // pattern-match `delta_type == DeltaKind::SchemaChange`
+            // and read the `schema_change` field. Frame ordering
+            // guarantee (server emits SchemaChange BEFORE any delta
+            // that references the new columns) is preserved by the
+            // sub channel's FIFO semantics.
+            if let Some(sid) = msg.sub_id.as_ref() {
+                if let Some(tx) = subs.get(sid) {
+                    let _ = tx.send(Delta {
+                        delta_type: DeltaKind::SchemaChange,
+                        sub_id: sid.clone(),
+                        sequence: msg.sequence,
+                        data: Map::new(),
+                        delivery_id: None,
+                        schema_change: msg.schema_change.clone(),
                     });
                 }
             }

@@ -1,0 +1,83 @@
+# Simple SELECT + WHERE on a single table. Catches basic comparison
+# operator semantics, projection mechanics, and integer/string literal
+# parsing.
+- name: select_all_from_empty_table
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes: []
+  query: "SELECT * FROM t"
+  expected_rows: []
+
+- name: select_all_after_three_publishes
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+    - { id: 3, name: "Carol" }
+  query: "SELECT * FROM t"
+  expected_rows:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+    - { id: 3, name: "Carol" }
+
+- name: where_equality_on_long_projection_excludes_key
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+    - { id: 3, name: "Carol" }
+  query: "SELECT name FROM t WHERE id = 2"
+  expected_rows:
+    - { name: "Bob" }
+  notes: |
+    Regression guard: pre-fix, projecting a column that excluded
+    the key (here: `SELECT name` while `id` is the key) tripped
+    the tombstone filter — `compute_key_from_map` returned None
+    on the result row and every row was dropped. The post-fix
+    tombstone filter uses source-row indices instead of
+    re-deriving the key.
+
+- name: where_equality_on_string_projection_excludes_key
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+  query: "SELECT name FROM t WHERE name = 'Alice'"
+  expected_rows:
+    - { name: "Alice" }
+
+- name: where_greater_than
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30 }
+  query: "SELECT v FROM t WHERE v > 15"
+  expected_rows:
+    - { v: 20 }
+    - { v: 30 }
+
+- name: where_no_matches
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+  query: "SELECT v FROM t WHERE v > 999"
+  expected_rows: []

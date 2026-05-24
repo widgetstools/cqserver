@@ -186,6 +186,63 @@ pub struct ServerOpts {
     /// per-topic subdirectories. The harness creates the root
     /// directory inside the test's tempdir.
     pub txlog_archive: Option<TxLogArchiveOpts>,
+    /// S20 materialized views. Each is rendered as a `[[views]]`
+    /// table in the generated TOML. The server applies them after
+    /// all `topics` have been initialised, so views may reference
+    /// any topic in the same config.
+    pub views: Vec<ViewSpec>,
+    /// S21 spillover. When `Some(_)`, the harness writes a
+    /// `[transport.spillover]` section with a directory under the
+    /// test's tempdir; every subscription on this server gets a
+    /// per-route overflow file.
+    pub spillover: Option<SpilloverOpts>,
+    /// S25 per-target tracing sinks. Each `LogSinkSpec` becomes a
+    /// `[[logging.sinks]]` table in the rendered TOML. Empty means
+    /// the historical single-stderr layer is installed (default
+    /// behaviour for tests that don't care about sink routing).
+    pub logging_sinks: Vec<LogSinkSpec>,
+}
+
+/// S25 sink spec used by the e2e harness.
+#[derive(Clone, Debug)]
+pub struct LogSinkSpec {
+    pub file: Option<String>,
+    pub filter: String,
+    pub format: String,
+}
+
+impl LogSinkSpec {
+    pub fn stderr(filter: impl Into<String>) -> Self {
+        Self {
+            file: None,
+            filter: filter.into(),
+            format: "text".into(),
+        }
+    }
+    pub fn to_file(path: impl Into<String>, filter: impl Into<String>) -> Self {
+        Self {
+            file: Some(path.into()),
+            filter: filter.into(),
+            format: "text".into(),
+        }
+    }
+}
+
+/// Spillover knobs for the e2e harness. Mirrors the server's
+/// `[transport.spillover]` config.
+#[derive(Clone)]
+pub struct SpilloverOpts {
+    /// Maximum on-disk bytes per subscription. Defaults to 16 MiB,
+    /// generous enough for any e2e scenario.
+    pub max_bytes_per_sub: u64,
+}
+
+impl Default for SpilloverOpts {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_sub: 16 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -214,6 +271,38 @@ impl TxLogArchiveOpts {
 #[derive(Clone)]
 pub struct AuthOpts {
     pub users: Vec<UserSpec>,
+    /// S16 — optional JWT validator. When set, the server's
+    /// `[auth.jwt]` section is rendered with these knobs and Logon
+    /// frames may carry `data.token` to authenticate.
+    pub jwt: Option<JwtAuthOpts>,
+}
+
+impl AuthOpts {
+    pub fn users(users: Vec<UserSpec>) -> Self {
+        Self { users, jwt: None }
+    }
+}
+
+/// S16 JWT validator config for the e2e harness.
+#[derive(Clone, Debug)]
+pub struct JwtAuthOpts {
+    pub secret: String,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub username_claim: String,
+    pub entitlements_claim: String,
+}
+
+impl Default for JwtAuthOpts {
+    fn default() -> Self {
+        Self {
+            secret: "e2e-test-secret".into(),
+            issuer: None,
+            audience: None,
+            username_claim: "sub".into(),
+            entitlements_claim: "entitlements".into(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -222,6 +311,33 @@ pub struct UserSpec {
     pub password_hash: String,
     pub entitlements: Vec<String>,
     pub row_filter: Option<String>,
+}
+
+/// S20 materialized-view spec used by the e2e harness. Mirrors the
+/// `[[views]]` TOML entry the server accepts.
+#[derive(Clone)]
+pub struct ViewSpec {
+    pub name: String,
+    pub source: String,
+    pub sql: String,
+    pub initial_capacity: usize,
+    pub tap_capacity: usize,
+}
+
+impl ViewSpec {
+    pub fn new(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        sql: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+            sql: sql.into(),
+            initial_capacity: 10_000,
+            tap_capacity: 1024,
+        }
+    }
 }
 
 /// Lightweight queue spec used by the e2e harness.
@@ -308,6 +424,9 @@ impl Default for ServerOpts {
             queues: Vec::new(),
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         }
     }
 }
@@ -489,6 +608,26 @@ fn build_toml(
         )
         .unwrap();
     }
+    if let Some(spillover) = &opts.spillover {
+        // Spillover dir lives in the same root as the txlog dir.
+        let spillover_dir = txlog_dir
+            .parent()
+            .unwrap_or(txlog_dir)
+            .join("spillover");
+        writeln!(out, "[transport.spillover]").unwrap();
+        writeln!(
+            out,
+            r#"directory = "{}""#,
+            spillover_dir.display().to_string().replace('\\', "/")
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "max_bytes_per_sub = {}",
+            spillover.max_bytes_per_sub
+        )
+        .unwrap();
+    }
     if let Some((cert_path, key_path)) = tls_paths {
         writeln!(out, "[transport.tls]").unwrap();
         writeln!(
@@ -581,6 +720,26 @@ fn build_toml(
     if let Some(auth_opts) = &opts.auth {
         writeln!(out, "[auth]").unwrap();
         writeln!(out, "required = true").unwrap();
+        // [auth.jwt] when a JWT validator is requested.
+        if let Some(jwt) = &auth_opts.jwt {
+            writeln!(out, "[auth.jwt]").unwrap();
+            let escaped_secret = jwt.secret.replace('\\', "\\\\").replace('"', "\\\"");
+            writeln!(out, r#"secret = "{escaped_secret}""#).unwrap();
+            if let Some(iss) = &jwt.issuer {
+                writeln!(out, r#"issuer = "{iss}""#).unwrap();
+            }
+            if let Some(aud) = &jwt.audience {
+                writeln!(out, r#"audience = "{aud}""#).unwrap();
+            }
+            writeln!(out, r#"username_claim = "{}""#, jwt.username_claim).unwrap();
+            writeln!(
+                out,
+                r#"entitlements_claim = "{}""#,
+                jwt.entitlements_claim
+            )
+            .unwrap();
+            writeln!(out).unwrap();
+        }
         for u in &auth_opts.users {
             writeln!(out, "[[auth.users]]").unwrap();
             writeln!(out, r#"username = "{}""#, u.username).unwrap();
@@ -605,6 +764,33 @@ fn build_toml(
             }
             writeln!(out).unwrap();
         }
+    }
+
+    // [[logging.sinks]] entries — S25 per-target tracing sinks.
+    for sink in &opts.logging_sinks {
+        writeln!(out, "[[logging.sinks]]").unwrap();
+        if let Some(path) = &sink.file {
+            writeln!(out, r#"file = "{}""#, path.replace('\\', "/")).unwrap();
+        }
+        let escaped_filter = sink.filter.replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(out, r#"filter = "{escaped_filter}""#).unwrap();
+        writeln!(out, r#"format = "{}""#, sink.format).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    // [[views]] entries — only emitted when the caller actually
+    // configured materialized views. The server applies these AFTER
+    // every topic has been initialised, so the view's `source` can
+    // refer to any topic declared above.
+    for v in &opts.views {
+        writeln!(out, "[[views]]").unwrap();
+        writeln!(out, r#"name = "{}""#, v.name).unwrap();
+        writeln!(out, r#"source = "{}""#, v.source).unwrap();
+        let escaped_sql = v.sql.replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(out, r#"sql = "{escaped_sql}""#).unwrap();
+        writeln!(out, "initial_capacity = {}", v.initial_capacity).unwrap();
+        writeln!(out, "tap_capacity = {}", v.tap_capacity).unwrap();
+        writeln!(out).unwrap();
     }
 
     // [[queues]] entries — only emitted when the caller actually

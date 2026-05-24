@@ -1,0 +1,61 @@
+# IN clause + NOT IN. Catches list-membership semantics and the
+# classic NULL-IN-list trap (ANSI: NULL in IN list does NOT match
+# NULL in the column; behaves more like UNKNOWN, so a NULL row
+# can't match an IN list).
+- name: in_with_literal_list
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+    - { id: 3, name: "Carol" }
+    - { id: 4, name: "Dave" }
+  query: "SELECT id, name FROM t WHERE name IN ('Alice', 'Carol')"
+  expected_rows:
+    - { id: 1, name: "Alice" }
+    - { id: 3, name: "Carol" }
+
+# Numeric `IN` — pre-fix this panicked in `get_string` because
+# `Expr::InList` always compiled to `InString`. After the
+# type-routed compile-path fix, the predicate matches against the
+# `Long` column directly.
+- name: in_with_numeric_list
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30 }
+  query: "SELECT id, v FROM t WHERE v IN (10, 30)"
+  expected_rows:
+    - { id: 1, v: 10 }
+    - { id: 3, v: 30 }
+
+- name: not_in_with_literal_list
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+    - { id: 3, name: "Carol" }
+  query: "SELECT id, name FROM t WHERE name NOT IN ('Alice', 'Carol')"
+  expected_rows:
+    - { id: 2, name: "Bob" }
+
+- name: in_with_single_element
+  schema:
+    - { name: id, type: long }
+    - { name: name, type: string }
+  key: id
+  publishes:
+    - { id: 1, name: "Alice" }
+    - { id: 2, name: "Bob" }
+  query: "SELECT id, name FROM t WHERE name IN ('Alice')"
+  expected_rows:
+    - { id: 1, name: "Alice" }

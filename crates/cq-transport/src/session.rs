@@ -70,7 +70,7 @@ pub fn encode_frame(codec: Codec, msg: &CqMessage) -> Option<OutboundFrame> {
     match codec {
         Codec::Json => serde_json::to_string(msg).ok().map(OutboundFrame::Text),
         Codec::MessagePack => rmp_serde::to_vec_named(msg).ok().map(OutboundFrame::Binary),
-        Codec::Bson => codec.encode(msg).ok().map(OutboundFrame::Binary),
+        Codec::Bson | Codec::Fix => codec.encode(msg).ok().map(OutboundFrame::Binary),
     }
 }
 
@@ -180,6 +180,13 @@ pub struct DeliveryRoute {
     /// resume). The replay loop awaits this notify when it sees
     /// the paused flag set.
     pub resume_notify: Arc<tokio::sync::Notify>,
+    /// S21: per-route disk spillover. When `Some`, the delivery path
+    /// pushes frames here instead of dropping on `try_send` failure;
+    /// a background drain task feeds them back into `tx` as soon as
+    /// the queue has room. `None` falls back to the legacy "drop on
+    /// full" behaviour. Ordering is preserved by routing through
+    /// spillover whenever any backlog is present.
+    pub spillover: Option<Arc<crate::spillover::Spillover>>,
 }
 
 impl DeliveryRoute {
@@ -202,7 +209,17 @@ impl DeliveryRoute {
             bookmark_store: None,
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resume_notify: Arc::new(tokio::sync::Notify::new()),
+            spillover: None,
         }
+    }
+
+    /// Attach a spillover file to this route. Subsequent `try_send`
+    /// failures fall through to the spillover instead of dropping;
+    /// the caller is expected to also spawn `spawn_spillover_drain`
+    /// (in this module) so a backlog drains as the queue catches up.
+    pub fn with_spillover(mut self, spillover: Arc<crate::spillover::Spillover>) -> Self {
+        self.spillover = Some(spillover);
+        self
     }
 
     pub fn with_client_name(mut self, client_name: Option<String>) -> Self {
@@ -320,8 +337,76 @@ impl DeliveryRoute {
             bookmark_store: None,
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resume_notify: Arc::new(tokio::sync::Notify::new()),
+            spillover: None,
         }
     }
+}
+
+/// Spawn the per-route spillover drain task. Wakes whenever the
+/// outbound queue has space, reads frames back from disk in append
+/// order, and `try_send`s them through the route. Exits when the
+/// spillover has been empty for one full backoff cycle AND no new
+/// writes arrive — re-armed by any subsequent overflow.
+pub fn spawn_spillover_drain(
+    sub_id: String,
+    tx: OutboundTx,
+    spillover: Arc<crate::spillover::Spillover>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff_ms: u64 = 5;
+        loop {
+            if spillover.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(250);
+                // Re-check after sleep so we can exit when the sub
+                // has been closed (sender disconnect).
+                if tx.is_closed() {
+                    break;
+                }
+                continue;
+            }
+            backoff_ms = 5;
+            // Peek the next frame. We do NOT advance the read cursor
+            // until try_send succeeds; otherwise a Full receiver would
+            // lose the frame entirely. Read+rollback isn't supported
+            // by Spillover, so we instead poll the queue's capacity
+            // and skip the read when there's no room.
+            if tx.capacity() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            let frame = match spillover.read_next_frame() {
+                Ok(Some(f)) => f,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(sub = %sub_id, error = %e, "Spillover read failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            match tx.try_send(frame) {
+                Ok(()) => {
+                    metrics::counter!("cq_spillover_drained_total").increment(1);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_lost)) => {
+                    // The capacity check above raced with another
+                    // sender (e.g., a parallel live publish). The
+                    // frame has already been consumed from the
+                    // spillover — losing it would be a bug. Best
+                    // recovery: wait briefly and re-spool by writing
+                    // it back. Order is preserved because we hold
+                    // the only drain task.
+                    metrics::counter!("cq_spillover_respool_total").increment(1);
+                    let _ = spillover.write_frame(&_lost);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(sub = %sub_id, "Spillover drain: receiver closed");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Spawn a background task that drains `conflator` every `interval` and
@@ -555,6 +640,19 @@ pub struct Session {
     /// binary frame from the client. Shared via `Arc` so the
     /// heartbeat task can encode in the negotiated codec.
     pub codec: SharedCodec,
+    /// S28 — active wire-protocol version for this connection. Set on
+    /// `Logon` via [`cq_protocol::version::negotiate`]; defaults to
+    /// `DEFAULT_LEGACY_VERSION` for pre-S28 clients that don't send
+    /// `protocol_versions`. Future feature gating consults this to
+    /// decide whether to emit V≥2 fields.
+    pub protocol_version: u32,
+    /// S27 — active wire-compression algorithm for this connection.
+    /// Set on `Logon` via [`cq_protocol::compression::negotiate`];
+    /// defaults to `Compression::None` for pre-S27 clients. Shared
+    /// via `Arc<AtomicU8>` so the TCP write loop (which lives in a
+    /// separate task and doesn't own the Session) can read the
+    /// current setting without taking a lock.
+    pub compression: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Session {
@@ -571,6 +669,10 @@ impl Session {
             username: None,
             entitlements: Vec::new(),
             codec: Arc::new(parking_lot::Mutex::new(Codec::Json)),
+            protocol_version: cq_protocol::version::DEFAULT_LEGACY_VERSION,
+            compression: Arc::new(std::sync::atomic::AtomicU8::new(
+                compression_to_u8(cq_protocol::compression::DEFAULT_LEGACY_COMPRESSION),
+            )),
         }
     }
 
@@ -627,5 +729,39 @@ impl Session {
                 false
             }
         }
+    }
+
+    /// Read the session's currently-active wire compression. Cheap
+    /// atomic load; safe to call from any task holding the Session.
+    pub fn compression(&self) -> cq_protocol::compression::Compression {
+        compression_from_u8(self.compression.load(Ordering::Acquire))
+    }
+
+    /// Set the session's wire compression — called from the Logon
+    /// handler once the negotiation has settled. Subsequent writes
+    /// to the TCP outbound stream consult this value.
+    pub fn set_compression(&self, c: cq_protocol::compression::Compression) {
+        self.compression
+            .store(compression_to_u8(c), Ordering::Release);
+    }
+}
+
+/// Encode the `Compression` enum into a single byte for `AtomicU8`
+/// transport. The enum has only two variants today; future entries
+/// just need a non-conflicting discriminant.
+pub fn compression_to_u8(c: cq_protocol::compression::Compression) -> u8 {
+    match c {
+        cq_protocol::compression::Compression::None => 0,
+        cq_protocol::compression::Compression::Zstd => 1,
+    }
+}
+
+/// Decode a compression byte back into the enum. Unknown bytes are
+/// treated as `None` so a future build that adds a new algorithm
+/// downgrades cleanly on an older receiver instead of panicking.
+pub fn compression_from_u8(b: u8) -> cq_protocol::compression::Compression {
+    match b {
+        1 => cq_protocol::compression::Compression::Zstd,
+        _ => cq_protocol::compression::Compression::None,
     }
 }

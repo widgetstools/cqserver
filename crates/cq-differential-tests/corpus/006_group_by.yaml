@@ -1,0 +1,54 @@
+# GROUP BY with single-column groupings + aggregates. Catches
+# bucketing correctness and per-group aggregation semantics. ORDER BY
+# is added where the test asserts ordered output; without it we
+# compare as multisets.
+- name: group_by_desk_count
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES" }
+    - { id: 2, desk: "EQUITIES" }
+    - { id: 3, desk: "RATES" }
+    - { id: 4, desk: "FX" }
+    - { id: 5, desk: "RATES" }
+  query: "SELECT desk, COUNT(*) AS c FROM t GROUP BY desk"
+  expected_rows:
+    - { desk: "RATES", c: 3 }
+    - { desk: "EQUITIES", c: 1 }
+    - { desk: "FX", c: 1 }
+
+- name: group_by_desk_sum
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: qty, type: long }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES", qty: 100 }
+    - { id: 2, desk: "EQUITIES", qty: 200 }
+    - { id: 3, desk: "RATES", qty: 50 }
+    - { id: 4, desk: "FX", qty: 75 }
+    - { id: 5, desk: "RATES", qty: 25 }
+  query: "SELECT desk, SUM(qty) AS s FROM t GROUP BY desk"
+  expected_rows:
+    - { desk: "RATES", s: 175 }
+    - { desk: "EQUITIES", s: 200 }
+    - { desk: "FX", s: 75 }
+
+- name: group_by_min_max
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: price, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES", price: 100.0 }
+    - { id: 2, desk: "RATES", price: 150.0 }
+    - { id: 3, desk: "EQUITIES", price: 200.0 }
+    - { id: 4, desk: "RATES", price: 110.0 }
+  query: "SELECT desk, MIN(price) AS mn, MAX(price) AS mx FROM t GROUP BY desk"
+  expected_rows:
+    - { desk: "RATES", mn: 100.0, mx: 150.0 }
+    - { desk: "EQUITIES", mn: 200.0, mx: 200.0 }

@@ -1,5 +1,9 @@
 pub mod codec;
 pub mod command;
+pub mod compression;
+pub mod fix;
 pub mod message;
 pub mod nvfix;
+pub mod schema_change;
 pub mod serialization;
+pub mod version;

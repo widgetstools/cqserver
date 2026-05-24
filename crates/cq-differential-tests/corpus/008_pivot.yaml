@@ -1,0 +1,69 @@
+# Static PIVOT / UNPIVOT — worklog S43.
+#
+# DuckDB syntax mirrors Snowflake here. Test cases use schemas where
+# each (anchor, pivot) bucket has a single row (matching the SOW
+# shape CQ runs over) so multi-row aggregates don't blur the
+# semantic comparison. Out-of-list pivot values are dropped silently
+# in both engines (we use IN-lists that omit at least one value to
+# verify).
+
+- name: pivot_single_measure_two_values
+  schema:
+    - { name: trader, type: string }
+    - { name: desk, type: string }
+    - { name: qty, type: long }
+  key: trader
+  publishes:
+    - { trader: "alice", desk: "RATES", qty: 100 }
+    - { trader: "bob", desk: "RATES", qty: 50 }
+    - { trader: "carol", desk: "RATES", qty: 25 }
+  query: "SELECT * FROM t PIVOT (SUM(qty) FOR desk IN ('RATES', 'FX'))"
+  expected_rows:
+    - { trader: "alice", RATES: 100, FX: null }
+    - { trader: "bob", RATES: 50, FX: null }
+    - { trader: "carol", RATES: 25, FX: null }
+  notes: |
+    Single-measure pivot with bucket misses (no FX rows). Both
+    engines return null in the empty bucket.
+
+- name: pivot_filters_out_of_list_values
+  schema:
+    - { name: trader, type: string }
+    - { name: desk, type: string }
+    - { name: qty, type: long }
+  key: trader
+  publishes:
+    - { trader: "alice", desk: "RATES", qty: 100 }
+    - { trader: "bob", desk: "EQUITIES", qty: 999 }
+  query: "SELECT * FROM t PIVOT (SUM(qty) FOR desk IN ('RATES'))"
+  expected_rows:
+    - { trader: "alice", RATES: 100 }
+    - { trader: "bob", RATES: null }
+  notes: |
+    EQUITIES isn't in the IN-list, so bob's row doesn't contribute
+    to any bucket — but bob's *anchor* still surfaces with
+    RATES=null, matching Snowflake/DuckDB convention.
+
+# Dynamic PIVOT (`IN (ANY)`, Snowflake syntax) is verified by the
+# `dynamic_pivot_*` unit tests in `cq-core/tests/pivot_executor.rs`
+# rather than here — DuckDB's dynamic PIVOT uses an incompatible
+# syntactic form (`PIVOT t ON col USING agg`), so a differential
+# entry would test parser compatibility, not engine semantics.
+
+- name: unpivot_round_trip_via_wide_schema
+  schema:
+    - { name: trader, type: string }
+    - { name: RATES, type: long }
+    - { name: FX, type: long }
+  key: trader
+  publishes:
+    - { trader: "alice", RATES: 100, FX: 200 }
+    - { trader: "bob", RATES: 50 }
+  query: "SELECT * FROM t UNPIVOT (qty FOR desk IN (RATES, FX))"
+  expected_rows:
+    - { trader: "alice", desk: "RATES", qty: 100 }
+    - { trader: "alice", desk: "FX", qty: 200 }
+    - { trader: "bob", desk: "RATES", qty: 50 }
+  notes: |
+    bob's FX is null and gets dropped by both engines (Snowflake's
+    default `EXCLUDE NULLS` behavior).

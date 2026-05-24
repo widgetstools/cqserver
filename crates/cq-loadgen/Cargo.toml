@@ -1,0 +1,26 @@
+[package]
+name = "cq-loadgen"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cq-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+cq-client = { path = "../cq-client" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+# CLI parsing
+clap = { workspace = true }
+
+# HDR histograms for accurate p50/p95/p99/p99.9 latency reporting
+hdrhistogram = { workspace = true }
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]

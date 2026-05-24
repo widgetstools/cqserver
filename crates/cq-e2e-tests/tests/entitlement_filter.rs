@@ -47,8 +47,12 @@ async fn row_filter_restricts_alice_to_rates_desk() {
                         row_filter: None,
                     },
                 ],
+                jwt: None,
             }),
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

@@ -26,6 +26,7 @@ parking_lot.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+jsonwebtoken.workspace = true
 
 [dev-dependencies]
 compact_str.workspace = true

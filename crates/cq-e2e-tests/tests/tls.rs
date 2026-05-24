@@ -24,6 +24,9 @@ async fn tls_publish_and_sow_roundtrip() {
             queues: Vec::new(),
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

@@ -3,6 +3,11 @@ name = "cq-core"
 version.workspace = true
 edition.workspace = true
 
+# Register `cfg(loom)` so `--cfg loom` builds don't trip
+# `unexpected_cfgs`. Required because CI runs with `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 cq-txlog = { path = "../cq-txlog" }
 serde.workspace = true
@@ -19,11 +24,42 @@ dashmap.workspace = true
 regex.workspace = true
 uuid.workspace = true
 metrics.workspace = true
+# S11 — `tokio::sync::Notify` is needed as a wakeup primitive for the
+# replication-barrier. Only the `sync` feature; cq-core doesn't run
+# the tokio runtime itself.
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+proptest.workspace = true
+# loom is also a dev-dep so loom-cfg-gated test files compile cleanly
+# without RUSTFLAGS. The real wiring is in [target.'cfg(loom)'.dependencies]
+# below, which pulls loom into the regular build when --cfg loom is set.
+loom.workspace = true
+
+# When compiling with `RUSTFLAGS="--cfg loom"`, pull loom into the
+# regular dependency graph so the sync::* shim can re-export
+# loom::sync / loom::sync::atomic / loom::thread.
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
 
 [[bench]]
 name = "store_bench"
+harness = false
+
+[[bench]]
+name = "filter_eval"
+harness = false
+
+[[bench]]
+name = "subscribe_register"
+harness = false
+
+[[bench]]
+name = "fanout_predicate_index"
+harness = false
+
+[[bench]]
+name = "range_index"
 harness = false

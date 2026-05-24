@@ -75,6 +75,9 @@ async fn snapshot_beyond_queue_capacity_completes() {
             queues: Vec::new(),
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;
@@ -121,6 +124,9 @@ async fn many_concurrent_subscribes_no_ack_drops() {
             queues: Vec::new(),
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

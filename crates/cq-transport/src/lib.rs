@@ -4,6 +4,7 @@ pub mod heartbeat;
 pub mod queue;
 pub mod router;
 pub mod session;
+pub mod spillover;
 pub mod tcp;
 pub mod tls;
 pub mod websocket;

@@ -18,6 +18,9 @@ async fn queue_lease_redelivers_to_other_consumer() {
             queues: vec![QueueSpec::new("/work").with_lease(150)],
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;
@@ -81,6 +84,9 @@ async fn queue_ack_prevents_redelivery() {
             queues: vec![QueueSpec::new("/acked").with_lease(150)],
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

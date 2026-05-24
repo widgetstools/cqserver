@@ -63,7 +63,10 @@ async fn run_session(
     }
     write_frame(&mut stream, &ReplFrame::Hello { highwater }).await?;
 
-    // 2. Apply incoming entries forever.
+    // 2. Apply incoming entries forever. After each apply, emit an
+    //    Ack back to the primary so the shipper's Ack reader can
+    //    bump the per-topic `last_replicated_sequence` and release
+    //    the publish path in S11 sync mode.
     loop {
         let frame = read_frame(&mut stream).await?;
         match frame {
@@ -75,6 +78,14 @@ async fn run_session(
                 payload,
             } => {
                 apply_entry(&topics, sequence, &topic, &key, is_tombstone, &payload);
+                let ack = ReplFrame::Ack {
+                    topic: topic.clone(),
+                    sequence,
+                };
+                if let Err(e) = write_frame(&mut stream, &ack).await {
+                    tracing::warn!(error = %e, "Failed to write Ack — ending session");
+                    return Err(e);
+                }
             }
             ReplFrame::Hello { .. } => {
                 tracing::warn!("Primary sent unexpected Hello — ignoring");

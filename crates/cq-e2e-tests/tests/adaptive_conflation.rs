@@ -72,6 +72,9 @@ async fn adaptive_conflation_widens_under_pressure() {
             queues: Vec::new(),
             auth: None,
             txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
         },
     )
     .await;

@@ -79,6 +79,9 @@ async fn shipper_to_receiver_replicates_publishes() {
             topics: vec![("/repl-trades".into(), topic_dir.clone())],
             poll_interval: Duration::from_millis(20),
             reconnect_backoff: Duration::from_millis(100),
+            filter: None,
+            transform: None,
+            topic_refs: Default::default(),
         })
         .await;
     });

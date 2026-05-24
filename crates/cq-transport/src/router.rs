@@ -31,6 +31,25 @@ pub struct RouterContext {
     /// the replay from the stored sequence. In-memory; survives
     /// reconnects within the process lifetime but not restarts.
     pub bookmark_store: BookmarkStore,
+    /// S21 spillover config. `Some(_)` enables per-subscription disk
+    /// overflow: when an outbound queue fills, the delivery layer
+    /// appends to a file under `directory` and a background drain
+    /// task feeds frames back as the queue catches up. `None` keeps
+    /// the legacy "drop on full" behaviour.
+    pub spillover: Option<SpilloverContext>,
+}
+
+/// Server-wide spillover configuration, captured in [`RouterContext`]
+/// and consulted at route construction time.
+#[derive(Clone)]
+pub struct SpilloverContext {
+    /// Root directory under which per-route spillover files are created.
+    /// Created on demand if missing.
+    pub directory: std::path::PathBuf,
+    /// Maximum on-disk bytes per subscription. Writes that would push
+    /// the spool past this limit are dropped (and counted) so a
+    /// hopelessly-slow consumer can't grow the spool indefinitely.
+    pub max_bytes_per_sub: u64,
 }
 
 /// Process-wide map of `(client_name, topic_name) → max sequence
@@ -213,35 +232,193 @@ fn check_entitlement(
 }
 
 fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
+    // S28 — version negotiation runs FIRST, regardless of auth. A
+    // client whose supported set is disjoint from ours has nothing
+    // to gain from authenticating, so we fail before even reading
+    // credentials.
+    let client_versions = msg.protocol_versions.clone().unwrap_or_default();
+    let outcome = cq_protocol::version::negotiate(
+        &client_versions,
+        cq_protocol::version::SUPPORTED_VERSIONS,
+    );
+    let negotiated = match outcome {
+        cq_protocol::version::NegotiationOutcome::Negotiated(v) => v,
+        cq_protocol::version::NegotiationOutcome::NoOverlap => {
+            tracing::warn!(
+                session = %session.id,
+                client_versions = ?client_versions,
+                server_versions = ?cq_protocol::version::SUPPORTED_VERSIONS,
+                "Logon rejected: no overlapping protocol version"
+            );
+            metrics::counter!(
+                "cq_logon_total",
+                "result" => "version_mismatch"
+            )
+            .increment(1);
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "No mutually supported protocol version",
+            ));
+            return;
+        }
+    };
+    session.protocol_version = negotiated;
+
+    // S27 — compression negotiation, same handshake shape. An empty
+    // client list (or pre-S27 client) implies Compression::None,
+    // preserving wire compatibility for older clients.
+    let client_compressions = msg
+        .compressions
+        .clone()
+        .unwrap_or_default();
+    let compression = match cq_protocol::compression::negotiate(
+        &client_compressions,
+        cq_protocol::compression::SUPPORTED_COMPRESSIONS,
+    ) {
+        cq_protocol::compression::NegotiationOutcome::Negotiated(c) => c,
+        cq_protocol::compression::NegotiationOutcome::NoOverlap => {
+            // Disjoint compressions can only happen if the client
+            // explicitly rules out None — which is an unusual choice.
+            // Reject so the client knows.
+            tracing::warn!(
+                session = %session.id,
+                client = ?client_compressions,
+                "Logon rejected: no overlapping compression algorithm"
+            );
+            metrics::counter!(
+                "cq_logon_total",
+                "result" => "compression_mismatch"
+            )
+            .increment(1);
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "No mutually supported compression",
+            ));
+            return;
+        }
+    };
+    session.set_compression(compression);
+
+    // When auth isn't required and no creds are supplied, the logon
+    // is effectively a version-negotiation handshake — accept and
+    // echo the negotiated version. (Existing entitlement-checked
+    // commands still gate per-message; an unauthenticated session
+    // just doesn't get user-specific entitlements.)
     let creds = msg.data.as_ref().and_then(|d| d.as_object());
     let user = creds.and_then(|m| m.get("user").and_then(|v| v.as_str()));
     let pass = creds.and_then(|m| m.get("password").and_then(|v| v.as_str()));
-    let (user, pass) = match (user, pass) {
-        (Some(u), Some(p)) => (u, p),
-        _ => {
+    // S16 — JWT path. The Logon frame may carry a `token` field
+    // instead of (or alongside) `user`/`password`. When present and
+    // the AuthStore has a JWT validator configured, verify the
+    // token; on success the user identity comes from its claims.
+    let token = creds.and_then(|m| m.get("token").and_then(|v| v.as_str()));
+    if let Some(t) = token {
+        if auth.has_jwt() {
+            match auth.verify_jwt(t) {
+                Some(matched) => {
+                    session.username = Some(matched.username.clone());
+                    session.entitlements = matched.entitlements.clone();
+                    tracing::info!(
+                        target: "cq_audit",
+                        session = %session.id,
+                        user = %matched.username,
+                        entitlements = matched.entitlements.len(),
+                        protocol_version = negotiated,
+                        event = "logon_ok_jwt",
+                        "Logon ok (jwt)"
+                    );
+                    metrics::counter!(
+                        "cq_logon_total",
+                        "result" => "ok_jwt"
+                    )
+                    .increment(1);
+                    let mut ack = CqMessage::ack_ok(msg.command_id);
+                    ack.protocol_versions = Some(vec![negotiated]);
+                    ack.compressions = Some(vec![compression]);
+                    let _ = session.send_message(&ack);
+                    return;
+                }
+                None => {
+                    tracing::warn!(
+                        target: "cq_audit",
+                        session = %session.id,
+                        event = "logon_fail_jwt",
+                        "Logon rejected: invalid JWT"
+                    );
+                    metrics::counter!(
+                        "cq_logon_total",
+                        "result" => "fail_jwt"
+                    )
+                    .increment(1);
+                    let _ = session.send_message(&CqMessage::error(
+                        msg.command_id,
+                        "Invalid JWT",
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    let credentials = match (user, pass) {
+        (Some(u), Some(p)) => Some((u, p)),
+        _ => None,
+    };
+
+    if credentials.is_none() {
+        if auth.required {
             let _ = session.send_message(&CqMessage::error(
                 msg.command_id,
                 "Missing user/password in logon data",
             ));
             return;
         }
-    };
+        let mut ack = CqMessage::ack_ok(msg.command_id);
+        ack.protocol_versions = Some(vec![negotiated]);
+        ack.compressions = Some(vec![compression]);
+        tracing::info!(
+            session = %session.id,
+            protocol_version = negotiated,
+            compression = ?compression,
+            "Logon ok (no credentials, auth not required)"
+        );
+        metrics::counter!("cq_logon_total", "result" => "ok").increment(1);
+        let _ = session.send_message(&ack);
+        return;
+    }
+    let (user, pass) = credentials.unwrap();
 
     match auth.verify(user, pass) {
         Some(matched) => {
             session.username = Some(matched.username.clone());
             session.entitlements = matched.entitlements.clone();
+            // S25 audit event: explicit `target = "cq_audit"` so the
+            // tracing-subscriber Registry can route it to the
+            // dedicated audit sink (e.g., audit.log) while the same
+            // session keeps its other events on the operational sink.
             tracing::info!(
+                target: "cq_audit",
                 session = %session.id,
                 user = %matched.username,
                 entitlements = matched.entitlements.len(),
+                protocol_version = negotiated,
+                event = "logon_ok",
                 "Logon ok"
             );
             metrics::counter!("cq_logon_total", "result" => "ok").increment(1);
-            let _ = session.send_message(&CqMessage::ack_ok(msg.command_id));
+            let mut ack = CqMessage::ack_ok(msg.command_id);
+            ack.protocol_versions = Some(vec![negotiated]);
+            ack.compressions = Some(vec![compression]);
+            let _ = session.send_message(&ack);
         }
         None => {
-            tracing::warn!(session = %session.id, attempted_user = %user, "Logon failed");
+            tracing::warn!(
+                target: "cq_audit",
+                session = %session.id,
+                attempted_user = %user,
+                event = "logon_fail",
+                "Logon failed"
+            );
             metrics::counter!("cq_logon_total", "result" => "fail").increment(1);
             let _ = session.send_message(&CqMessage::error(
                 msg.command_id,
@@ -504,6 +681,7 @@ fn handle_sow_and_subscribe(
             registry,
             cname,
             ctx.bookmark_store.clone(),
+            ctx.spillover.as_ref(),
         );
         return;
     }
@@ -538,7 +716,7 @@ fn handle_sow_and_subscribe(
                 session.subscriptions.push(sub_id.clone());
                 registry.insert(
                     sub_id.clone(),
-                    build_route(
+                    build_route_with_spillover(
                         session.tx.clone(),
                         topic_name.clone(),
                         sub_id.clone(),
@@ -547,6 +725,7 @@ fn handle_sow_and_subscribe(
                         session.id.clone(),
                         msg.client_name.clone().or_else(|| session.username.clone()),
                         Some(ctx.bookmark_store.clone()),
+                        ctx.spillover.as_ref(),
                     ),
                 );
                 metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
@@ -607,6 +786,7 @@ fn handle_bookmark_subscribe(
     registry: &SessionRegistry,
     client_name: Option<String>,
     bookmark_store: BookmarkStore,
+    spillover_ctx: Option<&SpilloverContext>,
 ) {
     let sub_id = session.next_sub_id();
 
@@ -647,7 +827,7 @@ fn handle_bookmark_subscribe(
     session.subscriptions.push(sub_id.clone());
     registry.insert(
         sub_id.clone(),
-        build_route(
+        build_route_with_spillover(
             session.tx.clone(),
             topic_name.clone(),
             sub_id.clone(),
@@ -656,6 +836,7 @@ fn handle_bookmark_subscribe(
             session.id.clone(),
             client_name,
             Some(bookmark_store),
+            spillover_ctx,
         ),
     );
     metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone()).increment(1.0);
@@ -826,7 +1007,7 @@ fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) 
                 session.subscriptions.push(sub_id.clone());
                 registry.insert(
                     sub_id.clone(),
-                    build_route(
+                    build_route_with_spillover(
                         session.tx.clone(),
                         topic_name.clone(),
                         sub_id.clone(),
@@ -835,6 +1016,7 @@ fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) 
                         session.id.clone(),
                         msg.client_name.clone().or_else(|| session.username.clone()),
                         Some(ctx.bookmark_store.clone()),
+                        ctx.spillover.as_ref(),
                     ),
                 );
                 metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
@@ -944,7 +1126,7 @@ fn handle_sow_delete(
     }
 }
 
-fn build_route(
+fn build_route_with_spillover(
     tx: crate::session::OutboundTx,
     topic: String,
     sub_id: String,
@@ -953,21 +1135,69 @@ fn build_route(
     session_id: String,
     client_name: Option<String>,
     bookmark_store: Option<BookmarkStore>,
+    spillover_ctx: Option<&SpilloverContext>,
 ) -> DeliveryRoute {
     let route = match conflation_ms {
         Some(ms) if ms > 0 => DeliveryRoute::with_conflation_codec(
-            tx,
+            tx.clone(),
             topic,
-            sub_id,
+            sub_id.clone(),
             Duration::from_millis(ms),
             codec,
         )
         .with_session(session_id),
-        _ => DeliveryRoute::with_codec(tx, topic, codec).with_session(session_id),
+        _ => DeliveryRoute::with_codec(tx.clone(), topic, codec)
+            .with_session(session_id),
     };
-    route
+    let route = route
         .with_client_name(client_name)
-        .with_bookmark_store(bookmark_store)
+        .with_bookmark_store(bookmark_store);
+
+    // S21: opt-in disk spillover. Create a fresh per-route file
+    // under the configured directory, attach it to the route, and
+    // spawn the drain task that feeds frames back from disk as the
+    // outbound queue catches up.
+    if let Some(ctx) = spillover_ctx {
+        let safe_id = sanitize_filename(&sub_id);
+        let path = ctx.directory.join(format!("{}.spill", safe_id));
+        match crate::spillover::Spillover::open(path, ctx.max_bytes_per_sub) {
+            Ok(sp) => {
+                let sp = std::sync::Arc::new(sp);
+                let drain_handle = crate::session::spawn_spillover_drain(
+                    sub_id.clone(),
+                    tx.clone(),
+                    sp.clone(),
+                );
+                // Detach the drain task; it exits naturally when the
+                // outbound tx closes (sub teardown).
+                drop(drain_handle);
+                return route.with_spillover(sp);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sub = %sub_id,
+                    error = %e,
+                    "Spillover open failed; falling back to drop-on-full"
+                );
+            }
+        }
+    }
+    route
+}
+
+/// Translate a subscription id into a filename-safe slug. Sub ids are
+/// server-assigned (`sess-N:sub-M`) but defensively sanitise anything
+/// outside `[A-Za-z0-9_-.]` to `_`.
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Replace the SELECT projection in `sql` with only the topic's key

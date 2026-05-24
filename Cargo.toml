@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/cq-client",
     "crates/cq-core",
+    "crates/cq-differential-tests",
     "crates/cq-e2e-tests",
+    "crates/cq-loadgen",
     "crates/cq-protocol",
     "crates/cq-replication",
     "crates/cq-transport",
@@ -83,6 +85,29 @@ regex = "1"
 # Testing
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Concurrency model checker (loom). Pulled in only under `--cfg loom`
+# via per-crate `[target.'cfg(loom)'.dependencies]`, plus dev-deps so
+# loom-cfg-gated test files compile cleanly without RUSTFLAGS.
+loom = "0.7"
+
+# Property-based testing
+proptest = "1"
+
+# Differential testing reference engine — bundled DuckDB. The crate
+# only links into `crates/cq-differential-tests`, which is its own
+# CI job (see .github/workflows/ci.yml). Bundled feature compiles
+# from C++ source; first build is slow, subsequent rebuilds cached.
+duckdb = { version = "1", features = ["bundled"] }
+
+# YAML parser for the differential-tests corpus.
+serde_yaml = "0.9"
+
+# CLI argument parsing for cq-loadgen
+clap = { version = "4", features = ["derive"] }
+
+# HDR histograms for accurate latency percentiles (cq-loadgen)
+hdrhistogram = "7"
+
 # Checksums
 crc32fast = "1.4"
 
@@ -93,6 +118,9 @@ zstd = { version = "0.13", default-features = false }
 
 # Temp dirs for tests
 tempfile = "3"
+
+# JWT validation for S16 auth.
+jsonwebtoken = "9"
 
 [profile.release]
 opt-level = 3

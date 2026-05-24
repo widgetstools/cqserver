@@ -228,10 +228,82 @@ pub struct ColumnStore {
    atomically after writing all column values for a row.
 
 3. **Per-row versions** — subscription evaluation can check if a row changed since
-   last evaluation without comparing all column values.
+   last evaluation without comparing all column values. Also doubles as a per-row
+   **seqlock** (S33 / C2) — see "Column Tear / Seqlock" below.
 
 4. **`CompactString`** — small-string optimization to avoid heap allocation for
    short values (trade IDs, currency codes, status strings).
+
+### SOW Shard Abstraction (C4 / S39, prepares S29)
+
+The production `ColumnStore` is a single-shard SOW: one `Vec<T>` per
+column, one global key→row map. Future per-CPU sharding (S29) wants N
+shards routed by row-key hash so concurrent publishers don't contend
+on the single state-write lock.
+
+S39 introduces `SowShard` and `SowStore` in [`sow_store.rs`](crates/cq-core/src/sow_store.rs)
+as the abstraction shape — independent of `Topic` + `StoreState` for
+now, but with the routing + materialization semantics S29 will adopt:
+
+- `SowShard` trait: minimal surface (`upsert`, `delete`, `get`,
+  `live_row_count`, `materialize`).
+- `SowStore::Single(SingleShard)`: current single-shard semantics.
+- `SowStore::Sharded { shards: Vec<SingleShard> }`: routes by
+  `ahash(key) % shards.len()`. Materialization fan-outs across every
+  shard and merges; a sorted multi-shard materialization equals a
+  sorted single-shard materialization for any op stream.
+
+Proptests in [`prop_sow_shard_equivalence.rs`](crates/cq-core/tests/prop_sow_shard_equivalence.rs)
+verify the load-bearing property: `Single`, `Sharded(2)`, and
+`Sharded(16)` produce identical materialized state and identical
+predicate-filtered subsets for every random insert/update/delete
+sequence. S29 then has a regression guard rail: any future change
+that breaks the cross-shard equivalence trips the proptest.
+
+S29 migrates `Topic`'s `RwLock<StoreState>` to a
+`RwLock<SowStore>`-shaped backend; the rest of the system sees an
+unchanged API.
+
+### Column Tear / Seqlock (C2 / S33)
+
+`ColumnStore` stores each column in its own contiguous `Vec<T>`. A multi-column
+write — e.g., updating `(qty, price, notional)` together — is a sequence of N
+independent column stores. A concurrent reader observing those stores without
+synchronization could see a mix of pre- and post-write column values: column
+tear. For derived invariants like `notional = qty * price`, that's a real
+correctness hazard.
+
+Two layers of protection:
+
+1. **Today, by lock**: every read goes through `Topic::*` methods that hold
+   `state.read()` on the parent `RwLock<StoreState>`, which serializes against
+   writers holding `state.write()`. Column tear is impossible while the lock is
+   honored.
+2. **As of S33, by per-row seqlock**: `row_versions[row]` follows an odd/even
+   convention. Even values mean "consistent" (the count of completed writes ×
+   2); odd values mean "writer mid-mutation." Each writer (`update_row`,
+   `append_row`, `null_out_row`) flips the version to odd, fences (Release),
+   writes every column, fences again (Release), then flips to even-plus-two.
+   The new `ColumnStore::read_row_consistent` reader takes the version both
+   before and after its column reads, retrying until it observes the same even
+   value on both sides — guaranteeing a self-consistent snapshot of every
+   column even without the parent `state.read()`.
+
+`read_row_consistent` isn't on any hot path today (production readers go
+through `state.read()`), so the seqlock is forward-prep: it lets future
+lock-free reader paths — per-CPU shard scans after S29, JIT-compiled
+predicates, snapshot streaming bypassing the parent lock — skip the global
+RwLock without re-introducing column tear.
+
+Verified by:
+- Loom model check
+  [`tests/loom_column_tear.rs`](crates/cq-core/tests/loom_column_tear.rs) — a
+  3-column row with the invariant `n == q * p`; loom exhaustively interleaves
+  the writer's three column stores against the reader's seqlock retry loop.
+- Stress test
+  [`tests/stress_column_tear.rs`](crates/cq-core/tests/stress_column_tear.rs) —
+  1 writer × 16 readers × 1s; on the dev workstation: ~32M writes and ~1.45B
+  reads, zero invariant violations.
 
 ---
 
@@ -293,11 +365,53 @@ Server:  1. Parse SQL → CompiledPredicate + projection list
          2. Scan SOW → snapshot rows matching predicate
          3. Send snapshot (GROUP_BEGIN, rows, GROUP_END)
          4. Register subscription with active set = {matching row indices}
+            AND live_start_sequence = captured_next_sequence + 1
          5. On each future mutation to the topic:
-            a. Evaluate predicate against mutated row
-            b. Compare with active set → compute delta type
-            c. If delta exists, queue for delivery
+            a. If sequence < live_start_sequence → SKIP (covered by snapshot)
+            b. Evaluate predicate against mutated row
+            c. Compare with active set → compute delta type
+            d. If delta exists, queue for delivery
 ```
+
+### Snapshot → Live Atomicity Contract (C1 / S32)
+
+Steps 2–4 above must be a single atomic boundary: every publish whose
+mutation is visible in the snapshot must be suppressed on the live
+delta stream, and every publish that lands after the snapshot must be
+delivered live. The implementation enforces this with a sequence
+high-water captured at registration:
+
+- **Writer side** (`Topic::write_store`, `Topic::delete`): the publish
+  acquires `state.write()`, then **inside** that critical section:
+  allocates `next_sequence` via `fetch_add`, optionally appends to the
+  txlog, mutates the store, and enqueues the `MutationEvent`. Releases
+  on exit. Allocating the sequence under the write lock guarantees no
+  thread can observe `next_sequence` advance to N without also seeing
+  the mutation for N committed.
+- **Reader side** (`Topic::subscribe_inner` and
+  `Topic::subscribe_with_bookmark`): the subscribe acquires
+  `state.read()`, executes the snapshot query, then loads
+  `next_sequence` — still under the read lock. The loaded value is the
+  high-water mark of every sequence whose mutation is in the snapshot.
+- **Evaluator side** (`SubscriptionEngine::evaluate_row_kind`):
+  events whose `sequence < sub.live_start_sequence` are dropped. With
+  `live_start_sequence = captured + 1`, exactly the events covered by
+  the snapshot are suppressed and exactly the strictly-newer events
+  pass through.
+
+Verified by:
+- Deterministic test
+  [`tests/sow_and_subscribe_atomicity.rs`](crates/cq-core/tests/sow_and_subscribe_atomicity.rs)
+  (both directions of the contract).
+- Property test
+  [`tests/prop_sow_and_subscribe.rs`](crates/cq-core/tests/prop_sow_and_subscribe.rs)
+  (random op streams with subscribe injected at a random offset; the
+  subscriber's snapshot + post-deltas equal a from-scratch HashMap
+  reference).
+- Loom model check
+  [`tests/loom_sow_and_subscribe.rs`](crates/cq-core/tests/loom_sow_and_subscribe.rs)
+  (a minimal protocol model exhaustively interleaved by loom; the
+  contract holds on every permitted schedule).
 
 ### Active Set
 
