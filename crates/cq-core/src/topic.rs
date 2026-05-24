@@ -148,6 +148,14 @@ pub struct Topic {
     config: TopicConfig,
     state: RwLock<StoreState>,
     sub_engine: Mutex<SubscriptionEngine>,
+    /// Live subscription count mirrored alongside the engine's
+    /// `subscriptions` map. Updated on every add / remove /
+    /// remove_by_prefix / reap_closed so `subscription_count()` can
+    /// answer in O(1) without taking `sub_engine.lock()`. The admin
+    /// `/stats` handler hammers this on every poll — taking the
+    /// mutex was the dominant source of admin unresponsiveness under
+    /// heavy WS load.
+    active_subscriptions: std::sync::atomic::AtomicUsize,
     mutation_tx: Sender<MutationEvent>,
     mutation_rx_holder: Mutex<Option<Receiver<MutationEvent>>>,
     /// Secondary fan-out for derived consumers (S20 views). Every
@@ -200,6 +208,7 @@ impl Topic {
             config,
             state: RwLock::new(state),
             sub_engine: Mutex::new(SubscriptionEngine::new()),
+            active_subscriptions: std::sync::atomic::AtomicUsize::new(0),
             mutation_tx,
             mutation_rx_holder: Mutex::new(Some(mutation_rx)),
             view_taps: Mutex::new(Vec::new()),
@@ -307,8 +316,12 @@ impl Topic {
         self.state.read().store.row_count()
     }
 
+    /// Live subscription count. Reads an atomic — does not lock the
+    /// subscription engine. Safe to call from the admin endpoint
+    /// while a data-path thread holds `sub_engine.lock()`.
     pub fn subscription_count(&self) -> usize {
-        self.sub_engine.lock().count()
+        self.active_subscriptions
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn conflation_ms(&self) -> Option<u64> {
@@ -547,7 +560,7 @@ impl Topic {
         // Subscriptions hold ParsedQuery with pre-resolved column indices
         // against the placeholder schema — installing a new schema would
         // invalidate them. Refuse and keep the placeholder.
-        if self.sub_engine.lock().count() > 0 {
+        if self.subscription_count() > 0 {
             return;
         }
 
@@ -1361,6 +1374,8 @@ impl Topic {
             engine.add(sub);
             engine.seed_active_set(&sub_id, &state.store);
         }
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(query)
     }
 
@@ -1439,6 +1454,8 @@ impl Topic {
             engine.add(sub);
             engine.seed_active_set(&sub_id, &state.store);
         }
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let snapshot_rows = if send_keys_only_snapshot {
             let key_names: Vec<String> = state
                 .key_col_indices
@@ -1485,6 +1502,8 @@ impl Topic {
             .with_live_start(captured + 1);
         engine.add(sub);
         engine.seed_active_set(&sub_id, &state.store);
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok((query, captured))
     }
 
@@ -1502,11 +1521,18 @@ impl Topic {
         // belt + braces — keeps the close-then-remove ordering
         // explicit) sees the flag and bails out of work for it.
         engine.mark_closed(sub_id);
-        engine.remove(sub_id);
+        if engine.remove(sub_id).is_some() {
+            self.active_subscriptions
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     pub fn unsubscribe_prefix(&self, prefix: &str) {
-        self.sub_engine.lock().remove_by_prefix(prefix);
+        let removed = self.sub_engine.lock().remove_by_prefix(prefix);
+        if removed > 0 {
+            self.active_subscriptions
+                .fetch_sub(removed, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// Mark a subscription as closed without removing the engine
@@ -1522,7 +1548,12 @@ impl Topic {
     /// be invoked periodically (e.g., once per second from a per-topic
     /// reaper task) and after large disconnect storms.
     pub fn reap_closed_subscriptions(&self) -> usize {
-        self.sub_engine.lock().reap_closed()
+        let reaped = self.sub_engine.lock().reap_closed();
+        if reaped > 0 {
+            self.active_subscriptions
+                .fetch_sub(reaped, std::sync::atomic::Ordering::AcqRel);
+        }
+        reaped
     }
 
     /// Subscribe with an active-set cap (S42 / C11). Beyond the cap,
@@ -1558,6 +1589,8 @@ impl Topic {
             .with_max_active(max_active);
         engine.add(sub);
         engine.seed_active_set(&sub_id, &state.store);
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok((result.rows, query))
     }
 
