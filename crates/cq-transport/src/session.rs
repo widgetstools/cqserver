@@ -110,6 +110,37 @@ pub fn build_json_delta_frame(
     Some(OutboundFrame::Text(buf))
 }
 
+/// Build a JSON `sow_batch` frame from pre-encoded row JSON bytes.
+/// Used by the streaming SOW snapshot path so we don't decode the row
+/// bytes back into `serde_json::Map` just to re-encode them inside a
+/// `CqMessage::sow_batch` envelope.
+///
+/// `rows` is a slice of already-valid JSON objects (e.g. produced by
+/// `ColumnStore::write_row_json_projected`). The envelope is built as
+/// a single `String` with a one-shot allocation sized for the
+/// expected output.
+///
+/// Returns `None` if any row's bytes aren't valid UTF-8 (shouldn't
+/// happen — our encoder writes only ASCII-safe UTF-8 plus
+/// JSON-escaped string contents).
+pub fn build_sow_batch_json_frame(sub_id: &str, rows: &[Vec<u8>]) -> Option<OutboundFrame> {
+    // Pre-size: envelope overhead + sum of row sizes + separators.
+    let body_size: usize = rows.iter().map(|r| r.len() + 1).sum();
+    let mut buf = String::with_capacity(body_size + 48 + sub_id.len());
+    buf.push_str("{\"c\":\"sow_batch\",\"sid\":\"");
+    push_json_string_escaped(&mut buf, sub_id);
+    buf.push_str("\",\"d\":[");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        let s = std::str::from_utf8(row).ok()?;
+        buf.push_str(s);
+    }
+    buf.push_str("]}");
+    Some(OutboundFrame::Text(buf))
+}
+
 /// JSON-string-escape `s` into `out`. Sub-ids are server-assigned in
 /// the form `sess-N:sub-M`, but we still escape defensively in case
 /// future schemes include `"`, `\` or control chars.
