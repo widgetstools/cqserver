@@ -156,6 +156,14 @@ pub struct Topic {
     /// mutex was the dominant source of admin unresponsiveness under
     /// heavy WS load.
     active_subscriptions: std::sync::atomic::AtomicUsize,
+    /// Mirror of `state.read().store.row_count()` updated lock-free
+    /// after every successful upsert. The store's own row_count is
+    /// already AtomicU32, but it lives behind the state RwLock —
+    /// admin readers shouldn't have to take that lock just to count
+    /// rows. We update this mirror after the write lock is released,
+    /// so the worst-case staleness is one publish; that's fine for a
+    /// stats endpoint.
+    row_count_mirror: std::sync::atomic::AtomicU32,
     mutation_tx: Sender<MutationEvent>,
     mutation_rx_holder: Mutex<Option<Receiver<MutationEvent>>>,
     /// Secondary fan-out for derived consumers (S20 views). Every
@@ -209,6 +217,7 @@ impl Topic {
             state: RwLock::new(state),
             sub_engine: Mutex::new(SubscriptionEngine::new()),
             active_subscriptions: std::sync::atomic::AtomicUsize::new(0),
+            row_count_mirror: std::sync::atomic::AtomicU32::new(0),
             mutation_tx,
             mutation_rx_holder: Mutex::new(Some(mutation_rx)),
             view_taps: Mutex::new(Vec::new()),
@@ -313,7 +322,10 @@ impl Topic {
     }
 
     pub fn row_count(&self) -> u32 {
-        self.state.read().store.row_count()
+        // Lock-free read via the mirror. Worst-case staleness: one
+        // publish lag, which the admin endpoint can tolerate.
+        self.row_count_mirror
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Live subscription count. Reads an atomic — does not lock the
@@ -674,6 +686,10 @@ impl Topic {
             }
         }
         let row = Self::commit_values_locked(&mut state, &values);
+        // Refresh the lock-free row-count mirror right after the
+        // store has been mutated, while we still hold the write
+        // lock. Readers see the new count as soon as the lock drops.
+        let new_count = state.store.row_count();
         if emit_event {
             let event = MutationEvent {
                 row,
@@ -685,6 +701,8 @@ impl Topic {
             self.fanout_view_tap(&event);
         }
         drop(state);
+        self.row_count_mirror
+            .store(new_count, std::sync::atomic::Ordering::Release);
         Ok((row, seq))
     }
 
@@ -694,7 +712,12 @@ impl Topic {
     /// event (evaluators aren't running yet during recovery).
     fn write_store_replay(&self, values: &[Value], _sequence: u64) -> u32 {
         let mut state = self.state.write();
-        Self::commit_values_locked(&mut state, values)
+        let row = Self::commit_values_locked(&mut state, values);
+        let new_count = state.store.row_count();
+        drop(state);
+        self.row_count_mirror
+            .store(new_count, std::sync::atomic::Ordering::Release);
+        row
     }
 
     /// Extend the `last_touched` Vec to cover `row`, setting the
