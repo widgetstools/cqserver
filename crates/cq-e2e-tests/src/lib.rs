@@ -201,6 +201,42 @@ pub struct ServerOpts {
     /// the historical single-stderr layer is installed (default
     /// behaviour for tests that don't care about sink routing).
     pub logging_sinks: Vec<LogSinkSpec>,
+    /// Replica-reads. When `Some(_)`, the harness writes a
+    /// `[replication]` section to the generated TOML. `None` keeps
+    /// the server in standalone mode (default).
+    pub replication: Option<ReplicationOpts>,
+}
+
+/// Replication config for the e2e harness. Mirrors
+/// `cq_server::config::ReplicationConfig` but without the dependency
+/// on the cq-server crate (which the e2e crate doesn't pull in).
+#[derive(Clone, Debug)]
+pub struct ReplicationOpts {
+    /// "primary" / "standby" / "standalone"
+    pub role: String,
+    /// `host:port` of the standby's replication listener (required
+    /// when role = "primary").
+    pub peer: Option<String>,
+    /// Listen `host:port` for the standby's replication acceptor
+    /// (required when role = "standby").
+    pub listen: Option<String>,
+}
+
+impl ReplicationOpts {
+    pub fn standby(listen: impl Into<String>) -> Self {
+        Self {
+            role: "standby".into(),
+            peer: None,
+            listen: Some(listen.into()),
+        }
+    }
+    pub fn primary(peer: impl Into<String>) -> Self {
+        Self {
+            role: "primary".into(),
+            peer: Some(peer.into()),
+            listen: None,
+        }
+    }
 }
 
 /// S25 sink spec used by the e2e harness.
@@ -427,6 +463,7 @@ impl Default for ServerOpts {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         }
     }
 }
@@ -809,6 +846,20 @@ fn build_toml(
         }
         writeln!(out).unwrap();
     }
+
+    // Replica-reads: emit [replication] when configured.
+    if let Some(repl) = &opts.replication {
+        writeln!(out, "[replication]").unwrap();
+        writeln!(out, r#"role = "{}""#, repl.role).unwrap();
+        if let Some(peer) = &repl.peer {
+            writeln!(out, r#"peer = "{peer}""#).unwrap();
+        }
+        if let Some(listen) = &repl.listen {
+            writeln!(out, r#"listen = "{listen}""#).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
     out
 }
 

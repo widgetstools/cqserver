@@ -27,6 +27,7 @@ async fn tls_publish_and_sow_roundtrip() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;

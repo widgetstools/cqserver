@@ -53,6 +53,7 @@ async fn row_filter_restricts_alice_to_rates_desk() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;

@@ -101,6 +101,7 @@ async fn slow_consumer_drops_are_observable() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;
@@ -166,6 +167,7 @@ async fn admin_delete_subscription_disconnects_slow_consumer() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;
@@ -244,6 +246,7 @@ async fn auto_disconnect_kicks_in_when_drops_exceed_threshold() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;

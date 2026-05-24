@@ -28,6 +28,7 @@ async fn dlq_routes_messages_after_max_delivery_exceeded() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;

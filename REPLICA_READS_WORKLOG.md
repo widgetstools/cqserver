@@ -151,40 +151,51 @@ the reconnect behaviour.
 
 ---
 
-### S3 — Operator docs + 1-leader-2-followers e2e test
+### S3a — Operator docs + follower-mode e2e — ✅ done
 
-**Goal.** Make the deployment story executable end-to-end and
-write down how to run it in production.
+**What landed.**
+- `docs/deploy/replica-reads.md` — full operator runbook covering
+  architecture, leader/follower TOML, L4 LB configs (HAProxy,
+  nginx stream, AWS NLB), monitoring + alerting, failure modes
+  (leader down, follower down, partition, cold-start).
+- `cq-e2e-tests::ReplicationOpts` + `ServerOpts.replication` —
+  harness support for spawning a server with a `[replication]`
+  block.
+- `crates/cq-e2e-tests/tests/replica_reads.rs` — 3 e2e tests:
+  1. `standby_rejects_publish_with_read_only_error` — verifies a
+     `role = standby` server returns the expected error to a real
+     wire-level publish through the SDK.
+  2. `standby_publish_rejected_metric_increments` — verifies the
+     `cq_publish_rejected_read_only_total` counter advances.
+  3. `standby_subscribe_still_works` — verifies the read path
+     remains functional on a follower.
 
-**Files touched:**
-- `docs/deploy/replica-reads.md` — new. Cover:
-  - Architecture diagram (leader, followers, LB, clients)
-  - TOML fragments for `role = primary` and `role = standby`
-  - Example L4 LB configs: HAProxy `mode tcp`, nginx `stream`,
-    AWS NLB target group
-  - Monitoring expectations: which metrics to scrape from
-    `/admin/replication` and what alerts to set on lag
-  - Failure modes: leader down, follower down, network partition,
-    cold-start a fresh follower
-- `crates/cq-e2e-tests/tests/replica_reads.rs` — new. Spawns:
-  - 1 leader on dynamic ports
-  - 2 followers configured to receive from the leader
-  - Publishes a known sequence of mutations on the leader
-  - Subscribes via both followers, asserts SOW + live deltas match
-    byte-for-byte
-  - Kills one follower mid-stream, asserts the other still serves
+### S3b — Multi-instance state-convergence e2e — ⏳ deferred to a follow-up session
 
-**Test plan:**
-- The new e2e test itself is the test plan; CI green = done.
-- Doc review: manually walk a fresh reader through the deploy guide
-  on a Linux box, see that the topology comes up.
+**Why deferred.** The bigger e2e originally planned for S3 (spawn
+1 leader + 2 followers, publish on leader, observe SOW + deltas
+on both followers, kill one mid-stream and verify the other still
+serves) depends on:
+- Confirming the existing `cq-replication::shipper` works through
+  the harness subprocess boundary (no e2e tests currently exercise
+  it; only unit/integration tests against in-process topics).
+- Coordinating dynamic ports so the primary's `peer` setting
+  matches the standby's `listen` setting at boot.
+- Time-bounded waits for replication lag to settle before assertions.
 
-**Definition of done:**
-- `cargo test -p cq-e2e-tests replica_reads` passes locally.
-- `docs/deploy/replica-reads.md` exists and is linked from the main
-  README's "Operations" section.
+Each of those is plausible but warrants careful test-isolation
+work — flaky multi-process e2e tests are worse than no test at
+all. Tracking as a separate session.
 
-**Estimated effort:** ~1 day.
+**Sketch for S3b:**
+1. Add `ReplicationOpts::primary(peer)` already done; use it.
+2. Spawn leader first, observe its `replication.peer` port.
+3. Spawn follower with `replication.listen = <port>`.
+4. Wait for `cq_repl_connect_total` to advance to 1 on the leader.
+5. Publish a known row on leader; subscribe to follower; assert
+   the row appears.
+6. Kill follower; verify leader's `cq_repl_reconnect_total`
+   advances. Restart follower; verify state catches up.
 
 ---
 
@@ -203,6 +214,7 @@ keep momentum.
 | S2a | `Client::connect_any` initial-connect failover | ✅ done — random-order multi-URI connect (stdlib-only shuffle, no `rand` dep). Tests in `connect_any.rs`. |
 | S2b | Live reconnect-on-loss | ⏳ deferred to follow-up session |
 | S2c | TypeScript client mirror | ⏳ deferred (do after S2b) |
-| S3 | Operator docs + e2e test | ⏳ pending |
+| S3a | Operator docs + follower-mode e2e | ✅ done — `docs/deploy/replica-reads.md`, harness `ReplicationOpts`, 3 e2e tests in `replica_reads.rs`. |
+| S3b | Multi-instance state-convergence e2e | ⏳ deferred (depends on confirming shipper through subprocess boundary) |
 
 (Update this table at the end of each session.)

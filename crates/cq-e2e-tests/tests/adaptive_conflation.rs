@@ -75,6 +75,7 @@ async fn adaptive_conflation_widens_under_pressure() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;

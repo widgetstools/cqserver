@@ -25,6 +25,7 @@ async fn compressed_archive_segments_replay_on_restart() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;

@@ -48,6 +48,7 @@ async fn sow_arrives_as_chunked_batch_frames() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
     };
     let server = start_server_with(vec![topic], opts).await;
 

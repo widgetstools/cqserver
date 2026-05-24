@@ -21,6 +21,7 @@ async fn queue_lease_redelivers_to_other_consumer() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;
@@ -87,6 +88,7 @@ async fn queue_ack_prevents_redelivery() {
             views: Vec::new(),
             spillover: None,
             logging_sinks: Vec::new(),
+            replication: None,
         },
     )
     .await;
