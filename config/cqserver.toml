@@ -9,8 +9,11 @@ admin_addr = "0.0.0.0:8085"
 # on send) and won't drop even when this is exceeded — sizing this is
 # about steady-state burst headroom. Live deltas still try_send and drop
 # if a subscriber falls behind; tune up for slow consumers or wide rows.
+# H1: 16384 was a backstop; 2048 is plenty given the await-based
+# backpressure on the SOW path. Cuts per-session memory ~8x at high
+# subscriber counts.
 [transport]
-outbound_queue_capacity = 16384
+outbound_queue_capacity = 2048
 
 # ===== Fixed-income demo topics =====
 #

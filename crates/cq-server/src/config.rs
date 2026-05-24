@@ -179,7 +179,11 @@ impl Default for TransportConfig {
 }
 
 fn default_outbound_queue_capacity() -> usize {
-    8192
+    // H1: dropped from 8192 to 2048. See the matching constant in
+    // `crates/cq-transport/src/session.rs::DEFAULT_OUTBOUND_QUEUE_CAPACITY`
+    // for rationale — short version is that 8K per-session was the
+    // dominant per-sub memory at high N.
+    2048
 }
 
 fn default_sow_batch_size() -> usize {

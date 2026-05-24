@@ -52,11 +52,18 @@ pub(crate) fn now_ms() -> u64 {
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default per-session outbound queue depth. Overridable from
-/// `[transport].outbound_queue_capacity` in `cqserver.toml`. Sized so a
-/// typical SOW burst absorbs without backpressure; the SOW path uses
-/// `send().await` and so won't drop even when this is exceeded, but
-/// live-delta `try_send` still drops on full.
-pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 8192;
+/// `[transport].outbound_queue_capacity` in `cqserver.toml`.
+///
+/// H1: dropped from 8192 to 2048. At high subscriber counts (2K+),
+/// each session's pre-allocated mpsc was the dominant per-sub
+/// memory cost — 8K × Vec<OutboundFrame>-slot was ~32 KB per session
+/// before any traffic flowed. 2K cuts that to ~8 KB, which is more
+/// than enough headroom for a typical SOW burst given the streaming
+/// SOW path uses `send().await` for natural backpressure. Slow
+/// consumers still get the same drop semantics on live-delta
+/// `try_send`. Operators with bursty workloads can dial it back up
+/// in TOML.
+pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 2048;
 
 /// Default rows packed per outbound `sow_batch` frame on the
 /// streaming SOW path. Overridable from `[transport].sow_batch_size`.
