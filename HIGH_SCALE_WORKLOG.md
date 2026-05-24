@@ -255,4 +255,50 @@ ceiling. Beyond there, H6 is the only honest path.
 
 ## Progress
 
-(empty — sessions start here as they're picked up)
+- 2026-05-24 — **H2 done** (snapshot fanout cache byte cap):
+  `CQSERVER_SNAPSHOT_CACHE_MAX_BYTES` (default 256 MB), oldest-first
+  LRU-style eviction, new `cq_snapshot_cache_bytes` Prometheus gauge.
+  Verified under stress-2k @ 2 000 subs: peak RSS dropped from 10.7 GB
+  (uncapped) to 938 MB (with cap); cache_bytes capped at 241 MB.
+
+- 2026-05-24 — **H1 done** (drop default outbound queue capacity):
+  `DEFAULT_OUTBOUND_QUEUE_CAPACITY` 8192 → 2048, mirrored in
+  `default_outbound_queue_capacity()` and the demo TOML. The
+  streaming SOW path uses await-based backpressure so the queue depth
+  doesn't determine reliability — only burst-absorbing headroom for
+  live deltas. ~3 GB projected savings at 2K fully-opened subs.
+  Adaptive shrinking based on global sub count (the "second half" of
+  H1 as originally scoped) is left for future work — would require
+  plumbing the sub-count atomic through the channel-creation path.
+
+- 2026-05-24 — **H5 done** (bookmark_pause_resume robustness):
+  Original test asserted `count_at_pause < n` immediately after sending
+  the pause RPC. Post-`snapshot-encode-perf` the encoder runs fast
+  enough that all `n=600` rows could arrive before the pause reaches
+  the dispatcher. Rewrite (a) bumps `n` to 6 000 so the queue choke
+  dominates regardless of encode speed, (b) drains to a 600 ms silence
+  to confirm pause took effect rather than racing on count, and (c)
+  prints the race observation as `eprintln!` not an assert. Five
+  consecutive runs pass clean (1.3 s each).
+
+- 2026-05-24 — **H4 deferred** (was: defer SOW snapshot delivery):
+  Premise didn't hold under measurement. The original code already
+  sent the ack BEFORE the snapshot semaphore acquire, so under any
+  workload that didn't fill the outbound queue, the ack was already
+  effectively immediate. A first attempt to make the ack synchronous
+  via `try_send` made things WORSE (silently dropped acks under
+  load → 1 837 / 2 000 timeouts vs 47 with the original code). The
+  47 timeouts in the baseline are runtime-scheduling noise at the
+  scale ceiling, not an ack-ordering bug. Revisit only if a true ack-
+  prioritization mechanism is in scope (separate fast-path channel,
+  not on this branch).
+
+- 2026-05-24 — **H3 deferred** (was: permessage-deflate WS compression):
+  `tokio-tungstenite` 0.24 has no `deflate` feature and the upstream
+  `tungstenite` crate doesn't support permessage-deflate natively.
+  Options: switch the WS dependency to `fastwebsockets` (large
+  refactor, touches the entire WS connection lifecycle) or implement
+  RFC 7692 on top of `tungstenite` by hand (several hundred lines of
+  protocol-correct code + tests). Neither is the one-day estimate
+  from the original scoping. Revisit if WS compression becomes a
+  product requirement.
