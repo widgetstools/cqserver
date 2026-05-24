@@ -56,6 +56,12 @@ use tokio::sync::Notify;
 struct CachedSnapshot {
     batches: Arc<Vec<Vec<Vec<u8>>>>,
     expires_at: Instant,
+    /// Inserted-at — used by the byte-cap evictor to pick the
+    /// oldest entry when over budget.
+    inserted_at: Instant,
+    /// Total byte size of every Vec<u8> in `batches`. Cached so we
+    /// don't iterate on every eviction decision.
+    bytes: usize,
 }
 
 enum SnapshotCacheState {
@@ -79,6 +85,81 @@ fn snapshot_cache_ttl() -> Duration {
         .and_then(|s| s.parse().ok())
         .unwrap_or(500);
     Duration::from_millis(ms)
+}
+
+/// Maximum total bytes the snapshot cache may hold across all
+/// entries. When inserting a new entry would push the total over the
+/// cap, the evictor drops the oldest entries until it fits. Tuned via
+/// `CQSERVER_SNAPSHOT_CACHE_MAX_BYTES`; default 256 MB. Bounding by
+/// bytes (rather than by entry count) keeps a single wide-row
+/// snapshot from monopolizing the cache.
+fn snapshot_cache_max_bytes() -> usize {
+    std::env::var("CQSERVER_SNAPSHOT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256 * 1024 * 1024)
+}
+
+/// Compute total bytes occupied by a snapshot. `Vec<Vec<Vec<u8>>>`
+/// → sum of inner Vec<u8> lengths. Ignores per-Vec heap overhead;
+/// content bytes dominate.
+fn snapshot_byte_size(batches: &[Vec<Vec<u8>>]) -> usize {
+    batches.iter().flatten().map(|r| r.len()).sum()
+}
+
+/// Walk every Ready entry, sum their `bytes`, and return the total.
+/// Holds the cache lock; cheap (a few dozen entries at most).
+fn current_cache_bytes(
+    cache: &StdHashMap<(String, String), SnapshotCacheState>,
+) -> usize {
+    cache
+        .values()
+        .filter_map(|s| match s {
+            SnapshotCacheState::Ready(snap) => Some(snap.bytes),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Evict expired + oldest-inserted entries until `current_bytes +
+/// incoming <= cap`. Returns nothing; caller has the lock and
+/// decides what to do if the incoming alone exceeds the cap (we
+/// don't refuse the insert — a single oversized snapshot is still
+/// a cache hit for sibling subs).
+fn evict_for_budget(
+    cache: &mut StdHashMap<(String, String), SnapshotCacheState>,
+    incoming_bytes: usize,
+    cap: usize,
+) {
+    // Step 1: drop expired Ready entries unconditionally.
+    let now = Instant::now();
+    let expired: Vec<(String, String)> = cache
+        .iter()
+        .filter_map(|(k, v)| match v {
+            SnapshotCacheState::Ready(s) if s.expires_at <= now => Some(k.clone()),
+            _ => None,
+        })
+        .collect();
+    for k in expired {
+        cache.remove(&k);
+    }
+    // Step 2: while still over budget, drop the oldest Ready entry.
+    while current_cache_bytes(cache) + incoming_bytes > cap {
+        let oldest_key = cache
+            .iter()
+            .filter_map(|(k, v)| match v {
+                SnapshotCacheState::Ready(s) => Some((k.clone(), s.inserted_at)),
+                _ => None,
+            })
+            .min_by_key(|(_, t)| *t)
+            .map(|(k, _)| k);
+        match oldest_key {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break, // nothing more to evict; incoming will be over budget on its own
+        }
+    }
 }
 
 /// Try to satisfy a snapshot request from the cache. Returns
@@ -128,22 +209,38 @@ async fn try_get_or_wait_snapshot(
 
 /// Publish the just-built snapshot into the cache so waiters wake up
 /// and subsequent arrivals within the TTL hit the cached copy.
+/// Enforces `CQSERVER_SNAPSHOT_CACHE_MAX_BYTES` — when the incoming
+/// snapshot would push total cache bytes over the cap, the oldest
+/// Ready entries are evicted to make room. Concurrent waiters on
+/// the same key are notified regardless of eviction outcome.
 fn publish_snapshot_to_cache(topic: &str, sql: &str, batches: Arc<Vec<Vec<Vec<u8>>>>) {
     let key = (topic.to_string(), sql.to_string());
-    let expires_at = Instant::now() + snapshot_cache_ttl();
+    let now = Instant::now();
+    let expires_at = now + snapshot_cache_ttl();
+    let bytes = snapshot_byte_size(&batches);
+    let cap = snapshot_cache_max_bytes();
+
     let mut cache = snapshot_fanout_cache().lock();
+    // Wake any Building waiters BEFORE eviction — they may belong
+    // to a key we're about to evict in extreme cases, but it's
+    // their notify channel we hold.
     let notify_to_wake = match cache.get(&key) {
         Some(SnapshotCacheState::Building(n)) => Some(n.clone()),
         _ => None,
     };
+    evict_for_budget(&mut cache, bytes, cap);
     cache.insert(
         key,
         SnapshotCacheState::Ready(CachedSnapshot {
             batches,
             expires_at,
+            inserted_at: now,
+            bytes,
         }),
     );
+    let total_after = current_cache_bytes(&cache);
     drop(cache);
+    metrics::gauge!("cq_snapshot_cache_bytes").set(total_after as f64);
     if let Some(n) = notify_to_wake {
         n.notify_waiters();
     }
