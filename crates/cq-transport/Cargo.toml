@@ -29,6 +29,14 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 jsonwebtoken.workspace = true
 
+# H3 (measurement): zstd-compute compressed size of each cached
+# snapshot so operators can see what WS-level deflate would buy.
+# Actual wire compression on Rust 1.78 requires switching the WS
+# library — verified that tokio-tungstenite 0.24-0.29 and
+# tokio-websockets 0.8.x have no deflate support. This gauge lets
+# us decide whether the lib swap is worth pursuing.
+zstd.workspace = true
+
 [dev-dependencies]
 compact_str.workspace = true
 tempfile.workspace = true

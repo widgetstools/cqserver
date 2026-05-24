@@ -107,6 +107,44 @@ fn snapshot_byte_size(batches: &[Vec<Vec<u8>>]) -> usize {
     batches.iter().flatten().map(|r| r.len()).sum()
 }
 
+/// H3 (measurement): project the snapshot's zstd-compressed size by
+/// compressing a SAMPLE of concatenated rows (not one row at a time
+/// — the dictionary effect from neighboring rows is exactly what
+/// permessage-deflate would exploit on the wire).
+///
+/// Samples up to 200 rows (or all rows in batch 0 if smaller) and
+/// concatenates them with a `\n` separator before compressing. This
+/// is bounded-CPU regardless of snapshot size while capturing the
+/// realistic dictionary effect: identical column names, repeated
+/// string values like book / sector / asset class.
+///
+/// The projection is: `compressed_sample.len() / sample_raw.len() *
+/// total_raw_bytes`. For homogeneous-row workloads (every row in a
+/// snapshot has the same schema and similar value distributions) the
+/// sampled ratio is representative of the whole. Underestimates for
+/// snapshots smaller than the sample; that's fine — the measurement
+/// is most interesting at large scale.
+fn measure_zstd_size(batches: &[Vec<Vec<u8>>]) -> Option<u64> {
+    const SAMPLE_ROW_BUDGET: usize = 200;
+    let mut sample: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut sampled_rows = 0usize;
+    for row in batches.iter().flatten() {
+        if sampled_rows >= SAMPLE_ROW_BUDGET {
+            break;
+        }
+        sample.extend_from_slice(row);
+        sample.push(b'\n');
+        sampled_rows += 1;
+    }
+    if sample.is_empty() {
+        return None;
+    }
+    let compressed = zstd::encode_all(sample.as_slice(), 3).ok()?;
+    let ratio = (compressed.len() as f64) / (sample.len() as f64);
+    let total_raw = snapshot_byte_size(batches) as f64;
+    Some((total_raw * ratio) as u64)
+}
+
 /// Walk every Ready entry, sum their `bytes`, and return the total.
 /// Holds the cache lock; cheap (a few dozen entries at most).
 fn current_cache_bytes(
@@ -219,6 +257,9 @@ fn publish_snapshot_to_cache(topic: &str, sql: &str, batches: Arc<Vec<Vec<Vec<u8
     let expires_at = now + snapshot_cache_ttl();
     let bytes = snapshot_byte_size(&batches);
     let cap = snapshot_cache_max_bytes();
+    // H3: project zstd size before we move `batches` into the
+    // cache entry, since the measurement borrows by reference.
+    let zstd_projection = measure_zstd_size(&batches);
 
     let mut cache = snapshot_fanout_cache().lock();
     // Wake any Building waiters BEFORE eviction — they may belong
@@ -241,6 +282,15 @@ fn publish_snapshot_to_cache(topic: &str, sql: &str, batches: Arc<Vec<Vec<Vec<u8
     let total_after = current_cache_bytes(&cache);
     drop(cache);
     metrics::gauge!("cq_snapshot_cache_bytes").set(total_after as f64);
+    if let Some(zstd_bytes) = zstd_projection {
+        metrics::gauge!("cq_snapshot_cache_bytes_zstd").set(zstd_bytes as f64);
+        let pct = if bytes > 0 {
+            (zstd_bytes as f64) * 100.0 / (bytes as f64)
+        } else {
+            0.0
+        };
+        metrics::gauge!("cq_snapshot_compression_ratio_pct").set(pct);
+    }
     if let Some(n) = notify_to_wake {
         n.notify_waiters();
     }
