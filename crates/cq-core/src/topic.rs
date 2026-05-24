@@ -1296,6 +1296,130 @@ impl Topic {
         Ok(total)
     }
 
+    /// JSON-bytes streaming variant of `query_streaming`. Each emitted
+    /// batch is a `Vec<Vec<u8>>` where every inner `Vec<u8>` is a
+    /// pre-serialized JSON object (one per row). Skips the
+    /// `serde_json::Map<String, Value>` intermediate that
+    /// `query_streaming` builds — eliminates the per-cell String key
+    /// allocation and the HashMap bucket overhead, both of which
+    /// dominate CPU on wide-row topics (e.g. /trades, 865K × 13 cols).
+    ///
+    /// Used by the SOW snapshot delivery path. Where the existing
+    /// `query_streaming` was producing `Vec<Map>` only to immediately
+    /// `serde_json::to_vec` each row downstream, this path skips both
+    /// steps: column-store values → JSON bytes in a single sweep.
+    ///
+    /// Falls back to the materialized executor (and serializes each
+    /// row at the end) when the query requires a full result buffer
+    /// (ORDER BY / LIMIT / GROUP BY / aggregate). Those paths are not
+    /// the wide-row bottleneck so the optimization isn't needed there.
+    pub fn query_streaming_json<F>(
+        &self,
+        sql: &str,
+        batch_size: usize,
+        mut emit: F,
+    ) -> Result<usize, QueryError>
+    where
+        F: FnMut(Vec<Vec<u8>>),
+    {
+        let state = self.state.read();
+        let query = parse_query(sql, &state.schema)?;
+        let needs_full_buffer = !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.is_aggregate()
+            || !query.group_by.is_empty();
+        if needs_full_buffer {
+            // Same shape as query_streaming for the buffered path —
+            // run the executor, drop tombstones, then serialize each
+            // row to bytes. The wide-row CPU win doesn't apply here
+            // (these queries are bounded by group cardinality, not
+            // row count), but we keep the API surface uniform.
+            let mut result = crate::query::execute_query_with_index(
+                &query,
+                &state.store,
+                Some(&state.secondary_index),
+            );
+            let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
+            if !is_aggregate && !self.config.key_fields.is_empty() {
+                let live_rows: std::collections::HashSet<u32> =
+                    state.key_to_row.values().copied().collect();
+                let mut kept = Vec::with_capacity(result.rows.len());
+                for (row_map, src) in
+                    result.rows.into_iter().zip(result.source_rows.iter().copied())
+                {
+                    if live_rows.contains(&src) {
+                        kept.push(row_map);
+                    }
+                }
+                result.rows = kept;
+            }
+            let total = result.rows.len();
+            drop(state);
+            let cap = batch_size.max(1);
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cap);
+            for row in result.rows {
+                let bytes = serde_json::to_vec(&row).unwrap_or_else(|_| b"{}".to_vec());
+                batch.push(bytes);
+                if batch.len() >= cap {
+                    emit(std::mem::replace(&mut batch, Vec::with_capacity(cap)));
+                }
+            }
+            if !batch.is_empty() {
+                emit(batch);
+            }
+            return Ok(total);
+        }
+
+        let proj_indices: Vec<usize> = if query.projection.is_empty() {
+            (0..state.schema.column_count()).collect()
+        } else {
+            query.projection.clone()
+        };
+        let cap = batch_size.max(1);
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cap);
+        let mut total: usize = 0;
+        let candidates = crate::query::plan_candidates(
+            &query,
+            &state.store,
+            Some(&state.secondary_index),
+        );
+        let live_rows: std::collections::HashSet<u32> =
+            state.key_to_row.values().copied().collect();
+        let has_keys = !self.config.key_fields.is_empty();
+        // Reused buffer for the direct-stream encoder. Each row's bytes
+        // are drained into a fresh `Vec<u8>` for the batch; the encoder
+        // appends to this then we `std::mem::take`.
+        let mut row_buf: Vec<u8> = Vec::with_capacity(256);
+        candidates.for_each(|row| {
+            if has_keys && !live_rows.contains(&row) {
+                return;
+            }
+            if !query.predicate.matches(&state.store, row) {
+                return;
+            }
+            row_buf.clear();
+            state
+                .store
+                .write_row_json_projected(row, &proj_indices, &mut row_buf);
+            // Shrink each emitted row's allocation to its actual size
+            // so the eventual `Arc<Vec<u8>>` (for the fanout cache)
+            // doesn't carry over the per-row buffer's capacity.
+            let mut taken = std::mem::take(&mut row_buf);
+            taken.shrink_to_fit();
+            batch.push(taken);
+            row_buf = Vec::with_capacity(256);
+            if batch.len() >= cap {
+                total += batch.len();
+                emit(std::mem::replace(&mut batch, Vec::with_capacity(cap)));
+            }
+        });
+        if !batch.is_empty() {
+            total += batch.len();
+            emit(batch);
+        }
+        Ok(total)
+    }
+
     // ==================== Subscription API ====================
 
     /// Subscribe: compute snapshot, register subscription, seed active set.

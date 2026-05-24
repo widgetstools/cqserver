@@ -1458,34 +1458,6 @@ async fn deliver_streaming_snapshot(
     }
     let _active_guard = ActiveGuard;
 
-    // Streaming iteration runs on a blocking worker so the column
-    // store's read lock and per-row projection don't tie up the async
-    // runtime. Batches flow through a bounded channel that gives us
-    // pipelined backpressure (writer drains as iterator produces).
-    let (batch_tx, mut batch_rx) =
-        tokio::sync::mpsc::channel::<Vec<serde_json::Map<String, serde_json::Value>>>(4);
-    let topic_for_block = topic.clone();
-    let sql_for_block = sql.clone();
-    let topic_label_for_block = topic_label.clone();
-    let iter_handle: tokio::task::JoinHandle<Result<usize, String>> =
-        tokio::task::spawn_blocking(move || {
-            let mut err: Option<String> = None;
-            let total = topic_for_block
-                .query_streaming(&sql_for_block, batch_size, |batch| {
-                    if err.is_some() {
-                        return;
-                    }
-                    if batch_tx.blocking_send(batch).is_err() {
-                        err = Some("consumer dropped".into());
-                    }
-                })
-                .map_err(|e| format!("query error on {}: {}", topic_label_for_block, e))?;
-            if let Some(e) = err {
-                return Err(e);
-            }
-            Ok(total)
-        });
-
     // group_begin carries the row count when known. For the streaming
     // path we don't know it without scanning, so emit it as 0 — the
     // total is reported on group_end via the snapshot-completion log.
@@ -1495,35 +1467,125 @@ async fn deliver_streaming_snapshot(
         }
     }
 
+    // Branch on codec: the JSON path uses `query_streaming_json` which
+    // skips the `serde_json::Map<String, Value>` intermediate, writing
+    // each row directly to a `Vec<u8>` in the columnar encoder. Saves
+    // the per-cell `String` key alloc + HashMap bucket overhead that
+    // dominates CPU on wide-row topics. Non-JSON codecs fall back to
+    // the old `Map`-based path; they have different on-wire
+    // serializations and don't share the win.
     let mut batches_sent: usize = 0;
     let mut rows_sent: usize = 0;
-    while let Some(batch) = batch_rx.recv().await {
-        let n = batch.len();
-        if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, batch)) {
-            if tx.send(f).await.is_err() {
-                tracing::warn!(
-                    session = %session_id,
-                    topic = %topic_label,
-                    rows_sent,
-                    "SOW snapshot aborted — session disconnected"
-                );
+    use cq_protocol::serialization::Codec;
+    let total: usize = if matches!(codec, Codec::Json) {
+        // ── JSON fast path ────────────────────────────────────────
+        let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<Vec<u8>>>(4);
+        let topic_for_block = topic.clone();
+        let sql_for_block = sql.clone();
+        let topic_label_for_block = topic_label.clone();
+        let iter_handle: tokio::task::JoinHandle<Result<usize, String>> =
+            tokio::task::spawn_blocking(move || {
+                let mut err: Option<String> = None;
+                let total = topic_for_block
+                    .query_streaming_json(&sql_for_block, batch_size, |batch| {
+                        if err.is_some() {
+                            return;
+                        }
+                        if batch_tx.blocking_send(batch).is_err() {
+                            err = Some("consumer dropped".into());
+                        }
+                    })
+                    .map_err(|e| {
+                        format!("query error on {}: {}", topic_label_for_block, e)
+                    })?;
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                Ok(total)
+            });
+
+        while let Some(batch) = batch_rx.recv().await {
+            let n = batch.len();
+            if let Some(f) = crate::session::build_sow_batch_json_frame(&sub_id, &batch) {
+                if tx.send(f).await.is_err() {
+                    tracing::warn!(
+                        session = %session_id,
+                        topic = %topic_label,
+                        rows_sent,
+                        "SOW snapshot aborted — session disconnected"
+                    );
+                    return;
+                }
+            }
+            batches_sent += 1;
+            rows_sent += n;
+        }
+
+        match iter_handle.await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                    let _ = tx.send(f).await;
+                }
                 return;
             }
+            Err(_) => return,
         }
-        batches_sent += 1;
-        rows_sent += n;
-    }
+    } else {
+        // ── Slow path for non-JSON codecs (bson, msgpack, fix) ─────
+        let (batch_tx, mut batch_rx) =
+            tokio::sync::mpsc::channel::<Vec<serde_json::Map<String, serde_json::Value>>>(4);
+        let topic_for_block = topic.clone();
+        let sql_for_block = sql.clone();
+        let topic_label_for_block = topic_label.clone();
+        let iter_handle: tokio::task::JoinHandle<Result<usize, String>> =
+            tokio::task::spawn_blocking(move || {
+                let mut err: Option<String> = None;
+                let total = topic_for_block
+                    .query_streaming(&sql_for_block, batch_size, |batch| {
+                        if err.is_some() {
+                            return;
+                        }
+                        if batch_tx.blocking_send(batch).is_err() {
+                            err = Some("consumer dropped".into());
+                        }
+                    })
+                    .map_err(|e| {
+                        format!("query error on {}: {}", topic_label_for_block, e)
+                    })?;
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                Ok(total)
+            });
 
-    // Wait for the iterator to finish — surfaces any query error.
-    let total = match iter_handle.await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
-                let _ = tx.send(f).await;
+        while let Some(batch) = batch_rx.recv().await {
+            let n = batch.len();
+            if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, batch)) {
+                if tx.send(f).await.is_err() {
+                    tracing::warn!(
+                        session = %session_id,
+                        topic = %topic_label,
+                        rows_sent,
+                        "SOW snapshot aborted — session disconnected"
+                    );
+                    return;
+                }
             }
-            return;
+            batches_sent += 1;
+            rows_sent += n;
         }
-        Err(_) => return,
+
+        match iter_handle.await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                    let _ = tx.send(f).await;
+                }
+                return;
+            }
+            Err(_) => return,
+        }
     };
 
     if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
