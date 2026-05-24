@@ -101,37 +101,53 @@ publisher learns immediately.
 
 ---
 
-### S2 — Multi-URI client with random-order failover
+### S2a — Initial-connect failover (`Client::connect_any`) — ✅ done
 
-**Goal.** `Client::connect_any(&[uri1, uri2, uri3, ...])` that picks
-a URI at random (load-spreading across many simultaneous clients),
-tries it, and on disconnect picks another. Same model AMPS HAClient
-uses; no directory service required.
+**Goal.** `Client::connect_any(&[uri1, uri2, uri3, ...])` tries the
+URLs in randomized order and returns the first successful client.
+This is the foundational primitive for any multi-follower deployment
+— without it, every client would hammer the first URL in the list.
 
-**Files touched:**
-- `crates/cq-client/src/lib.rs` (or wherever `connect` lives) — new
-  `connect_any` method.
-- `crates/cq-client/src/reconnect.rs` (new or existing) — reconnect
-  loop with exponential backoff, capped retries.
-- `clients/ts/src/cq-client.ts` — mirror in the TypeScript client
-  (config takes `urls?: string[]` instead of `url: string`).
+**What landed.**
+- `crates/cq-client/src/client.rs::connect_any` and
+  `::connect_any_with(urls, cfg)`.
+- `shuffled_indices(n)` helper — stdlib-only xorshift Fisher-Yates
+  seeded from process clock + a stack-ish address; no `rand` dep.
+- Unit tests: permutation invariant, edge cases (n=0, n=1), and a
+  variability sanity check.
+- Integration tests in `crates/cq-client/tests/connect_any.rs`:
+  - all-dead URL list returns an error (no hang, no panic)
+  - one-live + one-dead succeeds across multiple runs (catches a
+    bug in either ordering path)
+  - empty URL list returns InvalidUrl
 
-**Test plan:**
-- Rust unit test: stub two listeners, one refuses, one accepts;
-  `connect_any` lands on the accepting one. Random-order means the
-  test must accept either order being tried first.
-- Rust integration test: spawn two listeners, connect, kill the one
-  the client landed on, assert the client reconnects to the other
-  within a deadline.
-- TS test: same shape, jest + mock servers.
+### S2b — Live reconnect-on-loss — ⏳ deferred to a follow-up session
 
-**Definition of done:**
-- All cq-client tests green.
-- Both Rust + TS clients accept a multi-URI list.
-- Manual smoke: start leader + 2 followers, connect via multi-URI,
-  kill one follower, observe seamless failover.
+**Why deferred.** The existing `Client::spawn(transport, cfg)` is
+single-shot: the driver loop ends when the transport dies and the
+client becomes unusable. Adding "reconnect on disconnect" requires
+restructuring the driver to be re-entrant and re-subscribing the
+client's active subscriptions against the new socket — that's a
+larger and riskier change than the connect-any primitive and
+deserves its own session with its own test plan.
 
-**Estimated effort:** ~1 day.
+**Sketch for S2b:**
+- Wrap the driver loop in a supervisor that, on transport-EOF or
+  IO error, restarts using the stored `connect_any` URL list.
+- Maintain a record of active subscriptions (topic + filter/sql +
+  options) so they can be re-issued after reconnect.
+- Surface a "reconnecting" state on the public Client so application
+  code can pause publishes that would queue indefinitely.
+- Test: spawn 2 listeners, connect, kill the one the client landed
+  on, assert subs continue to deliver via the other within a
+  deadline.
+
+### S2c — TypeScript client mirror — ⏳ deferred to a follow-up session
+
+Mirror `connectAny(urls)` in `clients/ts/src/cq-client.ts`. Same
+random-order initial-connect semantics. Tests with jest + mock
+servers. Done after S2b so we can choose whether to also mirror
+the reconnect behaviour.
 
 ---
 
@@ -184,7 +200,9 @@ keep momentum.
 | # | Session | Status |
 |---|---|---|
 | S1 | Read-only server mode | ✅ done — `read_only` flag on `RouterContext`, fired before topic lookup, `Standby` role wires it via `WsConfig`/`TcpConfig`. Test: `tcp::tests::tcp_read_only_rejects_publish`. |
-| S2 | Multi-URI client + reconnect | ⏳ pending |
+| S2a | `Client::connect_any` initial-connect failover | ✅ done — random-order multi-URI connect (stdlib-only shuffle, no `rand` dep). Tests in `connect_any.rs`. |
+| S2b | Live reconnect-on-loss | ⏳ deferred to follow-up session |
+| S2c | TypeScript client mirror | ⏳ deferred (do after S2b) |
 | S3 | Operator docs + e2e test | ⏳ pending |
 
 (Update this table at the end of each session.)

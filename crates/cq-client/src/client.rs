@@ -95,6 +95,44 @@ impl Client {
         Ok(Self::spawn(transport, cfg))
     }
 
+    /// Replica-reads S2: connect to any one of `urls`, trying them in
+    /// a randomized order. The first successful connection wins; if
+    /// they all fail, returns the last error.
+    ///
+    /// Randomization matters when many clients start simultaneously:
+    /// without it every client would hammer the first URL and only
+    /// fail over when it dies, defeating the load-spread purpose.
+    /// The shuffle here is process-time-seeded — not cryptographically
+    /// random but more than sufficient to spread N clients across M
+    /// followers when N >> M.
+    ///
+    /// This is *initial-connect* failover only. Live reconnect after
+    /// a mid-stream disconnect is a separate concern handled by the
+    /// reconnect layer (see worklog S2b — not yet shipped).
+    pub async fn connect_any(urls: &[&str]) -> ClientResult<Self> {
+        Self::connect_any_with(urls, ClientConfig::default()).await
+    }
+
+    pub async fn connect_any_with(urls: &[&str], cfg: ClientConfig) -> ClientResult<Self> {
+        if urls.is_empty() {
+            return Err(ClientError::InvalidUrl(
+                "connect_any: empty url list".into(),
+            ));
+        }
+        let order = shuffled_indices(urls.len());
+        let mut last_err: Option<ClientError> = None;
+        for i in order {
+            match Self::connect_with(urls[i], cfg.clone()).await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    tracing::debug!(url = urls[i], error = %e, "connect_any: attempt failed");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("urls non-empty so at least one attempt ran"))
+    }
+
     /// Connect over TLS. `addr` is `host:port`; `server_name` is the
     /// SNI value the client presents and the cert is validated against;
     /// `client_config` is built via
@@ -990,5 +1028,76 @@ fn handle_inbound(
         _ => {
             tracing::debug!(?msg.command, "unhandled inbound command");
         }
+    }
+}
+
+/// Return `0..n` in a randomized order. Process-time-seeded xorshift —
+/// not crypto-grade, but sufficient to spread N clients across M
+/// follower URLs in `connect_any`. Pure stdlib so cq-client doesn't
+/// need to pull in `rand`.
+fn shuffled_indices(n: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..n).collect();
+    if n < 2 {
+        return idx;
+    }
+    let mut s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+        .wrapping_add(idx.as_ptr() as u64); // mix in a stack-ish address
+    if s == 0 {
+        s = 1;
+    }
+    // Fisher-Yates with a tiny xorshift PRNG.
+    for i in (1..n).rev() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let j = (s as usize) % (i + 1);
+        idx.swap(i, j);
+    }
+    idx
+}
+
+#[cfg(test)]
+mod shuffle_tests {
+    use super::shuffled_indices;
+
+    #[test]
+    fn shuffled_indices_returns_permutation() {
+        for n in 1..=8 {
+            let idx = shuffled_indices(n);
+            assert_eq!(idx.len(), n);
+            let mut sorted = idx.clone();
+            sorted.sort();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn shuffled_indices_empty_and_single_are_identity() {
+        assert_eq!(shuffled_indices(0), Vec::<usize>::new());
+        assert_eq!(shuffled_indices(1), vec![0]);
+    }
+
+    #[test]
+    fn shuffled_indices_actually_varies() {
+        // Across many calls we should see at least one non-identity
+        // permutation. (Time-seeded so close calls can collide, but
+        // 50 calls with a 5-elt array essentially never all match
+        // identity in practice.)
+        let mut saw_non_identity = false;
+        for _ in 0..50 {
+            let idx = shuffled_indices(5);
+            if idx != vec![0, 1, 2, 3, 4] {
+                saw_non_identity = true;
+                break;
+            }
+            // Small spin to advance the clock between calls.
+            for _ in 0..1000 {
+                std::hint::spin_loop();
+            }
+        }
+        assert!(saw_non_identity, "shuffle never varied across 50 calls");
     }
 }
