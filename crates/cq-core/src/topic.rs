@@ -1314,8 +1314,23 @@ impl Topic {
         sparse: bool,
     ) -> Result<ParsedQuery, QueryError> {
         let state = self.state.read();
-        let query = parse_query(sql, &state.schema)?;
-        let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
+        let mut query = parse_query(sql, &state.schema)?;
+        // PIVOT queries are re-evaluated on every mutation the same way
+        // GROUP BY aggregates are — the executor (`execute_pivot_query`)
+        // is keyed by anchor columns and the resulting rows have one
+        // entry per anchor key. We borrow the aggregating evaluator's
+        // diff machinery by seeding `query.group_by` with the pivot's
+        // anchor columns; the dispatch in
+        // `execute_query_with_index_filtered` checks `query.pivot`
+        // first, so SQL routing still hits the pivot executor — only
+        // the live-evaluator diff path uses the synthetic group_by.
+        if let Some(pivot) = &query.pivot {
+            if query.group_by.is_empty() {
+                query.group_by = pivot.anchor_cols.clone();
+            }
+        }
+        let is_aggregate =
+            query.is_aggregate() || !query.group_by.is_empty() || query.pivot.is_some();
         let captured = self.next_sequence.load(Ordering::SeqCst);
         let mut engine = self.sub_engine.lock();
         let mut sub =
@@ -1324,8 +1339,9 @@ impl Topic {
             sub = sub.into_sparse(state.key_col_indices.clone());
         }
         if is_aggregate {
-            // Aggregate subs need a seed snapshot for `last_emitted`.
-            // Cardinality is bounded by GROUP BY, not row count.
+            // Aggregate/PIVOT subs need a seed snapshot for
+            // `last_emitted`. Cardinality is bounded by GROUP BY (or by
+            // distinct anchor keys for PIVOT), not by row count.
             let result = execute_query(&query, &state.store);
             let mut sub_with_agg = sub.into_aggregating();
             let group_names: Vec<String> = sub_with_agg
