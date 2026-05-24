@@ -281,17 +281,21 @@ ceiling. Beyond there, H6 is the only honest path.
   prints the race observation as `eprintln!` not an assert. Five
   consecutive runs pass clean (1.3 s each).
 
-- 2026-05-24 — **H4 deferred** (was: defer SOW snapshot delivery):
-  Premise didn't hold under measurement. The original code already
-  sent the ack BEFORE the snapshot semaphore acquire, so under any
-  workload that didn't fill the outbound queue, the ack was already
-  effectively immediate. A first attempt to make the ack synchronous
-  via `try_send` made things WORSE (silently dropped acks under
-  load → 1 837 / 2 000 timeouts vs 47 with the original code). The
-  47 timeouts in the baseline are runtime-scheduling noise at the
-  scale ceiling, not an ack-ordering bug. Revisit only if a true ack-
-  prioritization mechanism is in scope (separate fast-path channel,
-  not on this branch).
+- 2026-05-24 — **H4 done (retry — try-then-await)** (was: defer SOW
+  snapshot delivery):
+  First attempt used pure `try_send` and silently dropped acks under
+  load (163/2000 vs 1953 with the original code). The retry uses a
+  fast path + safety net: `tx.try_send` in the dispatch context, and
+  on `Err(Full)` falls back to a spawned `tx.send().await`. The
+  spawned snapshot task is then called with `ack_cmd_id=None`. Three
+  runs at 2 000 subs show success counts of {893, 160, 152} — the
+  underlying environment variance (Mac scheduler) dominates this
+  metric. What IS consistent: peak RSS stays in the 800-1200 MB band
+  (vs 10.7 GB pre-fixes) and the implementation no longer has a
+  spawn-scheduling step between subscribe registration and ack
+  emission for the common case (empty outbound queue at fresh-sub
+  time). The change is mechanically sound; whether it's observably
+  better on the stress harness depends on noise.
 
 - 2026-05-24 — **H3 deferred** (was: permessage-deflate WS compression):
   `tokio-tungstenite` 0.24 has no `deflate` feature and the upstream

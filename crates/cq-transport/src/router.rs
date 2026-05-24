@@ -976,24 +976,66 @@ fn handle_sow_and_subscribe(
                 metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
                     .increment(1.0);
 
-                // The subscription is now registered + the engine's
-                // active_set is seeded (via `subscribe_register`). Wire
-                // delivery uses `query_streaming` so no materialized
-                // snapshot is ever held in memory.
+                // H4: ack-first, fast path + safety net.
+                //
+                // The previous wiring sent the ack from INSIDE the
+                // spawned `deliver_streaming_snapshot` via
+                // `tx.send().await`. That works but adds a
+                // tokio-spawn scheduling step between
+                // `subscribe_register` and the ack going on the
+                // wire. Under heavy concurrent subscribe pressure
+                // (1000+ pending spawns) that scheduling step can
+                // add seconds before the ack hits the client.
+                //
+                // The fix: in the dispatch context, try_send the
+                // ack synchronously (instant for the common case of
+                // an empty/near-empty outbound queue). On a full
+                // queue, fall back to a spawned awaited send so we
+                // never silently drop. The spawned snapshot task is
+                // then called with `ack_cmd_id=None` because the
+                // ack is already handled.
+                {
+                    let mut ack = CqMessage::ack_ok(msg.command_id.clone());
+                    ack.sub_id = Some(sub_id.clone());
+                    let codec = session.codec();
+                    if let Some(frame) = crate::session::encode_frame(codec, &ack) {
+                        match session.tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
+                                // Queue was full at try-time — fall back
+                                // to an awaited send so the ack isn't
+                                // dropped. Runs on a spawned task so the
+                                // dispatch loop is never blocked here.
+                                let tx = session.tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = tx.send(frame).await;
+                                });
+                            }
+                            Err(_) => {
+                                // Channel closed — session is going
+                                // away. The subscribe still succeeded
+                                // server-side; cleanup happens on
+                                // disconnect.
+                            }
+                        }
+                    }
+                }
+
                 let tx = session.tx.clone();
                 let codec_slot = session.codec.clone();
                 let session_id = session.id.clone();
                 let snapshot_sub_id = sub_id.clone();
                 let snapshot_topic = topic_name.clone();
-                let ack_cmd_id = msg.command_id.clone();
                 let batch_size = ctx.sow_batch_size;
                 let topic_for_task = topic.clone();
                 let sql_for_task = snapshot_sql.clone();
                 tokio::spawn(async move {
+                    // ack_cmd_id = None: the ack was sent
+                    // synchronously above.
                     deliver_streaming_snapshot(
                         topic_for_task,
                         sql_for_task,
-                        ack_cmd_id,
+                        None,
                         snapshot_sub_id,
                         snapshot_topic,
                         session_id,
