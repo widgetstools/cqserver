@@ -2,6 +2,7 @@
 name = "cq-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 # Register `cfg(loom)` so `--cfg loom` builds don't trip
 # `unexpected_cfgs`. Required because CI runs with `-D warnings`.

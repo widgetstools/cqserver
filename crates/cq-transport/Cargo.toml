@@ -2,6 +2,7 @@
 name = "cq-transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 cq-protocol = { path = "../cq-protocol" }

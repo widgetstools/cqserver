@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/cq-client",
     "crates/cq-core",
-    "crates/cq-differential-tests",
     "crates/cq-e2e-tests",
     "crates/cq-loadgen",
     "crates/cq-protocol",
@@ -12,11 +11,18 @@ members = [
     "crates/cq-txlog",
     "crates/cq-server",
 ]
+# `cq-differential-tests` is intentionally excluded from the
+# default workspace: DataFusion + Arrow's transitive deps now require
+# edition = "2024" in their Cargo manifests, which cargo < 1.85 cannot
+# parse. The dev harness can still be built/tested in isolation:
+#   `cd crates/cq-differential-tests && cargo test`
+# (using a newer Rust toolchain).
+exclude = ["crates/cq-differential-tests"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.78"
 license = "Apache-2.0"
 
 [workspace.dependencies]
@@ -97,8 +103,12 @@ proptest = "1"
 # (see .github/workflows/ci.yml). Pure Rust (no C/C++ toolchain
 # needed), modern analytical SQL surface, and Arrow-native. The crate
 # only links into `crates/cq-differential-tests`.
-datafusion = { version = "44", default-features = false, features = ["crypto_expressions", "regex_expressions", "unicode_expressions"] }
-arrow = "53"
+# DataFusion + Arrow are only used by `crates/cq-differential-tests/`,
+# which is excluded from the default workspace (it requires cargo 1.85+
+# for edition = "2024" transitives). The version below is what the
+# diff-tests crate uses when built standalone.
+# datafusion = { version = "42", default-features = false, features = ["crypto_expressions", "regex_expressions", "unicode_expressions"] }
+# arrow = "53"
 
 # YAML parser for the differential-tests corpus.
 serde_yaml = "0.9"

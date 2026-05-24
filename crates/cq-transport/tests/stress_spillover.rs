@@ -36,7 +36,7 @@ fn spillover_preserves_order_under_concurrent_write_read() {
                 .expect("write");
             // Tiny natural jitter so the reader sometimes drains
             // faster than we write.
-            if i.is_multiple_of(64) {
+            if i % 64 == 0 {
                 thread::sleep(Duration::from_micros(50));
             }
         }

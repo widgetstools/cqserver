@@ -1,21 +1,22 @@
 [package]
 name = "cq-differential-tests"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
+# DataFusion + Arrow transitives now require edition = "2024", which
+# is unstable in cargo < 1.85. The diff-tests crate is excluded from
+# the workspace and lives standalone for that reason.
+rust-version = "1.85"
 
 [dependencies]
 cq-core = { path = "../cq-core" }
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml = { workspace = true }
-anyhow.workspace = true
-tokio = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
 
-# DataFusion reference engine. Pure Rust, no C toolchain required —
-# builds clean on Windows alongside everything else. Arrow types are
-# exposed directly so we can build RecordBatches without going through
-# DataFusion's own re-export gymnastics.
-datafusion = { workspace = true }
-arrow = { workspace = true }
+# DataFusion reference engine. Pure Rust, no C toolchain required.
+datafusion = { version = "42", default-features = false, features = ["crypto_expressions", "regex_expressions", "unicode_expressions"] }
+arrow = "53"
 
 [dev-dependencies]

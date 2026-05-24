@@ -83,7 +83,7 @@ fn view_converges_under_concurrent_pressure() {
                 publish(&src, &trader, desk, (i as i64 + 1) * 7);
                 // Occasionally delete one of this thread's earlier keys
                 // to exercise the Remove path on the view.
-                if i > 0 && i.is_multiple_of(13) {
+                if i > 0 && i % 13 == 0 {
                     let target = format!("t{}-r{}", tid, i - 1);
                     let _ = src.delete(&target);
                 }
