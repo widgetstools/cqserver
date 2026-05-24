@@ -210,7 +210,26 @@ impact.
 ## H6 — Shard for ≥ 10 K concurrent subs (architectural — separate
 project)
 
-**Status:** ⏭️ Deferred — see plan below
+**Status:** ✅ minimum-viable primitive shipped (H6.1 of 4). H6.2–H6.4
+still future work — see plan below for the full multi-step roadmap.
+
+**What landed (H6.1).**
+- `ServerConfig.shards: Vec<ShardEntry>` static table loaded from TOML,
+  each entry binds a `topic_prefix` to an `instance_url`.
+- `ServerConfig::resolve_shard(topic)` — longest-prefix-match against
+  the table; `None` ⇒ "this instance owns it." Unit-tested.
+- `GET /admin/shard-for/{topic}` — returns the same decision over
+  HTTP, plus a `self` flag indicating whether the matched URL is this
+  instance's own URL. Two unit tests cover the matching cases.
+- `AdminState.self_url` derives from the configured WS (preferred) or
+  TCP address at startup.
+
+This is the smallest possible primitive a future client SDK or
+gateway can call to decide where to connect — no replication, no
+client-side smart-connect, no consistent hashing. It lets operators
+*declare* a sharding scheme in config today; the rest of the
+machinery (replication topology, client smart-connect) is still
+the H6.2–H6.4 project below.
 
 **Problem.** Above ~5 K concurrent subs on a single host, no amount of
 encoder optimization or memory shaving compensates for the fundamental
@@ -277,9 +296,9 @@ scale-out.
 | 1 | H4 — Defer ack from snapshot drain | ✅ done (retry — try-then-await) | mechanically correct; success-count metric noise-dominated on Mac |
 | 2 | H2 — Byte-cap the snapshot cache | ✅ done | **−9.8 GB peak RSS** (10.7 GB → 938 MB) |
 | 3 | H1 — Adaptive outbound queue capacity | ✅ done (flat drop; adaptive shrinking deferred) | per-session pre-alloc 32 KB → 8 KB |
-| 4 | H3 — `permessage-deflate` WS compression | ⏭️ deferred — WS lib has no native support | n/a; plan documented above |
+| 4 | H3 — `permessage-deflate` WS compression | ✅ measured (7× compressible) — lib swap deferred | zstd gauge shows 14.3% ratio on cached snapshots |
 | 5 | H5 — Flaky pause test | ✅ done | 5/5 runs pass clean |
-| 6 | H6 — Shard | ⏭️ deferred — separate-project scope | n/a; 4-step plan documented above |
+| 6 | H6 — Shard | ✅ H6.1 primitive shipped; H6.2–H6.4 still scoped as separate project | static shard table + `/admin/shard-for/:topic` endpoint |
 
 **Single-instance ceiling after H1+H2+H4+H5**: peak RSS bounded to
 ~1 GB under 2 000-sub stress, regardless of cache pressure. The

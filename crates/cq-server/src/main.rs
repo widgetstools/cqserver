@@ -244,10 +244,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_registry = registry.clone();
     let tcp_registry = registry.clone();
 
+    // H6: derive a stable self-URL for shard-routing responses. We
+    // prefer the WS address (most clients) and fall back to TCP. The
+    // value is opaque to the server — clients use it verbatim.
+    let self_url = if !server_config.websocket_addr.is_empty() {
+        format!(
+            "ws://{}{}",
+            server_config.websocket_addr, server_config.websocket_path
+        )
+    } else {
+        format!("tcp://{}", server_config.tcp_addr)
+    };
     let admin_state = AdminState {
         topics: topics.clone(),
         registry: registry.clone(),
         prom: prom_handle,
+        shards: Arc::new(server_config.shards.clone()),
+        self_url: Arc::new(self_url),
     };
     let admin_addr = server_config.admin_addr.clone();
 

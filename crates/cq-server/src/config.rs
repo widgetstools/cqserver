@@ -39,6 +39,49 @@ pub struct ServerConfig {
     /// tracing-subscriber Registry; events are routed by `target`.
     #[serde(default)]
     pub logging: crate::logging::LoggingConfig,
+    /// H6 (minimum viable shard primitive): static topic-prefix →
+    /// instance-URL map. When non-empty, the admin endpoint
+    /// `/admin/shard-for/{topic}` answers with the owning instance's
+    /// URL, letting clients route subscribes to the right node. This
+    /// is the smallest deployable shape of horizontal scale-out and
+    /// does NOT include cross-instance replication or topology
+    /// rebalancing — those are H6.2 / H6.3 / H6.4 in the worklog.
+    /// Empty means "this instance owns everything" (single-node
+    /// default).
+    #[serde(default)]
+    pub shards: Vec<ShardEntry>,
+}
+
+/// One row of the static shard table. The topic-prefix uses
+/// longest-match semantics: a topic named `/trades/us` matches
+/// prefix `/trades/` over `/`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShardEntry {
+    /// Topic prefix to match. Matched against the start of the
+    /// topic name; the longest matching prefix wins.
+    pub topic_prefix: String,
+    /// URL of the instance that owns topics matching this prefix.
+    /// Format: `tcp://host:port` or `ws://host:port/path`.
+    pub instance_url: String,
+}
+
+impl ServerConfig {
+    /// Resolve a topic to its owning instance URL using the configured
+    /// shard table. Returns `None` if no entry matches — the caller
+    /// should treat that as "this instance owns it." Longest-prefix
+    /// match wins; ties broken by config-file order.
+    ///
+    /// Currently invoked only by tests and reserved for future
+    /// in-process replication routing; the admin endpoint inlines
+    /// the same rule against `AdminState.shards`.
+    #[allow(dead_code)]
+    pub fn resolve_shard(&self, topic: &str) -> Option<&str> {
+        self.shards
+            .iter()
+            .filter(|e| topic.starts_with(&e.topic_prefix))
+            .max_by_key(|e| e.topic_prefix.len())
+            .map(|e| e.instance_url.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -502,6 +545,7 @@ impl Default for ServerConfig {
             replication: ReplicationConfig::default(),
             transport: TransportConfig::default(),
             logging: crate::logging::LoggingConfig::default(),
+            shards: Vec::new(),
         }
     }
 }
@@ -621,6 +665,26 @@ mod env_var_tests {
         std::env::remove_var("CQ_TEST_LITERAL");
         let out = substitute_env_vars("hello $WORLD ${CQ_TEST_LITERAL:-x}").unwrap();
         assert_eq!(out, "hello $WORLD x");
+    }
+
+    #[test]
+    fn resolve_shard_longest_prefix_wins() {
+        let cfg = super::ServerConfig {
+            shards: vec![
+                super::ShardEntry {
+                    topic_prefix: "/orders".into(),
+                    instance_url: "ws://a:9000/cqp".into(),
+                },
+                super::ShardEntry {
+                    topic_prefix: "/orders/usd".into(),
+                    instance_url: "ws://b:9000/cqp".into(),
+                },
+            ],
+            ..super::ServerConfig::default()
+        };
+        assert_eq!(cfg.resolve_shard("/orders/usd/aapl"), Some("ws://b:9000/cqp"));
+        assert_eq!(cfg.resolve_shard("/orders/eur/aapl"), Some("ws://a:9000/cqp"));
+        assert_eq!(cfg.resolve_shard("/positions/x"), None);
     }
 
     #[test]

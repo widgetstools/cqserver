@@ -35,6 +35,13 @@ pub struct AdminState {
     pub topics: Arc<DashMap<String, SharedTopic>>,
     pub registry: SessionRegistry,
     pub prom: PrometheusHandle,
+    /// H6: static shard table (topic-prefix → instance URL). Empty
+    /// vec = single-node mode where this instance owns everything.
+    pub shards: Arc<Vec<crate::config::ShardEntry>>,
+    /// H6: URL of *this* instance, returned when no shard entry
+    /// matches. Allows clients to confirm "yes this node owns it"
+    /// without a separate request.
+    pub self_url: Arc<String>,
 }
 
 pub async fn start_admin_server(
@@ -54,6 +61,7 @@ pub async fn start_admin_server(
         .route("/admin/shrink-store/:topic", post(shrink_store))
         .route("/admin/shrink-store-all", post(shrink_store_all))
         .route("/admin/replication", get(replication_status))
+        .route("/admin/shard-for/:topic", get(shard_for))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -275,6 +283,45 @@ async fn replication_status(State(s): State<AdminState>) -> impl IntoResponse {
     }))
 }
 
+/// H6: `GET /admin/shard-for/{topic}` — answer "which instance
+/// owns this topic?" via the static shard table. Returns
+/// `{ "topic": "...", "instance_url": "...", "self": true|false }`.
+/// `self: true` means this instance owns it (caller can use the
+/// current connection); `false` means redirect to `instance_url`.
+///
+/// This is the minimum viable shard primitive — the directory
+/// service (H6.2) layered on a real client SDK call. Real
+/// cross-instance replication (H6.3) and client smart-connect
+/// (H6.4) remain separate worklog items.
+async fn shard_for(
+    State(s): State<AdminState>,
+    Path(topic): Path<String>,
+) -> impl IntoResponse {
+    // Re-resolve via the same longest-prefix rule used in
+    // ServerConfig::resolve_shard, but on the Arc<Vec<ShardEntry>>
+    // we hold here.
+    let matched = s
+        .shards
+        .iter()
+        .filter(|e| topic.starts_with(&e.topic_prefix))
+        .max_by_key(|e| e.topic_prefix.len());
+
+    match matched {
+        Some(entry) => Json(serde_json::json!({
+            "topic": topic,
+            "instance_url": entry.instance_url,
+            "matched_prefix": entry.topic_prefix,
+            "self": entry.instance_url == s.self_url.as_str(),
+        })),
+        None => Json(serde_json::json!({
+            "topic": topic,
+            "instance_url": s.self_url.as_str(),
+            "matched_prefix": serde_json::Value::Null,
+            "self": true,
+        })),
+    }
+}
+
 async fn get_metrics(State(s): State<AdminState>) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -322,6 +369,8 @@ mod tests {
             topics,
             registry: new_registry(),
             prom,
+            shards: Arc::new(Vec::new()),
+            self_url: Arc::new("ws://127.0.0.1:9000/cqp".to_string()),
         };
         Router::new()
             .route("/healthz", get(healthz))
@@ -370,6 +419,69 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].get("name").unwrap(), "/t");
+    }
+
+    fn router_with_shards(shards: Vec<crate::config::ShardEntry>, self_url: &str) -> Router {
+        let topics: Arc<DashMap<String, SharedTopic>> = Arc::new(DashMap::new());
+        let prom = PrometheusBuilder::new().build_recorder().handle();
+        let state = AdminState {
+            topics,
+            registry: new_registry(),
+            prom,
+            shards: Arc::new(shards),
+            self_url: Arc::new(self_url.to_string()),
+        };
+        Router::new()
+            .route("/admin/shard-for/:topic", get(shard_for))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn shard_for_longest_prefix_wins() {
+        let shards = vec![
+            crate::config::ShardEntry {
+                topic_prefix: "/orders".into(),
+                instance_url: "ws://node-a:9000/cqp".into(),
+            },
+            crate::config::ShardEntry {
+                topic_prefix: "/orders/usd".into(),
+                instance_url: "ws://node-b:9000/cqp".into(),
+            },
+        ];
+        let app = router_with_shards(shards, "ws://self:9000/cqp");
+        let res = app
+            .oneshot(
+                Request::get("/admin/shard-for/%2Forders%2Fusd%2Faapl")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.get("instance_url").unwrap(), "ws://node-b:9000/cqp");
+        assert_eq!(v.get("matched_prefix").unwrap(), "/orders/usd");
+        assert_eq!(v.get("self").unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn shard_for_no_match_returns_self() {
+        let app = router_with_shards(Vec::new(), "ws://self:9000/cqp");
+        let res = app
+            .oneshot(
+                Request::get("/admin/shard-for/%2Fanything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.get("instance_url").unwrap(), "ws://self:9000/cqp");
+        assert!(v.get("matched_prefix").unwrap().is_null());
+        assert_eq!(v.get("self").unwrap(), true);
     }
 
     #[tokio::test]
