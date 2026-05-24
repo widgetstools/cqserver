@@ -11,8 +11,29 @@ use cq_core::topic::SharedTopic;
 use cq_protocol::command::Command;
 use cq_protocol::message::CqMessage;
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+/// Cap on concurrent SOW-snapshot encoders. Each `sow_and_subscribe`
+/// against a wide topic kicks off a streaming snapshot that encodes
+/// the full result set as JSON; running too many in parallel saturates
+/// the runtime (the stress-2k harness reproduces this with 8
+/// concurrent PIVOT snapshots over /trades's 865K rows). Excess
+/// requests queue on the semaphore — they don't fail, they just wait
+/// in line. Tuned via the `CQSERVER_MAX_SNAPSHOT_ENCODERS` env var;
+/// default 4.
+fn snapshot_encoder_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let n: usize = std::env::var("CQSERVER_MAX_SNAPSHOT_ENCODERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(4);
+        Semaphore::new(n)
+    })
+}
 
 /// Aggregate of the per-server registries the router consults. Keeps
 /// the dispatch signature small as we add new resource types (topics,
@@ -1412,6 +1433,30 @@ async fn deliver_streaming_snapshot(
             }
         }
     }
+
+    // Snapshot-encoder concurrency cap. Each in-flight snapshot holds
+    // one permit for the duration of `query_streaming + WS drain`.
+    // When the cap is reached, new SOW requests wait here instead of
+    // piling onto the runtime in parallel. Permit is released on
+    // function return (drop scope). Acquisition only fails if the
+    // semaphore was closed — which we never do — so the unwrap is
+    // safe.
+    metrics::gauge!("cq_snapshot_queued").increment(1.0);
+    let _permit = snapshot_encoder_semaphore()
+        .acquire()
+        .await
+        .expect("snapshot semaphore closed");
+    metrics::gauge!("cq_snapshot_queued").decrement(1.0);
+    metrics::gauge!("cq_snapshot_active").increment(1.0);
+    // Decrement on drop so the active count is always accurate even on
+    // early returns.
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            metrics::gauge!("cq_snapshot_active").decrement(1.0);
+        }
+    }
+    let _active_guard = ActiveGuard;
 
     // Streaming iteration runs on a blocking worker so the column
     // store's read lock and per-row projection don't tie up the async

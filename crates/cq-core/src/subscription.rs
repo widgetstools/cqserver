@@ -628,8 +628,10 @@ impl SubscriptionEngine {
     }
 
     /// Remove all subscriptions whose ID starts with a given prefix
-    /// (e.g., session-based cleanup).
-    pub fn remove_by_prefix(&mut self, prefix: &str) {
+    /// (e.g., session-based cleanup). Returns the number removed so
+    /// callers can keep an out-of-band count (Topic's atomic
+    /// `active_subscriptions`) in sync without re-locking the engine.
+    pub fn remove_by_prefix(&mut self, prefix: &str) -> usize {
         let to_drop: Vec<String> = self
             .subscriptions
             .keys()
@@ -640,6 +642,7 @@ impl SubscriptionEngine {
             self.predicate_index.remove(id);
         }
         self.subscriptions.retain(|id, _| !id.starts_with(prefix));
+        to_drop.len()
     }
 
     /// Mark the named subscription as closed without removing it. The

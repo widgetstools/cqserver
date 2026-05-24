@@ -23,4 +23,8 @@ hdrhistogram = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Used by stress-2k for join_all + parallel task join with a single
+# timeout (replaces a serial join loop that could hang for hours).
+futures = "0.3"
+
 [dev-dependencies]

@@ -28,6 +28,11 @@ enum Scenario {
     PublishThroughput,
     /// 1 publisher × N subscribers — stress-plan Scenario D.
     Fanout,
+    /// 2000+ concurrent subscribers spread across four query-complexity
+    /// classes (firehose, WHERE, GROUP BY, static PIVOT). Samples admin
+    /// `/stats` over the measurement window and reports peak / steady
+    /// RSS, connect-time histogram, and per-class delivery throughput.
+    Stress2k,
 }
 
 #[derive(Parser, Debug)]
@@ -54,9 +59,14 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     warmup_secs: f64,
 
-    /// Number of subscribers (used by `fanout` only).
+    /// Number of subscribers (used by `fanout` and `stress-2k`).
+    /// For stress-2k, this is the total across all 4 classes (default 2000).
     #[arg(long, default_value_t = 0)]
     subscribers: usize,
+
+    /// Admin-API URL for /stats polling (stress-2k only).
+    #[arg(long, default_value = "http://127.0.0.1:8085")]
+    admin_url: String,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -70,11 +80,15 @@ async fn main() -> Result<()> {
         publish_rate: args.rate,
         subscribers: args.subscribers,
         warmup: Duration::from_secs_f64(args.warmup_secs),
+        admin_url: args.admin_url,
     };
-    let report = match args.scenario {
-        Scenario::PublishThroughput => scenarios::publish_throughput(&cfg).await?,
-        Scenario::Fanout => scenarios::fanout(&cfg).await?,
+    match args.scenario {
+        Scenario::PublishThroughput => scenarios::publish_throughput(&cfg).await?.print(),
+        Scenario::Fanout => scenarios::fanout(&cfg).await?.print(),
+        Scenario::Stress2k => {
+            // stress2k has its own richer report shape — print directly.
+            scenarios::stress_2k(&cfg).await?.print();
+        }
     };
-    report.print();
     Ok(())
 }

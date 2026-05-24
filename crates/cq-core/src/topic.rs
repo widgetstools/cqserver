@@ -148,6 +148,22 @@ pub struct Topic {
     config: TopicConfig,
     state: RwLock<StoreState>,
     sub_engine: Mutex<SubscriptionEngine>,
+    /// Live subscription count mirrored alongside the engine's
+    /// `subscriptions` map. Updated on every add / remove /
+    /// remove_by_prefix / reap_closed so `subscription_count()` can
+    /// answer in O(1) without taking `sub_engine.lock()`. The admin
+    /// `/stats` handler hammers this on every poll — taking the
+    /// mutex was the dominant source of admin unresponsiveness under
+    /// heavy WS load.
+    active_subscriptions: std::sync::atomic::AtomicUsize,
+    /// Mirror of `state.read().store.row_count()` updated lock-free
+    /// after every successful upsert. The store's own row_count is
+    /// already AtomicU32, but it lives behind the state RwLock —
+    /// admin readers shouldn't have to take that lock just to count
+    /// rows. We update this mirror after the write lock is released,
+    /// so the worst-case staleness is one publish; that's fine for a
+    /// stats endpoint.
+    row_count_mirror: std::sync::atomic::AtomicU32,
     mutation_tx: Sender<MutationEvent>,
     mutation_rx_holder: Mutex<Option<Receiver<MutationEvent>>>,
     /// Secondary fan-out for derived consumers (S20 views). Every
@@ -200,6 +216,8 @@ impl Topic {
             config,
             state: RwLock::new(state),
             sub_engine: Mutex::new(SubscriptionEngine::new()),
+            active_subscriptions: std::sync::atomic::AtomicUsize::new(0),
+            row_count_mirror: std::sync::atomic::AtomicU32::new(0),
             mutation_tx,
             mutation_rx_holder: Mutex::new(Some(mutation_rx)),
             view_taps: Mutex::new(Vec::new()),
@@ -304,11 +322,18 @@ impl Topic {
     }
 
     pub fn row_count(&self) -> u32 {
-        self.state.read().store.row_count()
+        // Lock-free read via the mirror. Worst-case staleness: one
+        // publish lag, which the admin endpoint can tolerate.
+        self.row_count_mirror
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Live subscription count. Reads an atomic — does not lock the
+    /// subscription engine. Safe to call from the admin endpoint
+    /// while a data-path thread holds `sub_engine.lock()`.
     pub fn subscription_count(&self) -> usize {
-        self.sub_engine.lock().count()
+        self.active_subscriptions
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn conflation_ms(&self) -> Option<u64> {
@@ -547,7 +572,7 @@ impl Topic {
         // Subscriptions hold ParsedQuery with pre-resolved column indices
         // against the placeholder schema — installing a new schema would
         // invalidate them. Refuse and keep the placeholder.
-        if self.sub_engine.lock().count() > 0 {
+        if self.subscription_count() > 0 {
             return;
         }
 
@@ -661,6 +686,10 @@ impl Topic {
             }
         }
         let row = Self::commit_values_locked(&mut state, &values);
+        // Refresh the lock-free row-count mirror right after the
+        // store has been mutated, while we still hold the write
+        // lock. Readers see the new count as soon as the lock drops.
+        let new_count = state.store.row_count();
         if emit_event {
             let event = MutationEvent {
                 row,
@@ -672,6 +701,8 @@ impl Topic {
             self.fanout_view_tap(&event);
         }
         drop(state);
+        self.row_count_mirror
+            .store(new_count, std::sync::atomic::Ordering::Release);
         Ok((row, seq))
     }
 
@@ -681,7 +712,12 @@ impl Topic {
     /// event (evaluators aren't running yet during recovery).
     fn write_store_replay(&self, values: &[Value], _sequence: u64) -> u32 {
         let mut state = self.state.write();
-        Self::commit_values_locked(&mut state, values)
+        let row = Self::commit_values_locked(&mut state, values);
+        let new_count = state.store.row_count();
+        drop(state);
+        self.row_count_mirror
+            .store(new_count, std::sync::atomic::Ordering::Release);
+        row
     }
 
     /// Extend the `last_touched` Vec to cover `row`, setting the
@@ -1314,8 +1350,23 @@ impl Topic {
         sparse: bool,
     ) -> Result<ParsedQuery, QueryError> {
         let state = self.state.read();
-        let query = parse_query(sql, &state.schema)?;
-        let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
+        let mut query = parse_query(sql, &state.schema)?;
+        // PIVOT queries are re-evaluated on every mutation the same way
+        // GROUP BY aggregates are — the executor (`execute_pivot_query`)
+        // is keyed by anchor columns and the resulting rows have one
+        // entry per anchor key. We borrow the aggregating evaluator's
+        // diff machinery by seeding `query.group_by` with the pivot's
+        // anchor columns; the dispatch in
+        // `execute_query_with_index_filtered` checks `query.pivot`
+        // first, so SQL routing still hits the pivot executor — only
+        // the live-evaluator diff path uses the synthetic group_by.
+        if let Some(pivot) = &query.pivot {
+            if query.group_by.is_empty() {
+                query.group_by = pivot.anchor_cols.clone();
+            }
+        }
+        let is_aggregate =
+            query.is_aggregate() || !query.group_by.is_empty() || query.pivot.is_some();
         let captured = self.next_sequence.load(Ordering::SeqCst);
         let mut engine = self.sub_engine.lock();
         let mut sub =
@@ -1324,8 +1375,9 @@ impl Topic {
             sub = sub.into_sparse(state.key_col_indices.clone());
         }
         if is_aggregate {
-            // Aggregate subs need a seed snapshot for `last_emitted`.
-            // Cardinality is bounded by GROUP BY, not row count.
+            // Aggregate/PIVOT subs need a seed snapshot for
+            // `last_emitted`. Cardinality is bounded by GROUP BY (or by
+            // distinct anchor keys for PIVOT), not by row count.
             let result = execute_query(&query, &state.store);
             let mut sub_with_agg = sub.into_aggregating();
             let group_names: Vec<String> = sub_with_agg
@@ -1345,6 +1397,8 @@ impl Topic {
             engine.add(sub);
             engine.seed_active_set(&sub_id, &state.store);
         }
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(query)
     }
 
@@ -1423,6 +1477,8 @@ impl Topic {
             engine.add(sub);
             engine.seed_active_set(&sub_id, &state.store);
         }
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let snapshot_rows = if send_keys_only_snapshot {
             let key_names: Vec<String> = state
                 .key_col_indices
@@ -1469,6 +1525,8 @@ impl Topic {
             .with_live_start(captured + 1);
         engine.add(sub);
         engine.seed_active_set(&sub_id, &state.store);
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok((query, captured))
     }
 
@@ -1486,11 +1544,18 @@ impl Topic {
         // belt + braces — keeps the close-then-remove ordering
         // explicit) sees the flag and bails out of work for it.
         engine.mark_closed(sub_id);
-        engine.remove(sub_id);
+        if engine.remove(sub_id).is_some() {
+            self.active_subscriptions
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     pub fn unsubscribe_prefix(&self, prefix: &str) {
-        self.sub_engine.lock().remove_by_prefix(prefix);
+        let removed = self.sub_engine.lock().remove_by_prefix(prefix);
+        if removed > 0 {
+            self.active_subscriptions
+                .fetch_sub(removed, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// Mark a subscription as closed without removing the engine
@@ -1506,7 +1571,12 @@ impl Topic {
     /// be invoked periodically (e.g., once per second from a per-topic
     /// reaper task) and after large disconnect storms.
     pub fn reap_closed_subscriptions(&self) -> usize {
-        self.sub_engine.lock().reap_closed()
+        let reaped = self.sub_engine.lock().reap_closed();
+        if reaped > 0 {
+            self.active_subscriptions
+                .fetch_sub(reaped, std::sync::atomic::Ordering::AcqRel);
+        }
+        reaped
     }
 
     /// Subscribe with an active-set cap (S42 / C11). Beyond the cap,
@@ -1542,6 +1612,8 @@ impl Topic {
             .with_max_active(max_active);
         engine.add(sub);
         engine.seed_active_set(&sub_id, &state.store);
+        self.active_subscriptions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok((result.rows, query))
     }
 
