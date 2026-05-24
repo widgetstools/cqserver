@@ -315,6 +315,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_bytes_per_sub: sp.max_bytes_per_sub,
         }
     });
+    // Replica-reads S1: a `standby` server still listens for client
+    // connections (followers serve subscribes), but publish + delta_publish
+    // are rejected with a clear error so a misdirected publisher learns
+    // immediately instead of silently writing to a follower.
+    let read_only = server_config.replication.role == ReplicationRole::Standby;
+    if read_only {
+        info!("Replication role = standby — transports running in read-only mode (publishes will be rejected)");
+    }
     let ws_config = WsConfig {
         listen_addr: server_config.websocket_addr.clone(),
         path: server_config.websocket_path.clone(),
@@ -322,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sow_batch_size,
         bookmark_store: Some(bookmark_store.clone()),
         spillover: spillover_ctx.clone(),
+        read_only,
     };
     let tcp_config = TcpConfig {
         listen_addr: server_config.tcp_addr.clone(),
@@ -330,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls_acceptor,
         bookmark_store: Some(bookmark_store),
         spillover: spillover_ctx,
+        read_only,
     };
 
     let heartbeat_cfg = HeartbeatConfig {

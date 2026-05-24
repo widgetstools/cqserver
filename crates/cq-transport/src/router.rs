@@ -334,6 +334,14 @@ pub struct RouterContext {
     /// task feeds frames back as the queue catches up. `None` keeps
     /// the legacy "drop on full" behaviour.
     pub spillover: Option<SpilloverContext>,
+    /// Read-only mode (replica-reads S1). When `true`, the publish and
+    /// delta_publish handlers reject every request with a clear
+    /// "read-only follower" error so a misdirected publisher learns
+    /// immediately instead of silently writing to a follower's
+    /// in-memory state (which would never reach the leader's txlog
+    /// and would diverge across followers). Set from
+    /// `ServerConfig.replication.role == Standby` in main.rs.
+    pub read_only: bool,
 }
 
 /// Server-wide spillover configuration, captured in [`RouterContext`]
@@ -739,6 +747,21 @@ fn handle_publish_inner(
     ctx: &RouterContext,
     delta_mode: bool,
 ) {
+    // Replica-reads S1: a follower must never accept a publish. We
+    // reject before any topic/auth/payload validation so the error
+    // shape is consistent — every misdirected publish gets the same
+    // "publish to leader" message regardless of what else is wrong.
+    // Metric counts the misroute so operators can tell when their LB
+    // is sending writes to the wrong tier.
+    if ctx.read_only {
+        metrics::counter!("cq_publish_rejected_read_only_total").increment(1);
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id,
+            "read-only follower; publish to leader",
+        ));
+        return;
+    }
+
     let topic_name = match &msg.topic {
         Some(t) => t.clone(),
         None => {

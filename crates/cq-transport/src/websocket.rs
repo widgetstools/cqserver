@@ -29,6 +29,10 @@ pub struct WsConfig {
     pub bookmark_store: Option<crate::router::BookmarkStore>,
     /// S21 spillover configuration. See `TcpConfig::spillover`.
     pub spillover: Option<crate::router::SpilloverContext>,
+    /// Replica-reads S1. When `true`, publish + delta_publish are
+    /// rejected with a `read-only follower` error. Set by main.rs
+    /// when `ServerConfig.replication.role == Standby`.
+    pub read_only: bool,
 }
 
 impl Default for WsConfig {
@@ -40,6 +44,7 @@ impl Default for WsConfig {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: None,
             spillover: None,
+            read_only: false,
         }
     }
 }
@@ -70,6 +75,7 @@ pub async fn start_ws_server(
             sow_batch_size: config.sow_batch_size,
             bookmark_store: bookmark_store.clone(),
             spillover: config.spillover.clone(),
+            read_only: config.read_only,
         };
         let queue_capacity = config.outbound_queue_capacity;
 

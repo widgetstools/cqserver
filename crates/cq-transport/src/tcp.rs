@@ -56,6 +56,10 @@ pub struct TcpConfig {
     /// + drain task; queue-full events spill to disk instead of
     /// dropping. `None` keeps the legacy "drop on full" behaviour.
     pub spillover: Option<crate::router::SpilloverContext>,
+    /// Replica-reads S1. When `true`, publish + delta_publish are
+    /// rejected with a `read-only follower` error. Set by main.rs
+    /// when `ServerConfig.replication.role == Standby`.
+    pub read_only: bool,
 }
 
 impl Default for TcpConfig {
@@ -67,6 +71,7 @@ impl Default for TcpConfig {
             tls_acceptor: None,
             bookmark_store: None,
             spillover: None,
+            read_only: false,
         }
     }
 }
@@ -101,6 +106,7 @@ pub async fn start_tcp_server(
             sow_batch_size: config.sow_batch_size,
             bookmark_store: bookmark_store.clone(),
             spillover: config.spillover.clone(),
+            read_only: config.read_only,
         };
         let queue_capacity = config.outbound_queue_capacity;
         let tls_acceptor = config.tls_acceptor.clone();
@@ -284,6 +290,7 @@ mod tests {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
+            read_only: false,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -383,6 +390,137 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
 
+    /// Replica-reads S1: when the RouterContext is in read-only mode, a
+    /// publish must be rejected with a clear "read-only follower" error
+    /// regardless of topic validity. We don't even need a topic to exist
+    /// — the guard fires before topic lookup. Verifies the same for
+    /// delta_publish (which routes through the same inner handler with
+    /// `delta_mode = true`).
+    #[tokio::test]
+    async fn tcp_read_only_rejects_publish() {
+        let topics: Arc<DashMap<String, SharedTopic>> = Arc::new(DashMap::new());
+        let registry = new_registry();
+
+        let schema = Arc::new(Schema::from_strs(
+            &["symbol", "price"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let topic = Topic::new(
+            TopicConfig {
+                name: "/t".into(),
+                key_fields: vec!["symbol".into()],
+                persist: false,
+                conflation_ms: None,
+                index_columns: vec![],
+                expire_seconds: None,
+            },
+            schema,
+            32,
+        );
+        topics.insert("/t".into(), Arc::new(topic));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let ctx = RouterContext {
+            topics: topics.clone(),
+            sessions: registry.clone(),
+            queues: crate::queue::new_queue_registry(),
+            auth: std::sync::Arc::new(crate::auth::AuthStore::disabled()),
+            sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
+            bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
+            read_only: true,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_connection(
+                stream,
+                peer.to_string(),
+                ctx,
+                HeartbeatConfig::DISABLED,
+                DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            )
+            .await;
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+
+        async fn write_msg(w: &mut tokio::net::tcp::OwnedWriteHalf, msg: &CqMessage) {
+            let json = serde_json::to_vec(msg).unwrap();
+            let mut out = BytesMut::new();
+            encode_frame(&json, &mut out);
+            w.write_all(&out).await.unwrap();
+        }
+        async fn read_msg(
+            r: &mut tokio::net::tcp::OwnedReadHalf,
+            buf: &mut BytesMut,
+        ) -> CqMessage {
+            loop {
+                match decode_frame(buf) {
+                    Ok(Some(payload)) => return serde_json::from_slice(&payload).unwrap(),
+                    Ok(None) => {
+                        let n = r.read_buf(buf).await.unwrap();
+                        assert!(n > 0, "unexpected EOF");
+                    }
+                    Err(e) => panic!("decode error: {}", e),
+                }
+            }
+        }
+        let mut rbuf = BytesMut::with_capacity(4096);
+
+        // Plain publish — should be rejected.
+        let mut pub_msg = CqMessage::new(Command::Publish);
+        pub_msg.topic = Some("/t".into());
+        pub_msg.command_id = Some("p1".into());
+        let mut data = serde_json::Map::new();
+        data.insert("symbol".into(), "AAPL".into());
+        data.insert("price".into(), 150.0.into());
+        pub_msg.data = Some(serde_json::Value::Object(data));
+        write_msg(&mut cw, &pub_msg).await;
+
+        // Error responses use Command::Ack + Status::Error + reason field
+        // (see CqMessage::error in cq-protocol).
+        let m = tokio::time::timeout(Duration::from_secs(1), read_msg(&mut cr, &mut rbuf))
+            .await
+            .expect("response must arrive");
+        assert_eq!(m.command, Command::Ack);
+        assert_eq!(m.status, Some(cq_protocol::command::Status::Error));
+        assert_eq!(m.command_id.as_deref(), Some("p1"));
+        let err_msg = m.reason.as_deref().unwrap_or("");
+        assert!(
+            err_msg.contains("read-only follower"),
+            "expected read-only follower error, got {err_msg:?}"
+        );
+
+        // Delta publish — same guard fires.
+        let mut delta_msg = CqMessage::new(Command::DeltaPublish);
+        delta_msg.topic = Some("/t".into());
+        delta_msg.command_id = Some("p2".into());
+        let mut d = serde_json::Map::new();
+        d.insert("symbol".into(), "AAPL".into());
+        d.insert("price".into(), 151.0.into());
+        delta_msg.data = Some(serde_json::Value::Object(d));
+        write_msg(&mut cw, &delta_msg).await;
+
+        let m2 = tokio::time::timeout(Duration::from_secs(1), read_msg(&mut cr, &mut rbuf))
+            .await
+            .expect("response must arrive");
+        assert_eq!(m2.command, Command::Ack);
+        assert_eq!(m2.status, Some(cq_protocol::command::Status::Error));
+        assert_eq!(m2.command_id.as_deref(), Some("p2"));
+        assert!(m2
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only follower"));
+
+        drop(cw);
+        drop(cr);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
     /// Verify the server pushes heartbeats on the configured interval and
     /// closes the connection after the idle timeout elapses.
     #[tokio::test]
@@ -405,6 +543,7 @@ mod tests {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
+            read_only: false,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -512,6 +651,7 @@ mod tests {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
+            read_only: false,
         };
         let server = tokio::spawn(async move {
             loop {
@@ -705,6 +845,7 @@ mod tests {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
+            read_only: false,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -851,6 +992,7 @@ mod tests {
             sow_batch_size: DEFAULT_SOW_BATCH_SIZE,
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
+            read_only: false,
         };
         let server = tokio::spawn(async move {
             loop {
