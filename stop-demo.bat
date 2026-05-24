@@ -6,6 +6,9 @@ REM   Phase 1 - graceful: kill PIDs recorded by start-demo.bat in
 REM             .demo-run\*.pid (with tree-kill).
 REM   Phase 2 - sweep: cqserver by binary path + anything still
 REM             listening on the demo ports.
+REM
+REM Pure cmd.exe + wmic. No PowerShell, no execution-policy concerns.
+REM See start-demo.bat header for the wmic deprecation note on 24H2+.
 
 setlocal enabledelayedexpansion
 
@@ -45,11 +48,18 @@ if exist "%RUN_DIR%" (
 echo ^> Phase 2: port + binary sweep
 
 REM Kill cqserver by binary path. Anchored to this repo's target\ so we
-REM never touch cqserver instances from other checkouts.
+REM never touch cqserver instances from other checkouts. wmic WHERE
+REM needs backslashes doubled.
 for %%P in ("%ROOT%\target\release\cqserver.exe" "%ROOT%\target\debug\cqserver.exe") do (
-  for /f %%i in ('powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name = 'cqserver.exe'\" -EA SilentlyContinue ^| Where-Object { $_.ExecutablePath -ieq '%%~P' } ^| Select-Object -ExpandProperty ProcessId"') do (
-    echo   stopping cqserver ^(pid=%%i^)
-    taskkill /pid %%i /t /f >nul 2>&1
+  set "WMIC_PATH=%%~P"
+  set "WMIC_PATH=!WMIC_PATH:\=\\!"
+  for /f "tokens=2 delims==" %%i in ('wmic process where "ExecutablePath='!WMIC_PATH!'" get ProcessId /value 2^>nul ^| findstr /R "^ProcessId="') do (
+    set "FOUND_PID=%%i"
+    set "FOUND_PID=!FOUND_PID:~0,-1!"
+    if defined FOUND_PID (
+      echo   stopping cqserver ^(pid=!FOUND_PID!^)
+      taskkill /pid !FOUND_PID! /t /f >nul 2>&1
+    )
   )
 )
 

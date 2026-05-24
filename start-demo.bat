@@ -9,8 +9,14 @@ REM   4. Live publisher (market-data ticks + trades)
 REM   5. React demo dev server
 REM
 REM PIDs + logs are written under .demo-run\ so stop-demo.bat can shut
-REM everything down cleanly. Requires Windows 10+ (for curl.exe and
-REM PowerShell 5.1+ on PATH) and Node.js on PATH.
+REM everything down cleanly. Pure cmd.exe + wmic, no PowerShell, so
+REM corporate execution-policy / AppLocker rules don't apply.
+REM
+REM Tools required on PATH: cmd.exe, curl.exe, netstat.exe, wmic.exe,
+REM tasklist.exe, taskkill.exe, timeout.exe, findstr.exe, cargo, node,
+REM npm, npx. wmic is being deprecated by Microsoft and is NOT installed
+REM by default on Windows 11 24H2+; on those builds, add the optional
+REM feature "WMIC" via Settings > Apps > Optional Features.
 
 setlocal enabledelayedexpansion
 
@@ -28,8 +34,10 @@ echo ^> Pre-flight
 REM Refuse to start on top of a previous run.
 for %%N in (server publisher react-demo) do (
   if exist "%RUN_DIR%\%%N.pid" (
+    set "PREV_PID="
     set /p PREV_PID=<"%RUN_DIR%\%%N.pid"
     if defined PREV_PID (
+      set "PREV_PID=!PREV_PID: =!"
       tasklist /fi "PID eq !PREV_PID!" 2>nul | findstr /B "!PREV_PID! " >nul
       if !errorlevel! equ 0 (
         echo   x %%N already running ^(pid=!PREV_PID!^); run .\stop-demo.bat first
@@ -42,12 +50,9 @@ for %%N in (server publisher react-demo) do (
 REM Ports must be free. Only LISTENING sockets count -- CLOSE_WAIT
 REM stragglers (browser leftovers) don't block a fresh bind.
 for %%P in (9007 9008 8085 5173) do (
-  netstat -ano -p TCP | findstr /R /C:":%%P *LISTENING" >nul
-  if !errorlevel! equ 0 (
-    for /f "tokens=5" %%i in ('netstat -ano -p TCP ^| findstr /R /C:":%%P *LISTENING"') do (
-      echo   x Port %%P already in use ^(pid=%%i^)
-      exit /b 1
-    )
+  for /f "tokens=5" %%i in ('netstat -ano -p TCP ^| findstr /R /C:":%%P *LISTENING"') do (
+    echo   x Port %%P already in use ^(pid=%%i^)
+    exit /b 1
   )
 )
 echo   + Ports 9007 9008 8085 5173 free
@@ -76,14 +81,26 @@ echo   + JS deps installed
 
 REM 1. cqserver
 echo ^> Starting cqserver
+REM `start /b cmd /c "..."` is the canonical pattern for a backgrounded
+REM child whose stdout/stderr needs to land in a log file.
 pushd "%ROOT%"
 start "" /b cmd /c ""%SERVER_BIN%" --config "%SERVER_CFG%" > "%RUN_DIR%\server.log" 2>&1"
 popd
 
-REM Capture cqserver PID via PowerShell (anchored to binary path so we
-REM don't catch cqserver instances from other checkouts). Sleep briefly
-REM so the process appears in Get-CimInstance.
-for /f %%i in ('powershell -NoProfile -Command "Start-Sleep -Milliseconds 800; Get-CimInstance Win32_Process -Filter \"Name = 'cqserver.exe'\" -EA SilentlyContinue ^| Where-Object { $_.ExecutablePath -ieq '%SERVER_BIN%' } ^| Sort-Object CreationDate -Descending ^| Select-Object -First 1 -ExpandProperty ProcessId"') do set "SERVER_PID=%%i"
+REM Capture cqserver PID via wmic, anchored to binary path so we don't
+REM catch cqserver instances from other checkouts. Sleep briefly so
+REM the process is registered before we query.
+timeout /t 1 /nobreak >nul
+set "SERVER_PID="
+REM wmic's /value output: `Key=Value` on its own line. We tokenize on `=`
+REM and take the second token. Backslashes in the path need escaping for
+REM the WMI WHERE clause (\\ -> \\\\).
+set "WMIC_PATH=%SERVER_BIN:\=\\%"
+for /f "tokens=2 delims==" %%i in ('wmic process where "ExecutablePath='%WMIC_PATH%'" get ProcessId /value 2^>nul ^| findstr /R "^ProcessId="') do (
+  if not defined SERVER_PID set "SERVER_PID=%%i"
+)
+REM Strip any trailing CR (wmic emits CRLF; for /f keeps the CR).
+if defined SERVER_PID set "SERVER_PID=!SERVER_PID:~0,-1!"
 if not defined SERVER_PID (
   echo   x cqserver failed to start - check %RUN_DIR%\server.log
   exit /b 1
@@ -128,8 +145,14 @@ pushd "%ROOT%\clients\ts"
 start "" /b cmd /c "npx --no-install tsx examples/fi-publisher.ts > "%RUN_DIR%\publisher.log" 2>&1"
 popd
 
-REM Capture publisher PID -- the node.exe whose command-line includes the publisher script.
-for /f %%i in ('powershell -NoProfile -Command "Start-Sleep -Milliseconds 1500; Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" -EA SilentlyContinue ^| Where-Object { $_.CommandLine -like '*fi-publisher.ts*' } ^| Sort-Object CreationDate -Descending ^| Select-Object -First 1 -ExpandProperty ProcessId"') do set "PUBLISHER_PID=%%i"
+REM Capture publisher PID -- the node.exe whose CommandLine includes
+REM the publisher script. wmic LIKE uses % for wildcards.
+timeout /t 2 /nobreak >nul
+set "PUBLISHER_PID="
+for /f "tokens=2 delims==" %%i in ('wmic process where "Name='node.exe' AND CommandLine LIKE '%%fi-publisher.ts%%'" get ProcessId /value 2^>nul ^| findstr /R "^ProcessId="') do (
+  if not defined PUBLISHER_PID set "PUBLISHER_PID=%%i"
+)
+if defined PUBLISHER_PID set "PUBLISHER_PID=!PUBLISHER_PID:~0,-1!"
 if defined PUBLISHER_PID > "%RUN_DIR%\publisher.pid" echo !PUBLISHER_PID!
 echo     pid=!PUBLISHER_PID!  log=%RUN_DIR%\publisher.log
 
@@ -154,7 +177,12 @@ pushd "%ROOT%\clients\react-demo"
 start "" /b cmd /c "npx --no-install vite > "%RUN_DIR%\react-demo.log" 2>&1"
 popd
 
-for /f %%i in ('powershell -NoProfile -Command "Start-Sleep -Milliseconds 1500; Get-CimInstance Win32_Process -Filter \"Name = 'node.exe'\" -EA SilentlyContinue ^| Where-Object { $_.CommandLine -like '*vite*' -and $_.CommandLine -like '*react-demo*' } ^| Sort-Object CreationDate -Descending ^| Select-Object -First 1 -ExpandProperty ProcessId"') do set "VITE_PID=%%i"
+timeout /t 2 /nobreak >nul
+set "VITE_PID="
+for /f "tokens=2 delims==" %%i in ('wmic process where "Name='node.exe' AND CommandLine LIKE '%%vite%%' AND CommandLine LIKE '%%react-demo%%'" get ProcessId /value 2^>nul ^| findstr /R "^ProcessId="') do (
+  if not defined VITE_PID set "VITE_PID=%%i"
+)
+if defined VITE_PID set "VITE_PID=!VITE_PID:~0,-1!"
 if defined VITE_PID > "%RUN_DIR%\react-demo.pid" echo !VITE_PID!
 echo     pid=!VITE_PID!  log=%RUN_DIR%\react-demo.log
 
