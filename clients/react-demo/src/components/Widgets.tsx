@@ -8,6 +8,7 @@ import { MarketDataBlotter } from './MarketDataBlotter';
 import { TradesFeed } from './TradesFeed';
 import { PositionsBlotter } from './PositionsBlotter';
 import { AggregationsGrids } from './AggregationsGrids';
+import { PivotPanel } from './PivotPanel';
 import { useThemePrefs } from '@/lib/ThemeContext';
 
 export function MarketDataWidget() {
@@ -29,10 +30,16 @@ export function AggregationsWidget() {
   return <AggregationsGrids palette={palette} mode={mode} />;
 }
 
+export function PivotWidget() {
+  const { palette, mode } = useThemePrefs();
+  return <PivotPanel palette={palette} mode={mode} />;
+}
+
 // Stable registry — passed once to <DockManagerCore widgets={WIDGETS} />.
 export const WIDGETS = {
   'market-data': MarketDataWidget,
   trades: TradesWidget,
   positions: PositionsWidget,
   aggregations: AggregationsWidget,
+  pivot: PivotWidget,
 };

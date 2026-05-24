@@ -51,6 +51,8 @@ pub async fn start_admin_server(
         .route("/subscriptions/:sub_id", delete(delete_subscription))
         .route("/metrics", get(get_metrics))
         .route("/admin/rotate-journal/:topic", post(rotate_journal))
+        .route("/admin/shrink-store/:topic", post(shrink_store))
+        .route("/admin/shrink-store-all", post(shrink_store_all))
         .route("/admin/replication", get(replication_status))
         .with_state(state);
 
@@ -85,11 +87,18 @@ async fn get_stats(State(s): State<AdminState>) -> impl IntoResponse {
         .iter()
         .map(|e| e.value().subscription_count())
         .sum();
+    let (rss, virt) = memory_stats::memory_stats()
+        .map(|m| (m.physical_mem as u64, m.virtual_mem as u64))
+        .unwrap_or((0, 0));
+    metrics::gauge!("cq_process_rss_bytes").set(rss as f64);
+    metrics::gauge!("cq_process_virtual_bytes").set(virt as f64);
     Json(serde_json::json!({
         "topics": s.topics.len(),
         "totalRows": total_rows,
         "totalSubscriptions": total_subs,
         "activeRoutes": s.registry.len(),
+        "processRssBytes": rss,
+        "processVirtualBytes": virt,
     }))
 }
 
@@ -198,6 +207,49 @@ async fn rotate_journal(
         )
             .into_response(),
     }
+}
+
+/// `POST /admin/shrink-store/{topic}` — release unused tail capacity
+/// from the column store. Useful after a large delete or to recover
+/// the slack that `grow()` reserved (~25 % over the row count). Takes
+/// the topic write lock briefly; readers are unaffected.
+async fn shrink_store(
+    State(s): State<AdminState>,
+    Path(topic): Path<String>,
+) -> impl IntoResponse {
+    let Some(topic_arc) = s.topics.get(&topic).map(|e| e.clone()) else {
+        return (StatusCode::NOT_FOUND, "no such topic").into_response();
+    };
+    let (old, new) = topic_arc.shrink_store();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "topic": topic,
+            "oldCapacity": old,
+            "newCapacity": new,
+            "reclaimedRows": old.saturating_sub(new),
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /admin/shrink-store-all` — shrink every topic. One-shot
+/// convenience for "I want my memory back now" after a load test.
+async fn shrink_store_all(State(s): State<AdminState>) -> impl IntoResponse {
+    let results: Vec<serde_json::Value> = s
+        .topics
+        .iter()
+        .map(|e| {
+            let (old, new) = e.value().shrink_store();
+            serde_json::json!({
+                "topic": e.key(),
+                "oldCapacity": old,
+                "newCapacity": new,
+                "reclaimedRows": old.saturating_sub(new),
+            })
+        })
+        .collect();
+    Json(serde_json::Value::Array(results))
 }
 
 /// `GET /admin/replication` — snapshot of replication state.

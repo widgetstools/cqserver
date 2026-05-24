@@ -111,6 +111,17 @@ function Workspace({ mode }: { mode: ThemeMode }) {
       position: 'bottom',
       targetGroupId: trGroup ?? undefined,
     });
+
+    // Pivot tab joins the Aggregations group — same bottom-right
+    // quadrant. Omitting `position` adds it as a sibling tab in
+    // the target group rather than splitting it.
+    const aggGroup = api.getGroupForPanel('aggregations');
+    api.addPanel({
+      id: 'pivot',
+      title: 'Pivot',
+      widgetType: 'pivot',
+      targetGroupId: aggGroup ?? undefined,
+    });
   };
 
   return (

@@ -56,6 +56,30 @@ pub struct ParsedQuery {
     /// `UNPIVOT (val FOR name IN (c1, c2, ...))`. Mutually
     /// exclusive with `pivot`.
     pub unpivot: Option<ParsedUnpivot>,
+    /// S20 JOIN spec. `Some` iff the FROM clause is
+    /// `A JOIN B USING (col, ...)` — `A` is `topic`, `B` is
+    /// `join.right_topic`, and the parse-side schema check has
+    /// already validated that the `using` column names exist on the
+    /// left schema. The executor builds a hash map of right-side
+    /// rows keyed by the USING values, then walks the left store
+    /// joining on equality. Other join shapes (LEFT OUTER, ON-clause
+    /// with non-equi predicates, multi-table chained joins) are
+    /// rejected at parse time and reserved for follow-ups.
+    pub join: Option<JoinSpec>,
+}
+
+/// Compiled `A JOIN B USING (col, ...)` spec. Schemas of both sides
+/// are resolved at query-execution time (via `Topic` lookup in the
+/// server's topic map) — the parser stores symbolic names only so
+/// re-parse on schema-discovery boundaries stays cheap.
+#[derive(Debug, Clone)]
+pub struct JoinSpec {
+    /// Topic name on the right side of the JOIN.
+    pub right_topic: String,
+    /// USING column names (must exist on BOTH sides). Today only
+    /// INNER JOIN + USING is supported; LEFT OUTER + ON-with-Expr
+    /// are tracked as follow-ups.
+    pub using: Vec<String>,
 }
 
 /// Compiled `PIVOT (...) FOR col IN (lit, lit, ...)` spec.
@@ -205,6 +229,70 @@ pub fn parse_query(sql: &str, schema: &Schema) -> Result<ParsedQuery, QueryError
     }
 }
 
+/// S20 — peek at a SQL string and extract the JOIN's right-side
+/// topic name + USING columns without compiling the full query. The
+/// View setup uses this to look up the right topic in the registry,
+/// build a combined left∪right schema, and then call `parse_query`
+/// against that combined schema. Returns `Ok(None)` for un-joined
+/// SQL.
+pub fn peek_join(sql: &str) -> Result<Option<(String, String, Vec<String>)>, QueryError> {
+    let dialect = GenericDialect {};
+    let ast = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| QueryError::ParseError(e.to_string()))?;
+    let stmt = ast.first().ok_or_else(|| QueryError::ParseError("Empty SQL".into()))?;
+    let q = match stmt {
+        Statement::Query(q) => q,
+        _ => return Err(QueryError::ParseError("Only SELECT statements supported".into())),
+    };
+    let select = match q.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return Err(QueryError::ParseError("Expected SELECT".into())),
+    };
+    let from = match select.from.first() {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    let left_topic = match &from.relation {
+        TableFactor::Table { name, .. } => strip_identifier_quotes(&name.to_string()),
+        _ => return Ok(None),
+    };
+    let join = match parse_join_clause(&from.joins)? {
+        Some(j) => j,
+        None => return Ok(None),
+    };
+    Ok(Some((left_topic, join.right_topic, join.using)))
+}
+
+/// S20 — synthesize a combined schema from a left + right topic for
+/// JOIN parsing. The combined schema has the left columns first
+/// (in order), then every right column NOT in the USING list (so a
+/// USING column appears once and is unambiguous). Used by the view
+/// setup path to compile predicates and aggregates against the
+/// post-join column set.
+pub fn combined_join_schema(
+    left: &Schema,
+    right: &Schema,
+    using: &[String],
+) -> Schema {
+    let using_set: std::collections::HashSet<&str> =
+        using.iter().map(String::as_str).collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut types: Vec<crate::schema::ColumnType> = Vec::new();
+    for col in left.columns() {
+        names.push(col.name().to_string());
+        types.push(col.col_type());
+    }
+    for col in right.columns() {
+        if using_set.contains(col.name()) {
+            continue;
+        }
+        names.push(col.name().to_string());
+        types.push(col.col_type());
+    }
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    Schema::from_strs(&name_refs, &types)
+}
+
 fn parse_select(
     query: &sqlparser::ast::Query,
     schema: &Schema,
@@ -219,7 +307,16 @@ fn parse_select(
     // below since they carry significant out-of-band state (pivot
     // spec, source columns) that the rest of the SELECT pipeline
     // wouldn't otherwise know what to do with.
-    let topic = if let Some(from) = select.from.first() {
+    let from_entry = select.from.first();
+    // S20 JOIN: parse the (single) JOIN, if any. We support exactly
+    // `A INNER JOIN B USING (col, ...)`. The caller is expected to
+    // pass a COMBINED schema (left ∪ right minus USING duplicates)
+    // when a JOIN is present so the predicate / aggregate paths see
+    // every column they reference.
+    let join_spec = from_entry
+        .and_then(|fe| parse_join_clause(&fe.joins).transpose())
+        .transpose()?;
+    let topic = if let Some(from) = from_entry {
         match &from.relation {
             TableFactor::Table { name, .. } => name.to_string(),
             TableFactor::Pivot {
@@ -319,7 +416,85 @@ fn parse_select(
         group_by,
         pivot: None,
         unpivot: None,
+        join: join_spec,
     })
+}
+
+/// Strip the surrounding sqlparser identifier quotes (`"`, `` ` ``, `[`/`]`)
+/// from a topic name. Topic names like `/positions` aren't valid bare
+/// identifiers in SQL so users quote them in JOIN clauses; we want
+/// the unquoted form for the topic-registry lookup.
+fn strip_identifier_quotes(raw: &str) -> String {
+    let s = raw.trim();
+    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
+        || (s.starts_with('`') && s.ends_with('`') && s.len() >= 2)
+    {
+        s[1..s.len() - 1].to_string()
+    } else if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Pull a JoinSpec out of the sqlparser AST. Today we only accept a
+/// single INNER (or implicit) JOIN with a USING(...) constraint —
+/// the common dashboard pattern. LEFT/RIGHT OUTER, ON-clause Expr
+/// joins, and multi-table chained joins are tracked as follow-ups.
+fn parse_join_clause(
+    joins: &[sqlparser::ast::Join],
+) -> Result<Option<JoinSpec>, QueryError> {
+    if joins.is_empty() {
+        return Ok(None);
+    }
+    if joins.len() > 1 {
+        return Err(QueryError::ParseError(
+            "Only a single JOIN per FROM is supported".into(),
+        ));
+    }
+    let j = &joins[0];
+    let right_topic = match &j.relation {
+        TableFactor::Table { name, .. } => strip_identifier_quotes(&name.to_string()),
+        _ => {
+            return Err(QueryError::ParseError(
+                "JOIN target must be a plain topic name".into(),
+            ))
+        }
+    };
+    // Accept `[INNER] JOIN ... USING (col, ...)` only.
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let constraint = match &j.join_operator {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => c,
+        _ => {
+            return Err(QueryError::ParseError(
+                "Only INNER JOIN is supported today".into(),
+            ))
+        }
+    };
+    let using: Vec<String> = match constraint {
+        JoinConstraint::Using(cols) => cols
+            .iter()
+            .map(|on| {
+                // ObjectName parts are an enum of `ObjectNamePart`;
+                // we accept the simple identifier form.
+                on.to_string().trim_matches('"').to_string()
+            })
+            .collect(),
+        _ => {
+            return Err(QueryError::ParseError(
+                "JOIN must specify USING (col, ...)".into(),
+            ))
+        }
+    };
+    if using.is_empty() {
+        return Err(QueryError::ParseError(
+            "JOIN USING (...) must list at least one column".into(),
+        ));
+    }
+    Ok(Some(JoinSpec {
+        right_topic,
+        using,
+    }))
 }
 
 /// Parse a `SELECT ... FROM t PIVOT (agg(col) FOR pivot_col IN (lit, lit, ...))` query.
@@ -445,6 +620,7 @@ fn parse_pivot_query(
         group_by: Vec::new(),
         pivot: Some(pivot),
         unpivot: None,
+        join: None,
     })
 }
 
@@ -548,6 +724,7 @@ fn parse_unpivot_query(
         group_by: Vec::new(),
         pivot: None,
         unpivot: Some(unpivot),
+        join: None,
     })
 }
 
@@ -1513,6 +1690,151 @@ pub enum QueryError {
     NotYetImplemented(String),
 }
 
+/// S20 — execute a JOIN query. Pulls every left-store row that
+/// satisfies the predicate, joins it against the matching right-side
+/// row (lookup by USING columns), and runs the remaining stages
+/// (aggregate, projection) over the combined column set.
+///
+/// Internally this is a streaming hash join: we first build an index
+/// of right rows keyed by the USING tuple (O(right_rows)), then walk
+/// the left store once (O(left_rows)). The combined rows are
+/// materialized into a temporary `ColumnStore` with the
+/// `combined_join_schema` layout, then handed to the existing
+/// aggregate / non-aggregate executors so all of the WHERE / GROUP BY
+/// / aggregate / projection machinery reuses without modification.
+///
+/// `query.join` must be `Some(_)`; callers without a join should use
+/// the regular `execute_query_with_index` path.
+pub fn execute_join_query(
+    query: &ParsedQuery,
+    left_store: &ColumnStore,
+    right_store: &ColumnStore,
+) -> Result<QueryResult, QueryError> {
+    let join = query.join.as_ref().ok_or_else(|| {
+        QueryError::ParseError("execute_join_query called on a non-join ParsedQuery".into())
+    })?;
+    let left_schema = left_store.schema();
+    let right_schema = right_store.schema();
+
+    // Resolve USING column indices on both sides.
+    let mut left_using: Vec<usize> = Vec::with_capacity(join.using.len());
+    let mut right_using: Vec<usize> = Vec::with_capacity(join.using.len());
+    for name in &join.using {
+        let li = left_schema.index_of(name).ok_or_else(|| {
+            QueryError::ParseError(format!(
+                "JOIN USING column `{}` not found on left side",
+                name
+            ))
+        })?;
+        let ri = right_schema.index_of(name).ok_or_else(|| {
+            QueryError::ParseError(format!(
+                "JOIN USING column `{}` not found on right side",
+                name
+            ))
+        })?;
+        left_using.push(li);
+        right_using.push(ri);
+    }
+
+    // Build the combined column layout: every left column, then
+    // every right column NOT in the USING set.
+    let using_set: std::collections::HashSet<&str> =
+        join.using.iter().map(String::as_str).collect();
+    // Maps combined-column-index → (Side, source-column-index).
+    enum Side {
+        Left,
+        Right,
+    }
+    let mut combined_sources: Vec<(Side, usize)> = Vec::new();
+    let mut combined_types: Vec<crate::schema::ColumnType> = Vec::new();
+    let mut combined_names: Vec<String> = Vec::new();
+    for col in left_schema.columns() {
+        combined_sources.push((Side::Left, left_schema.index_of(col.name()).unwrap()));
+        combined_types.push(col.col_type());
+        combined_names.push(col.name().to_string());
+    }
+    for col in right_schema.columns() {
+        if using_set.contains(col.name()) {
+            continue;
+        }
+        combined_sources.push((Side::Right, right_schema.index_of(col.name()).unwrap()));
+        combined_types.push(col.col_type());
+        combined_names.push(col.name().to_string());
+    }
+    let combined_name_refs: Vec<&str> =
+        combined_names.iter().map(String::as_str).collect();
+    let combined_schema = std::sync::Arc::new(Schema::from_strs(
+        &combined_name_refs,
+        &combined_types,
+    ));
+
+    // Build the right-side hash index: key tuple → right row index.
+    // We canonicalise the key by joining stringified values with
+    // `\x1f` (unit separator) — bulletproof for any printable value
+    // and obviously distinguishable from `|` etc. for debugging.
+    fn key_for(store: &ColumnStore, row: u32, cols: &[usize]) -> Option<String> {
+        let mut out = String::new();
+        for (i, &c) in cols.iter().enumerate() {
+            if i > 0 {
+                out.push('\x1f');
+            }
+            let v = store.get(c, row);
+            if v.is_null() {
+                return None;
+            }
+            match v {
+                Value::String(Some(s)) => out.push_str(s.as_str()),
+                Value::Long(n) => out.push_str(&n.to_string()),
+                Value::Int(n) => out.push_str(&n.to_string()),
+                Value::Double(n) => out.push_str(&n.to_bits().to_string()),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    let right_row_count = right_store.row_count();
+    let mut right_index: HashMap<String, u32> = HashMap::with_capacity(right_row_count as usize);
+    for r in 0..right_row_count {
+        if let Some(k) = key_for(right_store, r, &right_using) {
+            // Last-write-wins on duplicate join keys (the right side
+            // is expected to be unique on the USING columns; if it
+            // isn't, we silently dedupe rather than fan-out).
+            right_index.insert(k, r);
+        }
+    }
+
+    // Materialize the joined rows into a temp ColumnStore.
+    let left_row_count = left_store.row_count();
+    let mut combined =
+        ColumnStore::new(combined_schema.clone(), left_row_count as usize + 16);
+    let mut row_buf: Vec<Value> = Vec::with_capacity(combined_sources.len());
+    for lr in 0..left_row_count {
+        let key = match key_for(left_store, lr, &left_using) {
+            Some(k) => k,
+            None => continue, // left key NULL → inner join drops
+        };
+        let rr = match right_index.get(&key).copied() {
+            Some(rr) => rr,
+            None => continue, // no right match → inner join drops
+        };
+        row_buf.clear();
+        for (side, src) in &combined_sources {
+            let v = match side {
+                Side::Left => left_store.get(*src, lr),
+                Side::Right => right_store.get(*src, rr),
+            };
+            row_buf.push(v);
+        }
+        combined.append_row(&row_buf);
+    }
+
+    // Strip the join off the query for the downstream executor — it's
+    // already been consumed by the materialization above.
+    let mut downstream = query.clone();
+    downstream.join = None;
+    Ok(execute_query_with_index(&downstream, &combined, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1839,5 +2161,186 @@ mod tests {
         .unwrap();
         let result = execute_query(&query, &store);
         assert_eq!(result.rows.len(), 3); // AAPL(150), MSFT(300), NVDA(250)
+    }
+
+    // ───── S20 JOIN: parser ──────────────────────────────────────────
+
+    #[test]
+    fn parse_join_with_using_clause() {
+        // Single-side schema is enough for the parser even when a
+        // JOIN is present — the parser stores symbolic names on the
+        // JoinSpec; the executor resolves USING columns against
+        // BOTH stores at run time.
+        let left = Schema::from_strs(
+            &["cusip", "qty", "ticker"],
+            &[ColumnType::String, ColumnType::Long, ColumnType::String],
+        );
+        let right = Schema::from_strs(
+            &["cusip", "sector"],
+            &[ColumnType::String, ColumnType::String],
+        );
+        let combined = combined_join_schema(&left, &right, &["cusip".to_string()]);
+        let q = parse_query(
+            "SELECT sector, SUM(qty) AS total FROM positions \
+             JOIN securities USING (cusip) \
+             GROUP BY sector",
+            &combined,
+        )
+        .unwrap();
+        let join = q.join.as_ref().expect("expected JoinSpec");
+        assert_eq!(join.right_topic, "securities");
+        assert_eq!(join.using, vec!["cusip".to_string()]);
+        assert!(q.is_aggregate());
+        assert_eq!(q.group_by.len(), 1);
+    }
+
+    #[test]
+    fn parse_join_rejects_left_outer_for_now() {
+        let combined = Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Long],
+        );
+        let r = parse_query(
+            "SELECT v FROM a LEFT JOIN b USING (k)",
+            &combined,
+        );
+        assert!(r.is_err(), "LEFT OUTER JOIN must be rejected today");
+    }
+
+    #[test]
+    fn parse_join_rejects_on_clause_for_now() {
+        let combined = Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Long],
+        );
+        let r = parse_query("SELECT v FROM a JOIN b ON a.k = b.k", &combined);
+        assert!(r.is_err(), "ON-clause JOIN must be rejected today");
+    }
+
+    #[test]
+    fn peek_join_extracts_topics_and_using() {
+        let (left, right, using) = peek_join(
+            "SELECT * FROM positions JOIN securities USING (cusip)",
+        )
+        .unwrap()
+        .expect("peek_join should match");
+        assert_eq!(left, "positions");
+        assert_eq!(right, "securities");
+        assert_eq!(using, vec!["cusip".to_string()]);
+    }
+
+    #[test]
+    fn peek_join_returns_none_for_non_join() {
+        let r = peek_join("SELECT * FROM trades WHERE price > 100").unwrap();
+        assert!(r.is_none());
+    }
+
+    // ───── S20 JOIN: executor ────────────────────────────────────────
+
+    /// Build a small two-store fixture mirroring the demo's
+    /// `/positions` ↔ `/securities` shape:
+    ///   positions(cusip, qty, marketValue)
+    ///   securities(cusip, sector)
+    /// The join enriches positions with sector.
+    fn make_join_fixture() -> (ColumnStore, ColumnStore, Arc<Schema>) {
+        let left_schema = Arc::new(Schema::from_strs(
+            &["cusip", "qty", "marketValue"],
+            &[ColumnType::String, ColumnType::Long, ColumnType::Double],
+        ));
+        let right_schema = Arc::new(Schema::from_strs(
+            &["cusip", "sector"],
+            &[ColumnType::String, ColumnType::String],
+        ));
+        let mut left = ColumnStore::new(left_schema.clone(), 16);
+        let mut right = ColumnStore::new(right_schema.clone(), 16);
+        let push_left = |s: &mut ColumnStore, cusip: &str, qty: i64, mv: f64| {
+            s.append_row(&[
+                Value::String(Some(CompactString::new(cusip))),
+                Value::Long(qty),
+                Value::Double(mv),
+            ]);
+        };
+        let push_right = |s: &mut ColumnStore, cusip: &str, sector: &str| {
+            s.append_row(&[
+                Value::String(Some(CompactString::new(cusip))),
+                Value::String(Some(CompactString::new(sector))),
+            ]);
+        };
+        push_left(&mut left, "AAPL", 100, 15_000.0);
+        push_left(&mut left, "MSFT", 50, 18_000.0);
+        push_left(&mut left, "JPM", 200, 22_000.0);
+        push_left(&mut left, "BAC", 75, 5_500.0);
+        push_left(&mut left, "ORPHAN", 999, 1.0); // no matching security → drops
+        push_right(&mut right, "AAPL", "Tech");
+        push_right(&mut right, "MSFT", "Tech");
+        push_right(&mut right, "JPM", "Banks");
+        push_right(&mut right, "BAC", "Banks");
+        push_right(&mut right, "UNUSED", "Energy"); // no left match → fine
+        let combined = Arc::new(combined_join_schema(
+            &left_schema,
+            &right_schema,
+            &["cusip".to_string()],
+        ));
+        (left, right, combined)
+    }
+
+    #[test]
+    fn join_aggregates_by_right_side_column() {
+        let (left, right, combined) = make_join_fixture();
+        let query = parse_query(
+            "SELECT sector, SUM(marketValue) AS exposure FROM positions \
+             JOIN securities USING (cusip) GROUP BY sector",
+            &combined,
+        )
+        .unwrap();
+        let result = execute_join_query(&query, &left, &right).unwrap();
+        // Tech: AAPL(15000) + MSFT(18000) = 33000
+        // Banks: JPM(22000) + BAC(5500) = 27500
+        // ORPHAN dropped (no right match); UNUSED dropped (no left match).
+        let mut got: std::collections::BTreeMap<String, f64> = Default::default();
+        for row in &result.rows {
+            let sec = row.get("sector").and_then(|v| v.as_str()).unwrap().to_string();
+            let exp = row.get("exposure").and_then(|v| v.as_f64()).unwrap();
+            got.insert(sec, exp);
+        }
+        assert_eq!(got.get("Tech").copied(), Some(33_000.0));
+        assert_eq!(got.get("Banks").copied(), Some(27_500.0));
+        assert!(!got.contains_key("Energy"));
+    }
+
+    #[test]
+    fn join_inner_drops_unmatched_rows() {
+        let (left, right, combined) = make_join_fixture();
+        // No GROUP BY, no aggregate — pure projection.
+        let query = parse_query(
+            "SELECT cusip, sector, qty FROM positions JOIN securities USING (cusip)",
+            &combined,
+        )
+        .unwrap();
+        let result = execute_join_query(&query, &left, &right).unwrap();
+        // 4 matched rows (AAPL, MSFT, JPM, BAC); ORPHAN dropped.
+        assert_eq!(result.rows.len(), 4);
+        let cusips: std::collections::HashSet<String> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("cusip").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(cusips.contains("AAPL"));
+        assert!(!cusips.contains("ORPHAN"));
+        assert!(!cusips.contains("UNUSED"));
+    }
+
+    #[test]
+    fn join_with_predicate_filters_post_join() {
+        let (left, right, combined) = make_join_fixture();
+        let query = parse_query(
+            "SELECT cusip FROM positions JOIN securities USING (cusip) \
+             WHERE sector = 'Banks'",
+            &combined,
+        )
+        .unwrap();
+        let result = execute_join_query(&query, &left, &right).unwrap();
+        // JPM + BAC are the only Banks rows.
+        assert_eq!(result.rows.len(), 2);
     }
 }

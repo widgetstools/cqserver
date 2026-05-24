@@ -1,5 +1,5 @@
 //! Integration test that runs the entire `corpus/` against both
-//! CQServer's `Topic::query` and a DuckDB in-memory connection,
+//! CQServer's `Topic::query` and an in-process DataFusion session,
 //! asserting result-set equality.
 //!
 //! Run with: `cargo test -p cq-differential-tests --release`
@@ -71,7 +71,7 @@ expected_rows:
 /// developer sees the full delta in one shot rather than fixing one,
 /// rerunning, finding the next, etc.
 #[test]
-fn corpus_against_duckdb() {
+fn corpus_against_datafusion() {
     let corpus_dir = format!("{}/corpus", env!("CARGO_MANIFEST_DIR"));
     let corpus = load_corpus(&corpus_dir).expect("load corpus");
     assert!(

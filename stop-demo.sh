@@ -77,8 +77,8 @@ else
   printf "${c_dim}No .demo-run dir; skipping tracked-process phase.${c_reset}\n"
 fi
 
-# ── Phase 2: sweep demo ports ──────────────────────────────────
-printf "${c_blue}▸ Phase 2: port sweep${c_reset}\n"
+# ── Phase 2: sweep demo ports + binary paths ───────────────────
+printf "${c_blue}▸ Phase 2: port + binary sweep${c_reset}\n"
 
 # 2a) TCP clients of cqserver (publisher, loader, sanity scripts).
 if [ -n "${client_pids:-}" ]; then
@@ -90,7 +90,18 @@ if [ -n "${client_pids:-}" ]; then
   done
 fi
 
-# 2b) Listeners on every demo port.
+# 2b) Kill cqserver by binary path. This catches the server even when
+# its expected ports (9007/9008/8085) were never bound or were bound by
+# something else — situations where the port sweep below would miss it.
+# Matching is anchored to this repo's target/ dir so we never touch
+# cqserver instances from other checkouts.
+for pat in "$ROOT/target/release/cqserver" "$ROOT/target/debug/cqserver"; do
+  for pid in $(pgrep -f "$pat" 2>/dev/null); do
+    kill_pid "$pid" "cqserver ($pat)"
+  done
+done
+
+# 2c) Listeners on every demo port (catches vite + anything else still up).
 for port in "${LISTEN_PORTS[@]}"; do
   for pid in $(lsof -ti :"$port" -sTCP:LISTEN 2>/dev/null); do
     kill_pid "$pid" "listener on :$port"

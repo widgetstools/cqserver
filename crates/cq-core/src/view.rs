@@ -43,7 +43,9 @@ use std::thread::JoinHandle;
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
 
-use crate::query::{parse_query, AggFn, ParsedQuery, QueryError};
+use crate::query::{
+    combined_join_schema, parse_query, peek_join, AggFn, ParsedQuery, QueryError,
+};
 use crate::schema::{ColumnType, Schema};
 use crate::subscription::group_key_canonical;
 use crate::topic::{MutationEvent, SharedTopic, Topic, TopicConfig, TopicError};
@@ -53,6 +55,10 @@ use crate::topic::{MutationEvent, SharedTopic, Topic, TopicConfig, TopicError};
 pub struct View {
     pub view_topic: SharedTopic,
     pub source_topic: SharedTopic,
+    /// S20 — optional right-side topic when the view's SQL uses
+    /// `... FROM A JOIN B USING (col)`. `None` for the common
+    /// single-source view.
+    pub right_topic: Option<SharedTopic>,
     pub query: ParsedQuery,
     /// `group_by` column names, in declaration order. Used to canonicalize
     /// each output row's group identity (passed to `group_key_canonical`).
@@ -79,33 +85,43 @@ pub enum ViewError {
     Topic(#[from] TopicError),
     #[error("view {view}: query must be an aggregate (SELECT ... GROUP BY ...)")]
     NotAggregate { view: String },
+    #[error("view {view}: SQL has a JOIN; use build_view_topic_joined")]
+    JoinWithoutRightTopic { view: String },
+    #[error("view {view}: expected a JOIN clause in the SQL but found none")]
+    ExpectedJoin { view: String },
+    #[error("view {view}: right-side JOIN topic `{right}` not found in the registry")]
+    RightTopicNotFound { view: String, right: String },
 }
 
 impl View {
-    /// Build the view topic's schema from a source schema + parsed
-    /// aggregate query. Exposed so the server can construct the view
-    /// topic before instantiating the `View` runner itself.
+    /// Build the view topic's schema from the *effective query
+    /// schema* (single-source schema for non-join views; the
+    /// combined `left ∪ right` schema for JOIN views) + parsed
+    /// aggregate query. Group-by columns and aggregate input
+    /// columns are resolved against this schema, so the derived
+    /// output schema preserves their declared types even when they
+    /// originate on the right side of a join.
     pub fn derive_view_schema(
-        source_schema: &Schema,
+        effective_schema: &Schema,
         query: &ParsedQuery,
     ) -> Schema {
         let mut names: Vec<String> = Vec::new();
         let mut types: Vec<ColumnType> = Vec::new();
         for &gi in &query.group_by {
-            names.push(source_schema.column_name(gi).to_string());
-            types.push(source_schema.column_type(gi));
+            names.push(effective_schema.column_name(gi).to_string());
+            types.push(effective_schema.column_type(gi));
         }
         for agg in &query.aggregates {
             names.push(agg.alias.clone());
             let ty = match (agg.func, agg.col) {
                 (AggFn::Count, _) => ColumnType::Long,
-                (AggFn::Sum, Some(c)) => match source_schema.column_type(c) {
+                (AggFn::Sum, Some(c)) => match effective_schema.column_type(c) {
                     ColumnType::Double => ColumnType::Double,
                     _ => ColumnType::Long,
                 },
                 (AggFn::Avg, _) => ColumnType::Double,
                 (AggFn::Min, Some(c)) | (AggFn::Max, Some(c)) => {
-                    source_schema.column_type(c)
+                    effective_schema.column_type(c)
                 }
                 // No-column MIN/MAX is rejected at parse time; the
                 // SUM(None) branch is similarly defensive.
@@ -118,9 +134,8 @@ impl View {
     }
 
     /// Parse the view's SQL against the source schema and prepare a
-    /// brand-new view `Topic` ready to be registered. Returns the
-    /// constructed (un-shared) topic plus the parsed query and the
-    /// `group_by` column names needed by `View::new`.
+    /// brand-new view `Topic`. The single-source variant — for
+    /// JOIN-bearing SQL use `build_view_topic_joined`.
     pub fn build_view_topic(
         source: &Topic,
         sql: &str,
@@ -129,6 +144,9 @@ impl View {
     ) -> Result<(Topic, ParsedQuery, Vec<String>), ViewError> {
         let source_schema = source.schema();
         let query = parse_query(sql, &source_schema)?;
+        if query.join.is_some() {
+            return Err(ViewError::JoinWithoutRightTopic { view: view_name });
+        }
         if query.group_by.is_empty() && query.aggregates.is_empty() {
             return Err(ViewError::NotAggregate { view: view_name });
         }
@@ -153,19 +171,79 @@ impl View {
         Ok((view_topic, query, group_by_names))
     }
 
-    /// Wire up the view runner against an already-registered view topic.
-    /// Performs the initial population pass so the view SOW reflects the
-    /// source's current contents before this returns.
+    /// S20 — build a JOIN view topic. Resolves the right-side topic
+    /// from the SQL via `peek_join`, looks up its schema, builds the
+    /// combined `left ∪ right` schema, parses the query against
+    /// THAT, and constructs the view topic. Callers (server
+    /// startup) typically pass a `resolve_right` closure that hits
+    /// the global topic registry; for tests, pass a closure that
+    /// returns the in-process right-side `&Topic`.
+    pub fn build_view_topic_joined(
+        source: &Topic,
+        right_resolver: impl FnOnce(&str) -> Option<SharedTopic>,
+        sql: &str,
+        view_name: String,
+        capacity: usize,
+    ) -> Result<(Topic, ParsedQuery, Vec<String>, SharedTopic), ViewError> {
+        let (_, right_topic_name, using) = peek_join(sql)?.ok_or_else(|| {
+            ViewError::ExpectedJoin {
+                view: view_name.clone(),
+            }
+        })?;
+        let right_topic = right_resolver(&right_topic_name).ok_or_else(|| {
+            ViewError::RightTopicNotFound {
+                view: view_name.clone(),
+                right: right_topic_name.clone(),
+            }
+        })?;
+        let left_schema = source.schema();
+        let right_schema = right_topic.schema();
+        let combined = Arc::new(combined_join_schema(&left_schema, &right_schema, &using));
+        let query = parse_query(sql, &combined)?;
+        if query.join.is_none() {
+            return Err(ViewError::ExpectedJoin { view: view_name });
+        }
+        if query.group_by.is_empty() && query.aggregates.is_empty() {
+            return Err(ViewError::NotAggregate { view: view_name });
+        }
+        let group_by_names: Vec<String> = query
+            .group_by
+            .iter()
+            .map(|&i| combined.column_name(i).to_string())
+            .collect();
+        let view_schema = Self::derive_view_schema(&combined, &query);
+        let view_topic = Topic::new(
+            TopicConfig {
+                name: view_name,
+                key_fields: group_by_names.clone(),
+                persist: false,
+                conflation_ms: None,
+                index_columns: Vec::new(),
+                expire_seconds: None,
+            },
+            Arc::new(view_schema),
+            capacity,
+        );
+        Ok((view_topic, query, group_by_names, right_topic))
+    }
+
+    /// Wire up the view runner against an already-registered view
+    /// topic. Performs the initial population pass so the view SOW
+    /// reflects the source's current contents before this returns.
+    /// For JOIN views, pass the right-side topic; the refresh path
+    /// then routes through `execute_join_query` against both stores.
     pub fn new(
         source_topic: SharedTopic,
         view_topic: SharedTopic,
         query: ParsedQuery,
         group_by_names: Vec<String>,
+        right_topic: Option<SharedTopic>,
     ) -> Result<Arc<Self>, ViewError> {
         let view_key_names = group_by_names.clone();
         let view = Arc::new(View {
             view_topic,
             source_topic,
+            right_topic,
             query,
             group_by_names,
             view_key_names,
@@ -175,11 +253,23 @@ impl View {
         Ok(view)
     }
 
-    /// Re-execute the view query against the source store, diff against
-    /// the last-emitted snapshot, and apply per-group upsert/delete to
+    /// Re-execute the view query against the source store (and the
+    /// right-side topic if a JOIN is configured), diff against the
+    /// last-emitted snapshot, and apply per-group upsert/delete to
     /// the view topic.
     pub fn refresh(&self) -> Result<(), ViewError> {
-        let result = self.source_topic.execute_parsed_query(&self.query);
+        let result = match (&self.query.join, &self.right_topic) {
+            (Some(_), Some(right)) => self.source_topic.execute_join_query(
+                &self.query,
+                right.as_ref(),
+            )?,
+            (None, _) => self.source_topic.execute_parsed_query(&self.query),
+            (Some(_), None) => {
+                return Err(ViewError::JoinWithoutRightTopic {
+                    view: self.view_topic.name().to_string(),
+                });
+            }
+        };
 
         let mut state = self.state.lock();
         let mut next: HashMap<String, serde_json::Map<String, serde_json::Value>> =
@@ -271,4 +361,37 @@ pub fn spawn_view_runner(view: Arc<View>, tap_rx: Receiver<MutationEvent>) -> Jo
             tracing::info!(view = %view_name, "View runner exiting");
         })
         .expect("view runner spawn")
+}
+
+/// S20 — for JOIN views, the runner needs to wake on EITHER source
+/// or right-side mutations. We merge two `crossbeam_channel`
+/// `Receiver`s onto a single internal channel and hand the merged
+/// receiver to `spawn_view_runner`. Both tap channels are bounded
+/// (the source registers via `Topic::register_view_tap`); a
+/// background select-thread forwards events from each tap to the
+/// merged channel.
+pub fn spawn_view_runner_joined(
+    view: Arc<View>,
+    left_tap: Receiver<MutationEvent>,
+    right_tap: Receiver<MutationEvent>,
+) -> JoinHandle<()> {
+    let (merged_tx, merged_rx) = crossbeam_channel::bounded::<MutationEvent>(1024);
+    // Forward thread: select on either tap; exit when both are closed.
+    let view_name = view.view_topic.name().to_string();
+    std::thread::Builder::new()
+        .name(format!("view-fanin:{}", view_name))
+        .spawn(move || loop {
+            crossbeam_channel::select! {
+                recv(left_tap) -> msg => match msg {
+                    Ok(ev) => { let _ = merged_tx.send(ev); }
+                    Err(_) => return,
+                },
+                recv(right_tap) -> msg => match msg {
+                    Ok(ev) => { let _ = merged_tx.send(ev); }
+                    Err(_) => return,
+                },
+            }
+        })
+        .expect("view fan-in spawn");
+    spawn_view_runner(view, merged_rx)
 }

@@ -516,9 +516,26 @@ impl ColumnStore {
 
     // ========================= Internal =========================
 
-    /// Double the capacity of all arrays.
+    /// Grow capacity. Doubling is amortized-O(1) but wastes up to 50%
+    /// of memory at the boundary — fine for small stores, painful on
+    /// wide topics (a 1 M-row /trades topic ends up reserving 2 M
+    /// rows × N columns × 8 bytes, hundreds of MB of slack).
+    ///
+    /// Strategy:
+    ///   * capacity < 64K      → double (latency: hot path on small
+    ///                           topics where the absolute slack is
+    ///                           negligible)
+    ///   * capacity ≥ 64K      → grow by max(64K, capacity / 4) —
+    ///                           still amortized-O(1) (25 % growth
+    ///                           rate) but caps wasted slack at ~25 %
     fn grow(&mut self) {
-        let new_cap = self.capacity * 2;
+        const ADDITIVE_THRESHOLD: usize = 64 * 1024;
+        const MIN_GROWTH: usize = 64 * 1024;
+        let new_cap = if self.capacity < ADDITIVE_THRESHOLD {
+            self.capacity * 2
+        } else {
+            self.capacity + (self.capacity / 4).max(MIN_GROWTH)
+        };
         tracing::info!(
             old_cap = self.capacity,
             new_cap,
@@ -541,6 +558,54 @@ impl ColumnStore {
         self.row_versions
             .resize_with(new_cap, || AtomicU64::new(0));
         self.capacity = new_cap;
+    }
+}
+
+impl ColumnStore {
+    /// Trim unused capacity from the end of every column.
+    ///
+    /// Safe whenever no concurrent writer holds a row index ≥
+    /// `row_count` — i.e. when called under the topic's write lock.
+    /// Row indices `< row_count` are referenced by `key_to_row` and
+    /// other per-topic indices, so we never touch those slots; we
+    /// only release the slack past `row_count` that `grow()` reserved.
+    ///
+    /// Returns the new capacity. No-op when `row_count == capacity`
+    /// or when the slack is below `MIN_RECLAIM` (avoids thrashing on
+    /// stores that are about to grow again).
+    pub fn shrink_to_fit(&mut self) -> usize {
+        const MIN_RECLAIM: usize = 16 * 1024;
+        let live = self.row_count.load(Ordering::Acquire) as usize;
+        let target = live.max(1);
+        if self.capacity.saturating_sub(target) < MIN_RECLAIM {
+            return self.capacity;
+        }
+        tracing::info!(
+            old_cap = self.capacity,
+            new_cap = target,
+            live,
+            "Shrinking column store"
+        );
+        for col in &mut self.double_cols {
+            col.truncate(target);
+            col.shrink_to_fit();
+        }
+        for col in &mut self.long_cols {
+            col.truncate(target);
+            col.shrink_to_fit();
+        }
+        for col in &mut self.int_cols {
+            col.truncate(target);
+            col.shrink_to_fit();
+        }
+        for col in &mut self.string_cols {
+            col.truncate(target);
+            col.shrink_to_fit();
+        }
+        self.row_versions.truncate(target);
+        self.row_versions.shrink_to_fit();
+        self.capacity = target;
+        target
     }
 }
 

@@ -1,5 +1,5 @@
 //! Streaming differential harness: feed events one at a time, after
-//! each event compare CQ's materialized SOW state against DuckDB's
+//! each event compare CQ's materialized SOW state against DataFusion's
 //! batch query result at the same logical point.
 //!
 //! This is the harder, more realistic shape of differential testing
@@ -13,19 +13,23 @@
 //! continuous-query shapes) is the next session's work (S36
 //! continuation or follow-up).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use arrow::array::{Array, Int64Array, Int64Builder};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
 use cq_core::schema::{ColumnType, Schema};
 use cq_core::topic::{Topic, TopicConfig};
-use duckdb::Connection;
+use datafusion::datasource::MemTable;
+use datafusion::execution::context::SessionContext;
 use serde_json::{json, Value};
 
 fn cq_to_set(rows: Vec<serde_json::Map<String, Value>>) -> HashSet<String> {
     rows.into_iter()
         .map(|m| {
             // Normalize: drop explicit nulls so CQ's omit-null style
-            // and DuckDB's explicit-null style compare equal.
+            // and DataFusion's explicit-null style compare equal.
             let normalized: serde_json::Map<String, Value> = m
                 .into_iter()
                 .filter(|(_, v)| !v.is_null())
@@ -35,47 +39,67 @@ fn cq_to_set(rows: Vec<serde_json::Map<String, Value>>) -> HashSet<String> {
         .collect()
 }
 
-fn duckdb_rows_to_set(conn: &Connection, sql: &str) -> HashSet<String> {
-    let mut stmt = conn.prepare(sql).expect("prep");
-    let mut rows = stmt.query([]).expect("query");
-    let names: Vec<String> = rows
-        .as_ref()
-        .map(|s| {
-            s.column_names()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut out = HashSet::new();
-    while let Some(row) = rows.next().expect("next") {
-        let mut map = serde_json::Map::new();
-        for (i, n) in names.iter().enumerate() {
-            let v: duckdb::types::Value = row.get(i).expect("col");
-            let jv = match v {
-                duckdb::types::Value::Null => Value::Null,
-                duckdb::types::Value::BigInt(n) => Value::Number(n.into()),
-                duckdb::types::Value::Int(n) => Value::Number((n as i64).into()),
-                duckdb::types::Value::Double(n) => {
-                    serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null)
+/// Take the current id→v mirror, build a fresh DataFusion table
+/// from it, and return the result of `SELECT id, v FROM t` as a
+/// canonical-JSON set for comparison.
+fn datafusion_snapshot(
+    runtime: &tokio::runtime::Runtime,
+    mirror: &BTreeMap<i64, i64>,
+) -> HashSet<String> {
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let mut id_b = Int64Builder::with_capacity(mirror.len());
+    let mut v_b = Int64Builder::with_capacity(mirror.len());
+    for (id, v) in mirror {
+        id_b.append_value(*id);
+        v_b.append_value(*v);
+    }
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![Arc::new(id_b.finish()), Arc::new(v_b.finish())],
+    )
+    .expect("build batch");
+
+    runtime.block_on(async move {
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(arrow_schema, vec![vec![batch]]).expect("memtable");
+        ctx.register_table("t", Arc::new(table)).expect("register");
+        let df = ctx.sql("SELECT id, v FROM t").await.expect("plan");
+        let batches = df.collect().await.expect("collect");
+        let mut out = HashSet::new();
+        for batch in batches {
+            let id_arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let v_arr = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let mut m = serde_json::Map::new();
+                if !id_arr.is_null(row) {
+                    m.insert("id".to_string(), json!(id_arr.value(row)));
                 }
-                duckdb::types::Value::Text(s) => Value::String(s),
-                other => Value::String(format!("{other:?}")),
-            };
-            if !jv.is_null() {
-                map.insert(n.clone(), jv);
+                if !v_arr.is_null(row) {
+                    m.insert("v".to_string(), json!(v_arr.value(row)));
+                }
+                out.insert(serde_json::to_string(&m).unwrap());
             }
         }
-        out.insert(serde_json::to_string(&map).unwrap());
-    }
-    out
+        out
+    })
 }
 
 /// One continuous query (SELECT * FROM t) over a stream of upserts +
-/// deletes. After EVERY operation, the CQ SOW state and DuckDB's
+/// deletes. After EVERY operation, the CQ SOW state and DataFusion's
 /// batch query of the equivalent state must agree.
 #[test]
-fn streaming_sow_stays_in_lockstep_with_duckdb_after_each_op() {
+fn streaming_sow_stays_in_lockstep_with_datafusion_after_each_op() {
     // CQ side: a topic with two columns.
     let schema = Arc::new(Schema::from_strs(
         &["id", "v"],
@@ -94,10 +118,16 @@ fn streaming_sow_stays_in_lockstep_with_duckdb_after_each_op() {
         64,
     );
 
-    // DuckDB side: matching schema.
-    let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)", [])
-        .expect("create");
+    // DataFusion side: we mirror the topic's keyed state in a small
+    // BTreeMap and rebuild a MemTable from it after every op. Each
+    // comparison runs a fresh query against that table — so we're
+    // genuinely re-deriving the snapshot from scratch (the reference
+    // semantics), not just trusting the mirror.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut mirror: BTreeMap<i64, i64> = BTreeMap::new();
 
     // Test trace: upserts that include new keys + updates to existing
     // keys + deletes. After every step we recompute SOW from both
@@ -120,33 +150,11 @@ fn streaming_sow_stays_in_lockstep_with_duckdb_after_each_op() {
                 m.insert("id".into(), json!(id));
                 m.insert("v".into(), json!(value.unwrap()));
                 topic.upsert_map(&m).expect("cq upsert");
+                mirror.insert(*id, value.unwrap());
             }
             "delete" => {
                 let _ = topic.delete(&id.to_string());
-            }
-            _ => unreachable!(),
-        }
-        // Apply to DuckDB. UPSERT semantics: DELETE existing, then
-        // INSERT (with PRIMARY KEY clearing handled implicitly by
-        // INSERT OR REPLACE).
-        match *op {
-            "upsert" => {
-                let v = value.unwrap();
-                conn.execute(
-                    "INSERT OR REPLACE INTO t (id, v) VALUES (?, ?)",
-                    [
-                        &(*id as i64) as &dyn duckdb::ToSql,
-                        &v as &dyn duckdb::ToSql,
-                    ],
-                )
-                .expect("dd upsert");
-            }
-            "delete" => {
-                conn.execute(
-                    "DELETE FROM t WHERE id = ?",
-                    [&(*id as i64) as &dyn duckdb::ToSql],
-                )
-                .expect("dd delete");
+                mirror.remove(id);
             }
             _ => unreachable!(),
         }
@@ -157,13 +165,13 @@ fn streaming_sow_stays_in_lockstep_with_duckdb_after_each_op() {
             .query("SELECT id, v FROM t")
             .expect("cq query")
             .rows;
-        let dd_set = duckdb_rows_to_set(&conn, "SELECT id, v FROM t");
+        let df_set = datafusion_snapshot(&runtime, &mirror);
         let cq_set = cq_to_set(cq_rows);
 
         assert_eq!(
-            cq_set, dd_set,
-            "streaming divergence after {op} id={id} v={:?}:\n  cq:     {:?}\n  duckdb: {:?}",
-            value, cq_set, dd_set
+            cq_set, df_set,
+            "streaming divergence after {op} id={id} v={:?}:\n  cq:         {:?}\n  datafusion: {:?}",
+            value, cq_set, df_set
         );
     }
 }

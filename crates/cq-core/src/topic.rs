@@ -247,6 +247,18 @@ impl Topic {
         Ok(())
     }
 
+    /// Release any over-provisioned tail slack in the column store.
+    /// Takes the topic write lock so it cannot race with publishers;
+    /// reads are unaffected (they see the same `row_count`).
+    ///
+    /// Returns `(old_capacity, new_capacity)`.
+    pub fn shrink_store(&self) -> (usize, usize) {
+        let mut state = self.state.write();
+        let old = state.store.capacity();
+        let new = state.store.shrink_to_fit();
+        (old, new)
+    }
+
     /// Highest sequence ever assigned by this topic. Bookmarks reference
     /// this value.
     pub fn current_sequence(&self) -> u64 {
@@ -1087,6 +1099,22 @@ impl Topic {
         )
     }
 
+    /// S20 — execute a JOIN query that uses this topic as the LEFT
+    /// side and `right` as the RIGHT side. Both stores are read
+    /// under their topics' read locks for the duration of the join
+    /// (read locks compose: writers on either side will queue, but
+    /// concurrent readers are fine). The aggregate / projection
+    /// stages run over the materialized combined row set.
+    pub fn execute_join_query(
+        &self,
+        parsed: &ParsedQuery,
+        right: &Topic,
+    ) -> Result<QueryResult, QueryError> {
+        let left_state = self.state.read();
+        let right_state = right.state.read();
+        crate::query::execute_join_query(parsed, &left_state.store, &right_state.store)
+    }
+
     pub fn query(&self, sql: &str) -> Result<QueryResult, QueryError> {
         let state = self.state.read();
         let parsed = parse_query(sql, &state.schema)?;
@@ -1263,6 +1291,61 @@ impl Topic {
         sql: &str,
     ) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, ParsedQuery), QueryError> {
         self.subscribe_inner(sub_id, sql, true, true)
+    }
+
+    /// Register a subscription without materializing the initial
+    /// snapshot as a `Vec<Map>`. Use this from the transport layer when
+    /// wire delivery uses `query_streaming` — it skips the entire
+    /// `execute_query(...)` call for non-aggregate queries, which is
+    /// the dominant cost on wide topics (e.g. `/trades` with 800K
+    /// rows would otherwise allocate ~1 GB of `serde_json::Map`s
+    /// per subscriber just to discard them).
+    ///
+    /// Aggregate / GROUP BY subscriptions still run `execute_query`
+    /// internally to seed `last_emitted` — but their result is
+    /// bounded by group cardinality, not row count, so it's safe.
+    ///
+    /// Returns the parsed query; the caller should drive wire
+    /// delivery via `query_streaming`.
+    pub fn subscribe_register(
+        &self,
+        sub_id: String,
+        sql: &str,
+        sparse: bool,
+    ) -> Result<ParsedQuery, QueryError> {
+        let state = self.state.read();
+        let query = parse_query(sql, &state.schema)?;
+        let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
+        let captured = self.next_sequence.load(Ordering::SeqCst);
+        let mut engine = self.sub_engine.lock();
+        let mut sub =
+            Subscription::new(sub_id.clone(), query.clone()).with_live_start(captured + 1);
+        if sparse {
+            sub = sub.into_sparse(state.key_col_indices.clone());
+        }
+        if is_aggregate {
+            // Aggregate subs need a seed snapshot for `last_emitted`.
+            // Cardinality is bounded by GROUP BY, not row count.
+            let result = execute_query(&query, &state.store);
+            let mut sub_with_agg = sub.into_aggregating();
+            let group_names: Vec<String> = sub_with_agg
+                .query
+                .group_by
+                .iter()
+                .map(|&i| state.schema.column_name(i).to_string())
+                .collect();
+            if let Some(agg) = sub_with_agg.aggregate.as_mut() {
+                for row in &result.rows {
+                    let k = crate::subscription::group_key_canonical(row, &group_names);
+                    agg.last_emitted.insert(k, row.clone());
+                }
+            }
+            engine.add(sub_with_agg);
+        } else {
+            engine.add(sub);
+            engine.seed_active_set(&sub_id, &state.store);
+        }
+        Ok(query)
     }
 
     fn subscribe_inner(

@@ -3,6 +3,26 @@
 //! A high-performance, content-aware messaging server written in Rust.
 //! Drop-in replacement for AMPS (60East Technologies).
 
+// Replace the system allocator with jemalloc on non-MSVC targets.
+// Tuned for bursty workloads where peak heap usage (SOW snapshot
+// delivery to slow WebSocket clients) is much higher than steady
+// state:
+//   - background_threads (feature)  → jemalloc purges on its own
+//     thread, no application calls needed.
+//   - dirty_decay_ms:1000           → return dirty pages to the OS
+//                                     1 s after they're freed.
+//   - muzzy_decay_ms:1000           → same for "muzzy" (uncommitted)
+//                                     pages — keeps RSS close to the
+//                                     working set.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 mod admin;
 mod config;
 mod logging;
@@ -12,7 +32,8 @@ use admin::{start_admin_server, AdminState};
 use config::{ColumnTypeSpec, ReplicationRole, TopicEntry, TxLogFsyncConfig, ViewEntry};
 use cq_core::schema::{ColumnType, Schema};
 use cq_core::topic::{SharedTopic, Topic, TopicConfig};
-use cq_core::view::{spawn_view_runner, View};
+use cq_core::query::peek_join;
+use cq_core::view::{spawn_view_runner, spawn_view_runner_joined, View};
 use cq_replication::{receiver as repl_recv, shipper as repl_ship};
 use cq_transport::auth::{AuthStore, User};
 use cq_transport::delivery::spawn_evaluator;
@@ -669,13 +690,40 @@ fn init_view(
         .map(|e| e.value().clone())
         .ok_or_else(|| format!("source topic `{}` not found", cfg.source))?;
 
-    let (view_topic, query, group_by_names) = View::build_view_topic(
-        &source,
-        &cfg.sql,
-        cfg.name.clone(),
-        cfg.initial_capacity,
-    )
-    .map_err(|e| format!("build view topic: {}", e))?;
+    // S20 — detect a JOIN clause on the view SQL. JOIN views go
+    // through `build_view_topic_joined` (parses against the
+    // combined left∪right schema) and the runner fans both source
+    // taps into a single refresh signal; un-joined views take the
+    // single-source path as before.
+    let join_topics = peek_join(&cfg.sql)
+        .map_err(|e| format!("parse view sql: {}", e))?;
+
+    let (view_topic, query, group_by_names, right_topic_opt): (
+        cq_core::topic::Topic,
+        cq_core::query::ParsedQuery,
+        Vec<String>,
+        Option<SharedTopic>,
+    ) = if join_topics.is_some() {
+        let topics_for_resolver = topics.clone();
+        let (vt, q, g, rt) = View::build_view_topic_joined(
+            &source,
+            move |name| topics_for_resolver.get(name).map(|e| e.value().clone()),
+            &cfg.sql,
+            cfg.name.clone(),
+            cfg.initial_capacity,
+        )
+        .map_err(|e| format!("build joined view topic: {}", e))?;
+        (vt, q, g, Some(rt))
+    } else {
+        let (vt, q, g) = View::build_view_topic(
+            &source,
+            &cfg.sql,
+            cfg.name.clone(),
+            cfg.initial_capacity,
+        )
+        .map_err(|e| format!("build view topic: {}", e))?;
+        (vt, q, g, None)
+    };
     let view_topic_arc = Arc::new(view_topic);
 
     // Take the view topic's own mutation receiver before anyone else
@@ -686,15 +734,27 @@ fn init_view(
         .take_mutation_rx()
         .expect("freshly-created view topic must have an rx");
 
-    let tap_rx = source.register_view_tap(cfg.tap_capacity);
+    let left_tap = source.register_view_tap(cfg.tap_capacity);
+    let right_tap = right_topic_opt
+        .as_ref()
+        .map(|r| r.register_view_tap(cfg.tap_capacity));
 
-    let view = View::new(source, view_topic_arc.clone(), query, group_by_names)
-        .map_err(|e| format!("instantiate view: {}", e))?;
+    let view = View::new(
+        source,
+        view_topic_arc.clone(),
+        query,
+        group_by_names,
+        right_topic_opt,
+    )
+    .map_err(|e| format!("instantiate view: {}", e))?;
 
     // The view's runner thread keeps the view SOW in sync with the
-    // source; the view-topic evaluator dispatches deltas to view
+    // source(s); the view-topic evaluator dispatches deltas to view
     // subscribers. Both run for the process lifetime.
-    let _runner = spawn_view_runner(view, tap_rx);
+    let _runner = match right_tap {
+        Some(rt) => spawn_view_runner_joined(view, left_tap, rt),
+        None => spawn_view_runner(view, left_tap),
+    };
     let evaluator_handle = cq_transport::delivery::spawn_evaluator(
         view_topic_arc.clone(),
         view_topic_rx,

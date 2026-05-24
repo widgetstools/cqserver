@@ -60,6 +60,7 @@ fn build_view(
         view_topic_arc.clone(),
         query,
         group_by_names,
+        None,
     )
     .expect("new view");
     let _ = spawn_view_runner(view.clone(), tap_rx);

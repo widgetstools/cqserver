@@ -3,13 +3,13 @@
 //!
 //! For each YAML test case, the harness:
 //!   1. Builds a CQServer `Topic` matching the case's schema.
-//!   2. Builds an in-memory DuckDB connection with the same schema.
+//!   2. Builds an in-memory DataFusion session with the same schema.
 //!   3. Applies the case's `publishes` to both: `upsert_map` on CQ,
-//!      INSERT statements on DuckDB.
+//!      an Arrow `RecordBatch` registered as `t` on DataFusion.
 //!   4. Runs the case's `query` against both.
 //!   5. Compares the result sets. If `expected_rows` is provided, it's
-//!      also asserted (catches a DuckDB upgrade that itself changes
-//!      semantics on us).
+//!      also asserted (catches a DataFusion upgrade that itself
+//!      changes semantics on us).
 //!
 //! The point is to find places where CQServer's SQL semantics drift
 //! from a reference engine — NULL handling in `IN`, type coercion in
@@ -17,15 +17,25 @@
 //! behavior on empty groups, etc. Unit tests in `cq-core` will
 //! almost never catch these because no human pre-imagines every edge
 //! case; the corpus accumulates them.
+//!
+//! Why DataFusion over DuckDB: pure-Rust dependency tree, so this
+//! crate builds without an MSVC + Windows-SDK toolchain on Windows.
+//! Compile-time cost is higher than tiny SQL crates but well-cached.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
+use arrow::array::{
+    ArrayRef, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
 use cq_core::schema::{ColumnType, Schema};
 use cq_core::topic::{Topic, TopicConfig};
-use duckdb::Connection;
+use datafusion::datasource::MemTable;
+use datafusion::execution::context::SessionContext;
 use serde::Deserialize;
 
 /// A single differential test case loaded from YAML.
@@ -33,7 +43,7 @@ use serde::Deserialize;
 pub struct TestCase {
     pub name: String,
     pub schema: Vec<ColumnDef>,
-    /// Key column for the CQ topic (DuckDB doesn't need one).
+    /// Key column for the CQ topic (DataFusion doesn't need one).
     pub key: String,
     /// Rows to publish before running the query. JSON-shaped.
     pub publishes: Vec<serde_json::Map<String, serde_json::Value>>,
@@ -48,9 +58,9 @@ pub struct TestCase {
     #[serde(default)]
     pub notes: Option<String>,
     /// If true, the test is expected to diverge (CQ does something
-    /// different from DuckDB on purpose). The harness then asserts
-    /// the engines disagree AND that `expected_rows` matches CQ.
-    /// Useful for documenting deliberate extensions.
+    /// different from DataFusion on purpose). The harness then
+    /// asserts the engines disagree AND that `expected_rows` matches
+    /// CQ. Useful for documenting deliberate extensions.
     #[serde(default)]
     pub expect_divergence: bool,
 }
@@ -73,12 +83,12 @@ impl ColumnDef {
         }
     }
 
-    fn duckdb_type(&self) -> Result<&'static str> {
+    fn arrow_type(&self) -> Result<DataType> {
         match self.ty.as_str() {
-            "string" => Ok("VARCHAR"),
-            "double" => Ok("DOUBLE"),
-            "long" => Ok("BIGINT"),
-            "int" => Ok("INTEGER"),
+            "string" => Ok(DataType::Utf8),
+            "double" => Ok(DataType::Float64),
+            "long" => Ok(DataType::Int64),
+            "int" => Ok(DataType::Int32),
             other => bail!("unknown column type: {other}"),
         }
     }
@@ -135,143 +145,248 @@ fn build_topic(case: &TestCase) -> Result<Topic> {
     Ok(Topic::new(config, schema, 256))
 }
 
-/// Build an in-memory DuckDB connection with a single table `t` whose
-/// columns mirror the test case's schema.
-fn build_duckdb(case: &TestCase) -> Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    let mut cols = Vec::new();
-    for c in &case.schema {
-        cols.push(format!("{} {}", c.name, c.duckdb_type()?));
-    }
-    let sql = format!("CREATE TABLE t ({})", cols.join(", "));
-    conn.execute(&sql, [])?;
-    Ok(conn)
+/// Build an Arrow schema matching the test case.
+fn build_arrow_schema(case: &TestCase) -> Result<ArrowSchema> {
+    let fields = case
+        .schema
+        .iter()
+        .map(|c| Ok(Field::new(&c.name, c.arrow_type()?, true)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ArrowSchema::new(fields))
 }
 
-/// Push the case's `publishes` into both engines.
-fn apply_publishes(case: &TestCase, topic: &Topic, conn: &Connection) -> Result<()> {
+/// Build a single RecordBatch from every publish in the case. Missing
+/// columns per row → NULL. Schema-mirror to what CQServer's topic
+/// holds in its column store after `upsert_map` on every row.
+fn build_record_batch(
+    case: &TestCase,
+    arrow_schema: &ArrowSchema,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(case.schema.len());
+    for col in &case.schema {
+        let arr: ArrayRef = match col.arrow_type()? {
+            DataType::Utf8 => {
+                let mut b = StringBuilder::new();
+                for row in &case.publishes {
+                    match row.get(&col.name) {
+                        Some(serde_json::Value::String(s)) => b.append_value(s),
+                        Some(serde_json::Value::Null) | None => b.append_null(),
+                        Some(v) => b.append_value(&v.to_string()),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Float64 => {
+                let mut b = Float64Builder::with_capacity(case.publishes.len());
+                for row in &case.publishes {
+                    match row.get(&col.name).and_then(|v| v.as_f64()) {
+                        Some(v) => b.append_value(v),
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Int64 => {
+                let mut b = Int64Builder::with_capacity(case.publishes.len());
+                for row in &case.publishes {
+                    match row.get(&col.name).and_then(|v| v.as_i64()) {
+                        Some(v) => b.append_value(v),
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Int32 => {
+                let mut b = Int32Builder::with_capacity(case.publishes.len());
+                for row in &case.publishes {
+                    match row.get(&col.name).and_then(|v| v.as_i64()) {
+                        Some(v) if i32::try_from(v).is_ok() => {
+                            b.append_value(v as i32);
+                        }
+                        _ => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            other => bail!("unsupported arrow type: {other:?}"),
+        };
+        columns.push(arr);
+    }
+    Ok(RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)?)
+}
+
+/// Push the case's `publishes` into the CQ topic. (DataFusion is
+/// populated separately via `build_record_batch` + `register_table`.)
+fn apply_publishes_to_topic(case: &TestCase, topic: &Topic) -> Result<()> {
     for row in &case.publishes {
-        // CQ side.
         topic.upsert_map(row).with_context(|| {
-            format!("upsert_map on {}: {}", case.name, serde_json::to_string(row).unwrap())
+            format!(
+                "upsert_map on {}: {}",
+                case.name,
+                serde_json::to_string(row).unwrap_or_default()
+            )
         })?;
-
-        // DuckDB side. Build an INSERT with the columns we have a
-        // value for; missing columns become NULL (DuckDB default).
-        let cols: Vec<&str> = row.keys().map(|s| s.as_str()).collect();
-        let placeholders: Vec<&str> = (0..cols.len()).map(|_| "?").collect();
-        let sql = format!(
-            "INSERT INTO t ({}) VALUES ({})",
-            cols.join(", "),
-            placeholders.join(", ")
-        );
-
-        let params: Vec<duckdb::types::Value> = row.values().map(json_to_duckdb).collect();
-        let param_refs: Vec<&dyn duckdb::ToSql> = params
-            .iter()
-            .map(|v| v as &dyn duckdb::ToSql)
-            .collect();
-        conn.execute(&sql, param_refs.as_slice())?;
     }
     Ok(())
 }
 
-fn json_to_duckdb(v: &serde_json::Value) -> duckdb::types::Value {
-    use duckdb::types::Value as DV;
-    use serde_json::Value as JV;
-    match v {
-        JV::Null => DV::Null,
-        JV::Bool(b) => DV::Boolean(*b),
-        JV::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                DV::BigInt(i)
-            } else if let Some(f) = n.as_f64() {
-                DV::Double(f)
-            } else {
-                DV::Null
-            }
-        }
-        JV::String(s) => DV::Text(s.clone()),
-        // Arrays / objects aren't supported in the corpus today; treat
-        // as NULL with a warning surfaced via the comparison failure.
-        _ => DV::Null,
-    }
+/// DataFusion's response to a query. Either we got rows back, or
+/// DataFusion bailed on parsing/planning — typically because the
+/// query uses a CQServer-specific extension (PIVOT, UNPIVOT, etc.)
+/// the reference engine doesn't speak. The harness treats the
+/// "unsupported" case as a graceful fallback to expected_rows-only
+/// verification.
+enum DataFusionOutcome {
+    Rows(Vec<serde_json::Map<String, serde_json::Value>>),
+    Unsupported(String),
 }
 
-/// Run the query against CQ and DuckDB, return the two result sets as
-/// JSON maps for easy comparison.
+/// Run the query against CQ and DataFusion. Returns CQ's rows
+/// unconditionally; the DataFusion side falls back to `Unsupported`
+/// when the reference engine can't even plan the query, so PIVOT /
+/// UNPIVOT / other CQ extensions don't fail the case outright.
 fn run_query(
     case: &TestCase,
     topic: &Topic,
-    conn: &Connection,
-) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, Vec<serde_json::Map<String, serde_json::Value>>)> {
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(Vec<serde_json::Map<String, serde_json::Value>>, DataFusionOutcome)> {
     let cq_result = topic
         .query(&case.query)
         .with_context(|| format!("CQ query on {}: {}", case.name, case.query))?;
     let cq_rows = cq_result.rows;
 
-    let mut stmt = conn.prepare(&case.query)?;
-    // duckdb-rs populates the prepared statement's column schema only
-    // after the statement is executed (see raw_statement.rs:248), so
-    // we cannot call `column_names()` before `query()`. Instead read
-    // the names from `Rows`, which exposes them after execution.
-    let mut rows = stmt.query([])?;
-    let column_names: Vec<String> = rows
-        .as_ref()
-        .map(|stmt| {
-            stmt.column_names()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut dd_rows = Vec::new();
-    while let Some(row) = rows.next()? {
-        let mut map = serde_json::Map::new();
-        for (i, name) in column_names.iter().enumerate() {
-            let v: duckdb::types::Value = row.get(i)?;
-            map.insert(name.clone(), duckdb_to_json(v));
+    let arrow_schema = Arc::new(build_arrow_schema(case)?);
+    let batch = build_record_batch(case, arrow_schema.as_ref())?;
+    let df_outcome: DataFusionOutcome = runtime.block_on(async move {
+        let ctx = SessionContext::new();
+        let table = MemTable::try_new(arrow_schema.clone(), vec![vec![batch]])?;
+        ctx.register_table("t", Arc::new(table))?;
+        match ctx.sql(&case.query).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => {
+                    let rows = record_batches_to_json(&batches)?;
+                    Result::<DataFusionOutcome>::Ok(DataFusionOutcome::Rows(rows))
+                }
+                Err(e) => Ok(DataFusionOutcome::Unsupported(e.to_string())),
+            },
+            Err(e) => Ok(DataFusionOutcome::Unsupported(e.to_string())),
         }
-        dd_rows.push(map);
-    }
-    Ok((cq_rows, dd_rows))
+    })?;
+    Ok((cq_rows, df_outcome))
 }
 
-fn duckdb_to_json(v: duckdb::types::Value) -> serde_json::Value {
-    use duckdb::types::Value as DV;
-    use serde_json::Value as JV;
-    match v {
-        DV::Null => JV::Null,
-        DV::Boolean(b) => JV::Bool(b),
-        DV::TinyInt(n) => JV::Number((n as i64).into()),
-        DV::SmallInt(n) => JV::Number((n as i64).into()),
-        DV::Int(n) => JV::Number((n as i64).into()),
-        DV::BigInt(n) => JV::Number(n.into()),
-        DV::UTinyInt(n) => JV::Number((n as u64).into()),
-        DV::USmallInt(n) => JV::Number((n as u64).into()),
-        DV::UInt(n) => JV::Number((n as u64).into()),
-        DV::UBigInt(n) => JV::Number(n.into()),
-        // DuckDB promotes SUM(BIGINT) to HUGEINT (128-bit). Demote
-        // back to i64 if it fits — sums in the corpus stay well
-        // inside i64 range — otherwise stringify so the comparison
-        // still surfaces meaningful diffs.
-        DV::HugeInt(n) => {
-            if let Ok(narrow) = i64::try_from(n) {
-                JV::Number(narrow.into())
+fn record_batches_to_json(
+    batches: &[RecordBatch],
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            let mut map = serde_json::Map::new();
+            for (i, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(i);
+                let val = arrow_scalar_to_json(col.as_ref(), row);
+                map.insert(field.name().clone(), val);
+            }
+            out.push(map);
+        }
+    }
+    Ok(out)
+}
+
+fn arrow_scalar_to_json(arr: &dyn arrow::array::Array, row: usize) -> serde_json::Value {
+    use arrow::array::*;
+    if arr.is_null(row) {
+        return serde_json::Value::Null;
+    }
+    match arr.data_type() {
+        DataType::Utf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+            serde_json::Value::String(a.value(row).to_string())
+        }
+        DataType::LargeUtf8 => {
+            let a = arr.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            serde_json::Value::String(a.value(row).to_string())
+        }
+        DataType::Boolean => {
+            let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            serde_json::Value::Bool(a.value(row))
+        }
+        DataType::Int8 => num_to_json(
+            arr.as_any().downcast_ref::<Int8Array>().unwrap().value(row) as i64,
+        ),
+        DataType::Int16 => num_to_json(
+            arr.as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::Int32 => num_to_json(
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::Int64 => {
+            num_to_json(arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row))
+        }
+        DataType::UInt8 => num_to_json(
+            arr.as_any().downcast_ref::<UInt8Array>().unwrap().value(row) as i64,
+        ),
+        DataType::UInt16 => num_to_json(
+            arr.as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::UInt32 => num_to_json(
+            arr.as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::UInt64 => {
+            // DataFusion typically promotes count() to UInt64. Demote
+            // to i64 when in range; stringify the rare out-of-range
+            // case so we still surface diffs cleanly.
+            let v = arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row);
+            if let Ok(narrow) = i64::try_from(v) {
+                serde_json::Value::Number(narrow.into())
             } else {
-                JV::String(n.to_string())
+                serde_json::Value::String(v.to_string())
             }
         }
-        DV::Float(n) => serde_json::Number::from_f64(n as f64).map(JV::Number).unwrap_or(JV::Null),
-        DV::Double(n) => serde_json::Number::from_f64(n).map(JV::Number).unwrap_or(JV::Null),
-        DV::Text(s) => JV::String(s),
-        other => JV::String(format!("{other:?}")),
+        DataType::Float32 => serde_json::Number::from_f64(
+            arr.as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row) as f64,
+        )
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null),
+        DataType::Float64 => serde_json::Number::from_f64(
+            arr.as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row),
+        )
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null),
+        other => serde_json::Value::String(format!("<unhandled: {other:?}>")),
     }
+}
+
+fn num_to_json(n: i64) -> serde_json::Value {
+    serde_json::Value::Number(n.into())
 }
 
 /// Normalize a row for comparison. CQServer's `Topic::query` omits
 /// null fields from its result maps (`ColumnStore::get_row_map`
-/// skips `val.is_null()`); DuckDB emits explicit `null`. Strip
+/// skips `val.is_null()`); DataFusion emits explicit `null`. Strip
 /// explicit nulls from both sides so the comparison reflects
 /// semantic equality rather than serialization style.
 fn normalize_row(
@@ -289,24 +404,24 @@ fn normalize_row(
 /// compare as ordered Vecs.
 fn result_sets_equal(
     cq: &[serde_json::Map<String, serde_json::Value>],
-    dd: &[serde_json::Map<String, serde_json::Value>],
+    df: &[serde_json::Map<String, serde_json::Value>],
     query: &str,
 ) -> bool {
     let cq_norm: Vec<_> = cq.iter().map(normalize_row).collect();
-    let dd_norm: Vec<_> = dd.iter().map(normalize_row).collect();
+    let df_norm: Vec<_> = df.iter().map(normalize_row).collect();
     let ordered = query.to_ascii_uppercase().contains("ORDER BY");
     if ordered {
-        return cq_norm == dd_norm;
+        return cq_norm == df_norm;
     }
     let cq_set: HashSet<String> = cq_norm
         .iter()
         .map(|m| serde_json::to_string(m).unwrap_or_default())
         .collect();
-    let dd_set: HashSet<String> = dd_norm
+    let df_set: HashSet<String> = df_norm
         .iter()
         .map(|m| serde_json::to_string(m).unwrap_or_default())
         .collect();
-    cq_set == dd_set
+    cq_set == df_set
 }
 
 /// Run a single test case end-to-end. Never panics; failures surface
@@ -328,15 +443,42 @@ pub fn run_case(case: &TestCase) -> CaseResult {
 
 fn try_run_case(case: &TestCase) -> Result<()> {
     let topic = build_topic(case)?;
-    let conn = build_duckdb(case)?;
-    apply_publishes(case, &topic, &conn)?;
-    let (cq_rows, dd_rows) = run_query(case, &topic, &conn)?;
-    let agree = result_sets_equal(&cq_rows, &dd_rows, &case.query);
+    apply_publishes_to_topic(case, &topic)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for DataFusion")?;
+    let (cq_rows, df_outcome) = run_query(case, &topic, &runtime)?;
+
+    // CQ-only path: DataFusion can't plan the query (it's a CQ
+    // extension like PIVOT / UNPIVOT). The case is valid only if
+    // expected_rows is declared — otherwise we have no oracle.
+    let df_rows = match df_outcome {
+        DataFusionOutcome::Rows(rows) => rows,
+        DataFusionOutcome::Unsupported(why) => {
+            let expected = case.expected_rows.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "DataFusion can't plan this query ({why}) — \
+                     case must declare expected_rows so we still have an oracle"
+                )
+            })?;
+            if !result_sets_equal(&cq_rows, expected, &case.query) {
+                bail!(
+                    "CQ-only (DataFusion: {why}) — CQ output ≠ declared expected:\n  cq: {}\n  expected: {}",
+                    serde_json::to_string(&cq_rows).unwrap_or_default(),
+                    serde_json::to_string(expected).unwrap_or_default()
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    let agree = result_sets_equal(&cq_rows, &df_rows, &case.query);
 
     if case.expect_divergence {
         if agree {
             bail!(
-                "expected CQ to diverge from DuckDB but they agreed:\n  rows: {}",
+                "expected CQ to diverge from DataFusion but they agreed:\n  rows: {}",
                 serde_json::to_string(&cq_rows).unwrap_or_default()
             );
         }
@@ -358,9 +500,9 @@ fn try_run_case(case: &TestCase) -> Result<()> {
 
     if !agree {
         bail!(
-            "result-set mismatch:\n  cq:     {}\n  duckdb: {}\n  query:  {}\n  notes:  {}",
+            "result-set mismatch:\n  cq:         {}\n  datafusion: {}\n  query:      {}\n  notes:      {}",
             serde_json::to_string(&cq_rows).unwrap_or_default(),
-            serde_json::to_string(&dd_rows).unwrap_or_default(),
+            serde_json::to_string(&df_rows).unwrap_or_default(),
             case.query,
             case.notes.as_deref().unwrap_or("—"),
         );

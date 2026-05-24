@@ -39,10 +39,12 @@ for name in server publisher react-demo; do
   fi
 done
 
-# Ports must be free.
+# Ports must be free. Only LISTENing sockets count — CLOSE_WAIT
+# stragglers from a recently-killed cqserver (browsers in particular
+# leave these around) don't actually block a fresh bind.
 for port in 9007 9008 8085 5173; do
-  if lsof -ti :"$port" >/dev/null 2>&1; then
-    fail "Port $port already in use (pid=$(lsof -ti :$port | head -1))"
+  if lsof -ti :"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    fail "Port $port already in use (pid=$(lsof -ti :$port -sTCP:LISTEN | head -1))"
   fi
 done
 ok "Ports 9007 9008 8085 5173 free"

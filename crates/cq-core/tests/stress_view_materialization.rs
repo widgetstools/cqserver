@@ -61,6 +61,7 @@ fn view_converges_under_concurrent_pressure() {
         view_topic_arc.clone(),
         query,
         group_by_names,
+        None,
     )
     .expect("view");
     let _runner = spawn_view_runner(view.clone(), tap_rx);

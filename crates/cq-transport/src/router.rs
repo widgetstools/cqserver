@@ -704,15 +704,13 @@ fn handle_sow_and_subscribe(
         } else {
             sql.clone()
         };
-        let subscribe_result = if sparse {
-            // Subscription state always uses the original SQL so live
-            // updates see every column they should.
-            topic.subscribe_sparse(sub_id.clone(), &sql)
-        } else {
-            topic.subscribe(sub_id.clone(), &sql)
-        };
+        // Register the subscription WITHOUT materializing a Vec<Map>
+        // snapshot — wire delivery uses `query_streaming` below, so
+        // there's no caller for the materialized snapshot. This saves
+        // ~1 GB transient heap per /trades-class subscriber.
+        let subscribe_result = topic.subscribe_register(sub_id.clone(), &sql, sparse);
         match subscribe_result {
-            Ok((snapshot, _)) => {
+            Ok(_) => {
                 session.subscriptions.push(sub_id.clone());
                 registry.insert(
                     sub_id.clone(),
@@ -731,12 +729,10 @@ fn handle_sow_and_subscribe(
                 metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
                     .increment(1.0);
 
-                // `_snapshot` returned by `topic.subscribe(..)` is the
-                // materialized snapshot — we keep it for ordering (the
-                // engine's active_set was just seeded from it) but the
-                // actual wire delivery uses `query_streaming` to avoid
-                // ever holding the full result in memory.
-                let _ = snapshot; // discarded: streaming path delivers it
+                // The subscription is now registered + the engine's
+                // active_set is seeded (via `subscribe_register`). Wire
+                // delivery uses `query_streaming` so no materialized
+                // snapshot is ever held in memory.
                 let tx = session.tx.clone();
                 let codec_slot = session.codec.clone();
                 let session_id = session.id.clone();
@@ -1002,7 +998,9 @@ fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) 
 
     if let Some(topic) = topics.get(&topic_name) {
         let conflation_ms = topic.conflation_ms();
-        match topic.subscribe(sub_id.clone(), &sql) {
+        // Live-only subscribe (no snapshot delivery on this path) —
+        // register without materializing any Vec<Map>.
+        match topic.subscribe_register(sub_id.clone(), &sql, false) {
             Ok(_) => {
                 session.subscriptions.push(sub_id.clone());
                 registry.insert(

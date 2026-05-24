@@ -25,6 +25,16 @@ anyhow.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 axum.workspace = true
+memory-stats = "1.2"
+
+# Custom allocator: jemalloc returns freed pages to the OS more
+# aggressively than the system malloc and reduces fragmentation on
+# bursty workloads (SOW snapshot delivery, in our case). Built with
+# `background_threads` so the background purge thread runs without
+# any application help, and `unprefixed_malloc_on_supported_platforms`
+# so jemalloc replaces the global `malloc` symbol on macOS/Linux.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 tower = "0.5"

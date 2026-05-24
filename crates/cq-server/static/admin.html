@@ -26,10 +26,11 @@
   header .nav a:hover { color: var(--text); }
   header .nav a.active { color: var(--accent); }
   main { padding: 20px; max-width: 1400px; margin: 0 auto; }
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 20px; }
   .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
   .stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
   .stat .value { font-size: 24px; font-weight: 600; margin-top: 6px; }
+  .stat .subvalue { color: var(--muted); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
   section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 20px; }
   section h2 { margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; }
   table { width: 100%; border-collapse: collapse; }
@@ -142,15 +143,30 @@ async function refresh() {
   }
 }
 
+function fmtMB(bytes) {
+  if (!bytes || bytes <= 0) return '—';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+function fmtGB(bytes) {
+  if (!bytes || bytes <= 0) return '—';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
 function renderStats(s) {
   const cards = [
-    ['Topics', s.topics ?? 0],
-    ['Total rows', s.totalRows ?? 0],
-    ['Subscriptions', s.totalSubscriptions ?? 0],
-    ['Active routes', s.activeRoutes ?? 0],
+    { label: 'Topics', value: s.topics ?? 0 },
+    { label: 'Total rows', value: s.totalRows ?? 0 },
+    { label: 'Subscriptions', value: s.totalSubscriptions ?? 0 },
+    { label: 'Active routes', value: s.activeRoutes ?? 0 },
+    { label: 'Memory (RSS)',     value: fmtMB(s.processRssBytes),     sub: fmtGB(s.processRssBytes) },
+    { label: 'Memory (virtual)', value: fmtMB(s.processVirtualBytes), sub: fmtGB(s.processVirtualBytes) },
   ];
-  document.getElementById('stats').innerHTML = cards.map(([l, v]) =>
-    `<div class="stat"><div class="label">${l}</div><div class="value">${v}</div></div>`
+  document.getElementById('stats').innerHTML = cards.map(c =>
+    `<div class="stat">
+       <div class="label">${c.label}</div>
+       <div class="value">${c.value}</div>
+       ${c.sub ? `<div class="subvalue">${c.sub}</div>` : ''}
+     </div>`
   ).join('');
 }
 
