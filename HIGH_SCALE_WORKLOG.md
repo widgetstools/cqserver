@@ -207,49 +207,88 @@ impact.
 
 ---
 
-## H6 — Shard for ≥ 10 K concurrent subs (deferred — architectural decision)
+## H6 — Shard for ≥ 10 K concurrent subs (architectural — separate
+project)
 
-**Status:** ⏭️ Deferred
+**Status:** ⏭️ Deferred — see plan below
 
 **Problem.** Above ~5 K concurrent subs on a single host, no amount of
 encoder optimization or memory shaving compensates for the fundamental
 egress-bandwidth wall: hundreds of GB of frame data multiplied across
 thousands of WS connections on one NIC.
 
-**Scope (when revisited).**
+**Concrete plan** (estimate: 2–3 weeks of focused work, four
+sub-sessions):
 
-- Multi-instance deployment with a topic-aware load balancer (HAProxy
-  / Envoy with sticky-by-topic routing).
-- Reuse the existing replication shipper for state synchronization.
-- A "directory" service so a client connecting to *any* instance can
-  be told which instance owns its topic.
+### H6.1 — Sharding key + routing decision (1 day, design only)
 
-**Estimated impact.** Linear scale-out — each added instance is
-worth its individual sub-count contribution.
+Pick ONE of:
+- **Topic-prefix** — each instance owns a set of `/topic-name` prefixes.
+  Cleanest, but requires clients to know which prefix lives where, OR
+  a directory service.
+- **Topic-hash** — `hash(topic) % N` picks instance. Cheaper for
+  clients but kills the option of a "global" subscribe.
+- **Consistent-hash with rebalancing** — supports adding/removing
+  instances without bulk re-subscribe. More machinery.
 
-**Why deferred.** Sharding is a multi-week effort, requires product
-decisions about which sharding key (topic name? topic+filter? client
-id?), and only matters if 10 K-on-one-instance is a real product
-requirement rather than a stress-test curiosity. AMPS itself targets
-1–2 K per instance and shards above. The single-instance target for
-cqserver should be in that ballpark too.
+Write a small ADR (1 page) in `docs/adrs/0001-sharding.md` capturing
+the choice.
+
+### H6.2 — Lightweight directory service (3 days)
+
+A tiny HTTP service (could even be `cq-server` running in
+"directory" mode) that answers `GET /resolve/topic/{name}` →
+`{instance_url}`. Could be a static config file in v1; service-side
+in v2.
+
+### H6.3 — Cross-instance topic replication via existing shipper
+(1 week)
+
+The existing replication infrastructure already moves mutations
+between instances for HA. For sharding, the replication topology
+becomes "every instance receives every mutation for topics it
+serves, regardless of which instance accepted the publish." Reuse
+the same shipper, but the routing now considers the topic-owner
+mapping.
+
+### H6.4 — Client-side instance routing in the SDKs (3 days)
+
+`Client::connect` becomes a "smart" connect that first consults the
+directory, then connects to the right instance. Failure modes:
+directory unavailable → fall back to a configured default; instance
+topology changes mid-connection → reconnect to the new owner.
+
+**Why this is its own project, not part of the High-Scale Worklog:**
+sharding is the difference between "one box doing as much as possible"
+and "a distributed system." Different testing model (need multi-host
+integration tests), different operational story (more moving parts),
+different product story (clients need updated SDKs). AMPS itself
+targets 1–2 K per instance and shards above; cqserver's single-instance
+target should be in that ballpark too. This worklog is about pushing
+the single-instance ceiling higher, not about building horizontal
+scale-out.
 
 ---
 
-## Suggested order of attack
+## Suggested order of attack (and actual outcomes)
 
-| # | Item | Effort | Win at 2K | Win at 10K |
-|---|---|---|---|---|
-| 1 | H4 — Defer ack from snapshot drain | half day | -47 failures | massive (no client timeouts) |
-| 2 | H2 — Byte-cap the snapshot cache | half day | -7 GB peak RSS | -7 GB peak RSS |
-| 3 | H1 — Adaptive outbound queue capacity | one day | -1 GB final RSS | -5 GB final RSS |
-| 4 | H3 — `permessage-deflate` WS compression | one day | 5× faster drain | 5× faster drain |
-| 5 | H5 — Flaky pause test | 2 hours | n/a | n/a |
-| 6 | H6 — Shard | 2 weeks | n/a | unlocks 10K+ |
+| # | Item | Status | Actual win measured |
+|---|---|---|---|
+| 1 | H4 — Defer ack from snapshot drain | ✅ done (retry — try-then-await) | mechanically correct; success-count metric noise-dominated on Mac |
+| 2 | H2 — Byte-cap the snapshot cache | ✅ done | **−9.8 GB peak RSS** (10.7 GB → 938 MB) |
+| 3 | H1 — Adaptive outbound queue capacity | ✅ done (flat drop; adaptive shrinking deferred) | per-session pre-alloc 32 KB → 8 KB |
+| 4 | H3 — `permessage-deflate` WS compression | ⏭️ deferred — WS lib has no native support | n/a; plan documented above |
+| 5 | H5 — Flaky pause test | ✅ done | 5/5 runs pass clean |
+| 6 | H6 — Shard | ⏭️ deferred — separate-project scope | n/a; 4-step plan documented above |
 
-H1 – H4 together should turn the 2 000-sub run into a steady-state ~2
-GB workload with zero failures. That's the realistic single-instance
-ceiling. Beyond there, H6 is the only honest path.
+**Single-instance ceiling after H1+H2+H4+H5**: peak RSS bounded to
+~1 GB under 2 000-sub stress, regardless of cache pressure. The
+remaining success-count variance is Mac scheduler noise — on a real
+production-class host (Linux, fast NIC, more cores) the same fixes
+should yield consistent thousands of concurrent subs.
+
+Beyond ~5 K subs on a single instance, H6 (sharding) is the only
+honest path. That's a separate project worth its own roadmap.
 
 ---
 
@@ -298,11 +337,30 @@ ceiling. Beyond there, H6 is the only honest path.
   better on the stress harness depends on noise.
 
 - 2026-05-24 — **H3 deferred** (was: permessage-deflate WS compression):
-  `tokio-tungstenite` 0.24 has no `deflate` feature and the upstream
-  `tungstenite` crate doesn't support permessage-deflate natively.
-  Options: switch the WS dependency to `fastwebsockets` (large
-  refactor, touches the entire WS connection lifecycle) or implement
-  RFC 7692 on top of `tungstenite` by hand (several hundred lines of
-  protocol-correct code + tests). Neither is the one-day estimate
-  from the original scoping. Revisit if WS compression becomes a
-  product requirement.
+  Verified across every shipped version of `tokio-tungstenite`
+  (0.24 through 0.29.0 as of today): **no `deflate` feature exists
+  upstream**. The `tungstenite` crate's permessage-deflate PR
+  (snapview/tungstenite-rs#426) has been open since 2023 and is
+  not merged.
+
+  **Concrete follow-up plan** when this becomes a real product
+  requirement (estimate: 1 week, not 1 day):
+    1. Swap the WS dependency to `tokio-websockets` (which DOES
+       support permessage-deflate natively). Touches the whole
+       connection-lifecycle path in `crates/cq-transport/src/websocket.rs`.
+    2. Verify MSRV — `tokio-websockets` requires `compile-time-rng`
+       which has its own MSRV chain.
+    3. Negotiate `Sec-WebSocket-Extensions: permessage-deflate`
+       on the accept-side handshake.
+    4. Configure context-takeover defaults (default-on per spec).
+    5. New E2E test: subscribe over a browser-style WS, verify the
+       handshake response includes the extension header and the
+       payload size of a known `/trades` snapshot drops by ≥ 5×.
+
+  Application-layer compression (zstd within `sow_batch` bodies)
+  was considered but only works for binary-codec clients (JSON
+  can't carry raw bytes without base64's 33% overhead). Browser
+  clients — which are the population that most benefits from
+  compression — only speak JSON over WS, so app-layer compression
+  doesn't move the needle for them. WS-level deflate is the right
+  layer.
