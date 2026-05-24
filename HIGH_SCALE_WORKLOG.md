@@ -210,10 +210,11 @@ impact.
 ## H6 — Shard for ≥ 10 K concurrent subs (architectural — separate
 project)
 
-**Status:** ✅ minimum-viable primitive shipped (H6.1 of 4). H6.2–H6.4
-still future work — see plan below for the full multi-step roadmap.
+**Status:**
+- ✅ H6.1 primitive shipped — static prefix-shard table + `/admin/shard-for/:topic` HTTP endpoint.
+- ⚠️ **Direction change.** Prefix-sharding (the originally planned H6.2–H6.4) addresses the *write* path. cqserver's scaling problem is read fan-out, not write distribution. The follow-up work has been re-scoped to **replica-reads** (H6.2′–H6.4′ below), matching the AMPS production deployment pattern.
 
-**What landed (H6.1).**
+**What landed (H6.1, kept for completeness).**
 - `ServerConfig.shards: Vec<ShardEntry>` static table loaded from TOML,
   each entry binds a `topic_prefix` to an `instance_url`.
 - `ServerConfig::resolve_shard(topic)` — longest-prefix-match against
@@ -224,68 +225,95 @@ still future work — see plan below for the full multi-step roadmap.
 - `AdminState.self_url` derives from the configured WS (preferred) or
   TCP address at startup.
 
-This is the smallest possible primitive a future client SDK or
-gateway can call to decide where to connect — no replication, no
-client-side smart-connect, no consistent hashing. It lets operators
-*declare* a sharding scheme in config today; the rest of the
-machinery (replication topology, client smart-connect) is still
-the H6.2–H6.4 project below.
+The primitive is harmless and may still be useful for a future
+write-heavy deployment, but it is **not the path forward for the
+2 K-subs-per-host problem.** See the revised plan below.
 
 **Problem.** Above ~5 K concurrent subs on a single host, no amount of
 encoder optimization or memory shaving compensates for the fundamental
 egress-bandwidth wall: hundreds of GB of frame data multiplied across
 thousands of WS connections on one NIC.
 
-**Concrete plan** (estimate: 2–3 weeks of focused work, four
-sub-sessions):
+**Wrong approach (originally planned here, now rejected): topic-prefix
+sharding.** Splitting different topics onto different hosts addresses
+the *write* path, not the read path. Our actual bottleneck is one
+publisher fanning out to thousands of subscribers — splitting writes
+across nodes doesn't help, and it forces clients to know which node
+holds which topic. The H6.1 primitive (static shard table +
+`/admin/shard-for/:topic`) was a useful exercise but is **not the
+direction this project should take past this point.** Two cqserver
+processes on the same box share RAM and NIC, so on-box sharding is
+strictly worse than a single well-tuned instance. Multi-host
+prefix-sharding requires every client SDK to grow a directory client,
+and still doesn't reduce per-topic egress when the bulk of subs all
+want the same hot topic.
 
-### H6.1 — Sharding key + routing decision (1 day, design only)
+**Right approach (what AMPS does): replica reads.** Replicate the full
+state from one leader to N follower instances; followers accept
+subscribes but reject publishes; an L4 LB (or DNS round-robin, or a
+client-side multi-URI list) spreads subscriber connections across
+followers. Each follower contributes its own NIC + CPU + RAM, and
+clients don't need to know anything about topic placement because
+every follower has every topic. This is precisely the read-fan-out
+shape we have.
 
-Pick ONE of:
-- **Topic-prefix** — each instance owns a set of `/topic-name` prefixes.
-  Cleanest, but requires clients to know which prefix lives where, OR
-  a directory service.
-- **Topic-hash** — `hash(topic) % N` picks instance. Cheaper for
-  clients but kills the option of a "global" subscribe.
-- **Consistent-hash with rebalancing** — supports adding/removing
-  instances without bulk re-subscribe. More machinery.
+The `cq-replication` crate already provides the transport
+primitives (shipper + receiver + filter), so this is mostly wiring
+work, not new infrastructure.
 
-Write a small ADR (1 page) in `docs/adrs/0001-sharding.md` capturing
-the choice.
+**Concrete plan (revised — replica-reads, ~4 days):**
 
-### H6.2 — Lightweight directory service (3 days)
+### H6.2′ — Read-replica server mode (1–2 days)
 
-A tiny HTTP service (could even be `cq-server` running in
-"directory" mode) that answers `GET /resolve/topic/{name}` →
-`{instance_url}`. Could be a static config file in v1; service-side
-in v2.
+Add a `[replication]` config block:
+```toml
+[replication]
+role = "follower"            # or "leader" / "standalone" (default)
+leader_url = "ws://leader-host:9008/cqp"
+```
 
-### H6.3 — Cross-instance topic replication via existing shipper
-(1 week)
+Behavior:
+- `leader`: same as today — accepts publishes, ships its journal to
+  any connected receiver.
+- `follower`: accepts subscribes; rejects publishes with a clear
+  error (`{"error":"read-only follower; publish to leader"}`); drives
+  its in-memory state from the shipper stream via the existing
+  `cq-replication::receiver` machinery.
+- `standalone`: today's behavior, no replication wiring.
 
-The existing replication infrastructure already moves mutations
-between instances for HA. For sharding, the replication topology
-becomes "every instance receives every mutation for topics it
-serves, regardless of which instance accepted the publish." Reuse
-the same shipper, but the routing now considers the topic-owner
-mapping.
+Most of this is already implemented in `cq-replication` — the work
+is in `cq-server` to honor a "publishes rejected" flag and to start
+the receiver on boot when role=follower.
 
-### H6.4 — Client-side instance routing in the SDKs (3 days)
+### H6.3′ — Multi-URI client + reconnect (1 day)
 
-`Client::connect` becomes a "smart" connect that first consults the
-directory, then connects to the right instance. Failure modes:
-directory unavailable → fall back to a configured default; instance
-topology changes mid-connection → reconnect to the new owner.
+`Client::connect_any(&["host1:9000", "host2:9000", "host3:9000"])`
+that:
+1. Randomly orders the URIs (spreads load when many clients start
+   simultaneously)
+2. Tries each in order until one connects
+3. On disconnect, repeats the dance — the next host picks up the
+   subs
 
-**Why this is its own project, not part of the High-Scale Worklog:**
-sharding is the difference between "one box doing as much as possible"
-and "a distributed system." Different testing model (need multi-host
-integration tests), different operational story (more moving parts),
-different product story (clients need updated SDKs). AMPS itself
-targets 1–2 K per instance and shards above; cqserver's single-instance
-target should be in that ballpark too. This worklog is about pushing
-the single-instance ceiling higher, not about building horizontal
-scale-out.
+No directory service, no topic-aware routing. Operators put a list
+of follower URIs in the client config; clients pick one. Failover is
+client-driven (same model AMPS HAClient uses).
+
+### H6.4′ — Operator docs + multi-instance e2e test (1 day)
+
+- `docs/deploy/replica-reads.md` — leader/follower toml fragments,
+  example L4 LB config (HAProxy + ELB + nginx stream module),
+  monitoring expectations (replication lag gauge).
+- `crates/cq-e2e-tests/tests/replica_reads.rs` — spawns 1 leader +
+  2 followers, publishes to leader, subscribes via both followers,
+  asserts SOW + live deltas observed identically on both, kills one
+  follower mid-stream, asserts client reconnects to the other.
+
+**What stays deferred.** Active-active multi-leader, dynamic
+follower-discovery (Consul/DNS-SRV-style), and topic-prefix sharding
+all remain out of scope. Replica-reads gets us to "5–10 K subs per
+follower × N followers" — well past the practical ceiling — without
+the complexity of any of those.
 
 ---
 
@@ -298,7 +326,7 @@ scale-out.
 | 3 | H1 — Adaptive outbound queue capacity | ✅ done (flat drop; adaptive shrinking deferred) | per-session pre-alloc 32 KB → 8 KB |
 | 4 | H3 — `permessage-deflate` WS compression | ✅ measured (7× compressible) — lib swap deferred | zstd gauge shows 14.3% ratio on cached snapshots |
 | 5 | H5 — Flaky pause test | ✅ done | 5/5 runs pass clean |
-| 6 | H6 — Shard | ✅ H6.1 primitive shipped; H6.2–H6.4 still scoped as separate project | static shard table + `/admin/shard-for/:topic` endpoint |
+| 6 | H6 — Scale-out | ✅ H6.1 prefix-shard primitive shipped; **direction changed** to replica-reads (H6.2′–H6.4′) | static shard table + `/admin/shard-for/:topic` (kept for write-shard future); replica-reads plan re-scoped |
 
 **Single-instance ceiling after H1+H2+H4+H5**: peak RSS bounded to
 ~1 GB under 2 000-sub stress, regardless of cache pressure. The
@@ -306,8 +334,12 @@ remaining success-count variance is Mac scheduler noise — on a real
 production-class host (Linux, fast NIC, more cores) the same fixes
 should yield consistent thousands of concurrent subs.
 
-Beyond ~5 K subs on a single instance, H6 (sharding) is the only
-honest path. That's a separate project worth its own roadmap.
+Beyond ~5 K subs, the honest path is **replica-reads** (leader →
+N followers, L4 LB or multi-URI client) — not prefix sharding. See
+the revised H6.2′–H6.4′ plan above. The `cq-replication` crate
+already provides the transport; the remaining work is wiring it
+into a "follower" server mode and adding multi-URI failover to the
+client (~4 days total).
 
 ---
 
