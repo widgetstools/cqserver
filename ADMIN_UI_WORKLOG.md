@@ -364,7 +364,7 @@ not available" empty state).
 | U1 | Scaffold + shell + admin API client | ⏳ in progress (this session) |
 | U2 | Overview page | ⏳ pending |
 | U3 | Topics page + topic detail | ⏳ pending |
-| U4 | Subscriptions + Queues | ⏳ pending |
+| U4 | Subscriptions + Queues | ✅ done — new server endpoint `GET /queues` (queue snapshots), `AdminState.queues` plumbed through `main.rs`. Admin UI: `SubscriptionsPage` (AG-Grid + summary strip with active/conflated/near-full/slow counts + per-row drop-sub via `DELETE /subscriptions/:id` + slow-consumer alert banner). `QueuesPage` (card-per-queue with buffered / consumers / sequence; "no consumers" badge when queue is backed up). |
 | U5 | Views + Replication + Config | ⏳ pending |
 | U6 | Metrics explorer + Query Explain | ⏳ pending |
 | U7 | Polish + production build | ⏳ pending |

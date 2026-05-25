@@ -24,6 +24,7 @@ use axum::{
 const ADMIN_HTML: &str = include_str!("../static/admin.html");
 const FI_DEMO_HTML: &str = include_str!("../static/fi-demo.html");
 use cq_core::topic::SharedTopic;
+use cq_transport::queue::QueueRegistry;
 use cq_transport::session::SessionRegistry;
 use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -34,6 +35,7 @@ use tracing::info;
 pub struct AdminState {
     pub topics: Arc<DashMap<String, SharedTopic>>,
     pub registry: SessionRegistry,
+    pub queues: QueueRegistry,
     pub prom: PrometheusHandle,
     /// H6: static shard table (topic-prefix → instance URL). Empty
     /// vec = single-node mode where this instance owns everything.
@@ -63,6 +65,7 @@ pub async fn start_admin_server(
         .route("/admin/replication", get(replication_status))
         .route("/admin/shard-for/:topic", get(shard_for))
         .route("/admin/explain", post(explain_query))
+        .route("/queues", get(get_queues))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -323,6 +326,20 @@ async fn shard_for(
     }
 }
 
+/// `GET /queues` — array of queue topic snapshots. Each entry has
+/// `name`, `kind: "queue"`, `buffered` (in-memory queue depth),
+/// `consumers` (registered subscriber count), `sequence` (next
+/// to-be-assigned sequence). Admin UI U4 consumes this for the
+/// Queues screen.
+async fn get_queues(State(s): State<AdminState>) -> impl IntoResponse {
+    let arr: Vec<serde_json::Value> = s
+        .queues
+        .iter()
+        .map(|e| e.value().stats())
+        .collect();
+    Json(serde_json::Value::Array(arr))
+}
+
 async fn get_metrics(State(s): State<AdminState>) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -424,6 +441,7 @@ mod tests {
         let state = AdminState {
             topics,
             registry: new_registry(),
+            queues: cq_transport::queue::new_queue_registry(),
             prom,
             shards: Arc::new(Vec::new()),
             self_url: Arc::new("ws://127.0.0.1:9000/cqp".to_string()),
@@ -483,6 +501,7 @@ mod tests {
         let state = AdminState {
             topics,
             registry: new_registry(),
+            queues: cq_transport::queue::new_queue_registry(),
             prom,
             shards: Arc::new(shards),
             self_url: Arc::new(self_url.to_string()),

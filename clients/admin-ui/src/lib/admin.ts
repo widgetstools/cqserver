@@ -71,14 +71,23 @@ export interface TopicInfo {
 
 export interface SubscriptionInfo {
   subId: string;
-  sessionId?: string;
-  topic?: string;
-  filter?: string;
-  sql?: string;
-  sequence?: number;
-  drops?: number;
-  queueDepth?: number;
-  connectedSinceMs?: number;
+  topic: string;
+  sessionId: string;
+  queueDepth: number;
+  queueCapacity: number;
+  fillRatio: number;
+  dropped: number;
+  ageMs: number;
+  conflated: boolean;
+  conflationIntervalMs: number;
+}
+
+export interface QueueInfo {
+  name: string;
+  kind: 'queue';
+  buffered: number;
+  consumers: number;
+  sequence: number;
 }
 
 export interface ReplicationStatus {
@@ -107,6 +116,7 @@ export const adminApi = {
   stats: () => get<ServerStats>('/stats'),
   topics: () => get<TopicInfo[]>('/topics'),
   subscriptions: () => get<SubscriptionInfo[]>('/subscriptions'),
+  queues: () => get<QueueInfo[]>('/queues'),
   metricsText: () => getText('/metrics'),
   replication: () => get<ReplicationStatus>('/admin/replication'),
   shardFor: (topic: string) =>

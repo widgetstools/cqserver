@@ -5,6 +5,8 @@ import { ThemeProvider } from '@/components/theme/ThemeProvider';
 import { AppShell } from '@/components/layout/AppShell';
 import { OverviewPage } from '@/pages/OverviewPage';
 import { TopicsPage } from '@/pages/TopicsPage';
+import { SubscriptionsPage } from '@/pages/SubscriptionsPage';
+import { QueuesPage } from '@/pages/QueuesPage';
 import { PlaceholderPage } from '@/pages/PlaceholderPage';
 
 const queryClient = new QueryClient({
@@ -30,16 +32,7 @@ export function App() {
               <Route element={<AppShell />}>
                 <Route index element={<OverviewPage />} />
                 <Route path="/topics" element={<TopicsPage />} />
-                <Route
-                  path="/subscriptions"
-                  element={
-                    <PlaceholderPage
-                      title="Subscriptions"
-                      description="Live wire view of every connected client + their query."
-                      worklogRef="U4"
-                    />
-                  }
-                />
+                <Route path="/subscriptions" element={<SubscriptionsPage />} />
                 <Route
                   path="/replication"
                   element={
@@ -60,16 +53,7 @@ export function App() {
                     />
                   }
                 />
-                <Route
-                  path="/queues"
-                  element={
-                    <PlaceholderPage
-                      title="Queues"
-                      description="Queue depth, leases, redelivery, DLQ routing."
-                      worklogRef="U4"
-                    />
-                  }
-                />
+                <Route path="/queues" element={<QueuesPage />} />
                 <Route
                   path="/metrics"
                   element={

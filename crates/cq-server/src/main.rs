@@ -275,6 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_state = AdminState {
         topics: topics.clone(),
         registry: registry.clone(),
+        queues: queues.clone(),
         prom: prom_handle,
         shards: Arc::new(server_config.shards.clone()),
         self_url: Arc::new(self_url),
