@@ -28,57 +28,48 @@ function bucketOf(v: number): -3 | -2 | -1 | 0 | 1 | 2 | 3 {
   return 3;
 }
 
+/**
+ * HeatmapPanel — follows its `data` prop directly. When ticking is
+ * enabled and `data` changes, we diff previous-vs-current buckets
+ * per cell and stamp a flash timestamp on cells that crossed a
+ * bucket boundary. The visual fade between background colors comes
+ * from the 600ms CSS transition on `.heatmap-cell`; the flash
+ * outline (`.flash`) is added for ~650ms after a bucket crossing.
+ */
 export function HeatmapPanel({ title, data, ticking = false, tooltipExtra }: HeatmapPanelProps) {
   const [tick, setTick] = useState(0);
+  const prevBucketsRef = useRef<Map<string, number>>(new Map());
   const flashRef = useRef<Map<string, number>>(new Map());
 
-  const { rows, cols, byKey } = useMemo(() => {
+  const { rows, cols } = useMemo(() => {
     const r = Array.from(new Set(data.map((d) => d.row)));
     const c = Array.from(new Set(data.map((d) => d.col)));
-    const m = new Map<string, HeatmapDatum>();
-    for (const d of data) m.set(`${d.row}${d.col}`, d);
-    return { rows: r, cols: c, byKey: m };
+    return { rows: r, cols: c };
   }, [data]);
 
-  // Synthesize live ticks: each interval, mutate a random subset of
-  // cells by a small Δ. The cell's data-bucket flips and the 600ms
-  // background transition kicks in. We also mark cells that switched
-  // buckets so the .flash outline animates.
-  const [live, setLive] = useState(data);
+  // Whenever `data` changes, diff bucket-of each cell against the
+  // previous snapshot. Cells that crossed a bucket get a flash mark.
   useEffect(() => {
     if (!ticking) {
-      setLive(data);
+      prevBucketsRef.current = new Map(data.map((d) => [`${d.row}::${d.col}`, bucketOf(d.value)]));
       return;
     }
-    setLive(data);
-    const id = setInterval(() => {
-      setLive((prev) => {
-        const next = prev.slice();
-        const flashes: string[] = [];
-        const n = Math.max(3, Math.floor(prev.length * 0.18));
-        for (let i = 0; i < n; i++) {
-          const ix = Math.floor(Math.random() * next.length);
-          const cur = next[ix]!;
-          const delta = (Math.random() - 0.48) * 0.6;
-          const before = bucketOf(cur.value);
-          const updated = { ...cur, value: Math.max(-6, Math.min(6, cur.value + delta)) };
-          const after = bucketOf(updated.value);
-          next[ix] = updated;
-          if (before !== after) flashes.push(`${updated.row}${updated.col}`);
-        }
-        if (flashes.length) {
-          const now = performance.now();
-          for (const k of flashes) flashRef.current.set(k, now);
-        }
-        return next;
-      });
-      setTick((t) => t + 1);
-    }, 900);
-    return () => clearInterval(id);
+    const now = performance.now();
+    const prev = prevBucketsRef.current;
+    const next = new Map<string, number>();
+    for (const d of data) {
+      const k = `${d.row}::${d.col}`;
+      const b = bucketOf(d.value);
+      next.set(k, b);
+      const old = prev.get(k);
+      if (old !== undefined && old !== b) flashRef.current.set(k, now);
+    }
+    prevBucketsRef.current = next;
+    setTick((t) => t + 1);
   }, [data, ticking]);
 
-  const flatMin = useMemo(() => Math.min(...live.map((d) => d.value)), [live]);
-  const flatMax = useMemo(() => Math.max(...live.map((d) => d.value)), [live]);
+  const flatMin = useMemo(() => Math.min(...data.map((d) => d.value)), [data]);
+  const flatMax = useMemo(() => Math.max(...data.map((d) => d.value)), [data]);
 
   const now = performance.now();
 
@@ -113,48 +104,44 @@ export function HeatmapPanel({ title, data, ticking = false, tooltipExtra }: Hea
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => {
-              const usedCols = byKey;
-              void usedCols;
-              return (
-                <tr key={r}>
-                  <td className="text-[10.5px] font-medium pr-2 text-foreground truncate" style={{ maxWidth: 110 }}>
-                    {r}
-                  </td>
-                  {cols.map((c) => {
-                    const k = `${r}${c}`;
-                    const d = live.find((x) => x.row === r && x.col === c);
-                    if (!d) {
-                      return (
-                        <td key={c} className="p-0">
-                          <div className="heatmap-cell" data-bucket="0" style={{ height: 42, width: 76, margin: 1 }}>
-                            —
-                          </div>
-                        </td>
-                      );
-                    }
-                    const b = bucketOf(d.value);
-                    const lastFlash = flashRef.current.get(k) ?? -Infinity;
-                    const isFlashing = now - lastFlash < 650;
-                    const tip = `${d.row} · ${d.col}: ${fmtPct(d.value)}${
-                      tooltipExtra ? ` · ${tooltipExtra(d)}` : ''
-                    }`;
+            {rows.map((r) => (
+              <tr key={r}>
+                <td className="text-[10.5px] font-medium pr-2 text-foreground truncate" style={{ maxWidth: 110 }}>
+                  {r}
+                </td>
+                {cols.map((c) => {
+                  const k = `${r}::${c}`;
+                  const d = data.find((x) => x.row === r && x.col === c);
+                  if (!d) {
                     return (
                       <td key={c} className="p-0">
-                        <div
-                          className={`heatmap-cell ${isFlashing ? 'flash' : ''}`}
-                          data-bucket={b}
-                          title={tip}
-                          style={{ height: 42, width: 76, margin: 1 }}
-                        >
-                          {d.value >= 0 ? '+' : ''}{d.value.toFixed(2)}
+                        <div className="heatmap-cell" data-bucket="0" style={{ height: 42, width: 76, margin: 1 }}>
+                          —
                         </div>
                       </td>
                     );
-                  })}
-                </tr>
-              );
-            })}
+                  }
+                  const b = bucketOf(d.value);
+                  const lastFlash = flashRef.current.get(k) ?? -Infinity;
+                  const isFlashing = now - lastFlash < 650;
+                  const tip = `${d.row} · ${d.col}: ${fmtPct(d.value)}${
+                    tooltipExtra ? ` · ${tooltipExtra(d)}` : ''
+                  }`;
+                  return (
+                    <td key={c} className="p-0">
+                      <div
+                        className={`heatmap-cell ${isFlashing ? 'flash' : ''}`}
+                        data-bucket={b}
+                        title={tip}
+                        style={{ height: 42, width: 76, margin: 1 }}
+                      >
+                        {d.value >= 0 ? '+' : ''}{d.value.toFixed(2)}
+                      </div>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
           </tbody>
         </table>
         <div className="mt-4 flex items-center gap-2 text-[10px] font-mono text-muted-foreground">

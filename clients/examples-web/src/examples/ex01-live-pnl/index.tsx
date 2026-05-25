@@ -1,11 +1,11 @@
-import { useMemo, useEffect, useState } from 'react';
+import { useMemo } from 'react';
 import { DockSurface, type DockPanelSpec, type DockLayoutStep } from '@/components/atlas/DockSurface';
 import { GridPanel } from '@/components/panels/GridPanel';
 import { KpiPanel, type Kpi } from '@/components/panels/KpiPanel';
 import { SqlPanel } from '@/components/panels/SqlPanel';
 import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
-import { getPositions } from '@/lib/data-gen';
+import { useLivePositions } from '@/lib/tick-engine';
 import { POSITION_COLUMNS } from '@/lib/schema/positions';
 import { buildColDefs, defaultPositionView } from '@/lib/grid-cols';
 import { fmtSigned, fmtCcy } from '@/lib/format';
@@ -33,20 +33,19 @@ function groupSum(rows: Record<string, unknown>[], keyField: string, valueField:
   return Array.from(m.entries()).map(([key, v]) => ({ key, v })).sort((a, b) => b.v - a.v);
 }
 
+// Numeric columns that should flash when their value updates live.
+const FLASH_COLS = [
+  'last_price', 'last_price_local', 'last_price_usd',
+  'market_value', 'market_value_local', 'market_value_usd',
+  'unrealized_pnl', 'unrealized_pnl_usd',
+  'day_pnl', 'total_pnl',
+  'price_change', 'price_change_pct',
+] as const;
+
 export function LivePnlCanvas() {
-  const positions = useMemo(() => getPositions(), []);
+  const live = useLivePositions();
   const colDefs = useMemo(() => buildColDefs(POSITION_COLUMNS), []);
   const visible = useMemo(() => defaultPositionView(), []);
-
-  // Live tick — pulse KPI values periodically by computing them on
-  // each tick using a randomly mutated subset of positions.
-  const [tickIx, setTickIx] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setTickIx((t) => t + 1), 1100);
-    return () => clearInterval(id);
-  }, []);
-
-  const live = useMemo(() => positions, [positions, tickIx]);
 
   const kpis = useMemo<Kpi[]>(() => {
     const gross = sum(live, 'exposure_gross');
@@ -136,6 +135,8 @@ export function LivePnlCanvas() {
           rows={live as Record<string, unknown>[]}
           colDefs={colDefs}
           visible={visible}
+          getRowId={(r) => r.position_id as string}
+          flashColumns={FLASH_COLS}
         />
       ),
     },

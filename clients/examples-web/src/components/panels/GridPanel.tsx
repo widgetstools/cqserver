@@ -20,6 +20,19 @@ interface GridPanelProps<T> {
   right?: ReactNode;
   /** Apply row-level click → highlight. */
   onRowClick?: (row: T) => void;
+  /**
+   * Stable row identifier extractor. When set, AG-Grid uses it to
+   * track row updates across rowData re-renders (vs. naive index
+   * matching). Required for `enableCellChangeFlash` to actually
+   * flash cells when their value changes.
+   */
+  getRowId?: (row: T) => string;
+  /**
+   * When `getRowId` is set, list of column field names that should
+   * flash on value change. Any column not in this list won't flash
+   * even when its value updates.
+   */
+  flashColumns?: readonly string[];
 }
 
 /**
@@ -38,16 +51,28 @@ export function GridPanel<T extends Record<string, unknown>>({
   visible,
   right,
   onRowClick,
+  getRowId,
+  flashColumns,
 }: GridPanelProps<T>) {
   const { theme, palette } = useTheme();
 
+  // Apply visibility filter + opt cells into cellFlash where requested.
   const cols = useMemo<ColDef[]>(() => {
-    if (!visible) return colDefs;
+    const flash = new Set(flashColumns ?? []);
     const ix = new Map(colDefs.map((c) => [c.field, c]));
-    return visible.map((f) => ix.get(f)).filter((c): c is ColDef => !!c);
-  }, [colDefs, visible]);
+    const ordered = visible ? visible.map((f) => ix.get(f)).filter((c): c is ColDef => !!c) : colDefs;
+    if (!getRowId || flash.size === 0) return ordered;
+    return ordered.map((c) =>
+      c.field && flash.has(c.field) ? { ...c, enableCellChangeFlash: true } : c,
+    );
+  }, [colDefs, visible, flashColumns, getRowId]);
 
   const agTheme = useMemo(() => getAgGridTheme(palette, theme), [palette, theme]);
+
+  const agGetRowId = useMemo(
+    () => (getRowId ? ({ data }: { data: T }) => getRowId(data) : undefined),
+    [getRowId],
+  );
 
   return (
     <PanelChrome
@@ -69,6 +94,7 @@ export function GridPanel<T extends Record<string, unknown>>({
           headerHeight={28}
           suppressMovableColumns={false}
           animateRows={false}
+          getRowId={agGetRowId}
           onRowClicked={(e) => onRowClick?.(e.data as T)}
         />
       </div>

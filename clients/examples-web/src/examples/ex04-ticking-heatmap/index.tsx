@@ -6,7 +6,7 @@ import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
 import { KpiPanel, type Kpi } from '@/components/panels/KpiPanel';
 import { Badge } from '@/components/ui/badge';
-import { getPositions } from '@/lib/data-gen';
+import { useLivePositions } from '@/lib/tick-engine';
 import { QUERIES } from '@/lib/queries/library';
 import { DOCS_BY_ID } from '@/docs';
 
@@ -41,7 +41,7 @@ function buildHeatmap(positions: Record<string, unknown>[]): HeatmapDatum[] {
 }
 
 export function TickingHeatmapCanvas() {
-  const positions = useMemo(() => getPositions(), []);
+  const positions = useLivePositions();
   const data = useMemo(() => buildHeatmap(positions as Record<string, unknown>[]), [positions]);
 
   const kpis: Kpi[] = useMemo(() => {

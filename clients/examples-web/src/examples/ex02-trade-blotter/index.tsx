@@ -8,7 +8,7 @@ import { KpiPanel, type Kpi } from '@/components/panels/KpiPanel';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { getTrades } from '@/lib/data-gen';
+import { useLiveTrades } from '@/lib/tick-engine';
 import { TRADE_COLUMNS } from '@/lib/schema/trades';
 import { buildColDefs, defaultTradeView } from '@/lib/grid-cols';
 import { DOCS_BY_ID } from '@/docs';
@@ -26,7 +26,7 @@ const FILTERS: { id: FilterId; label: string; predicate: (t: Record<string, unkn
 ];
 
 export function TradeBlotterCanvas() {
-  const trades = useMemo(() => getTrades(), []);
+  const trades = useLiveTrades();
   const colDefs = useMemo(() => buildColDefs(TRADE_COLUMNS), []);
   const visible = useMemo(() => defaultTradeView(), []);
 
@@ -154,6 +154,7 @@ LIMIT 500;`;
           rows={filtered}
           colDefs={colDefs}
           visible={visible}
+          getRowId={(r) => r.trade_id as string}
         />
       ),
     },
