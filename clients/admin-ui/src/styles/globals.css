@@ -1,0 +1,254 @@
+@import "tailwindcss";
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource-variable/jetbrains-mono";
+
+/*
+ * cqserver admin — operator console palette
+ * Built on the trading platform design system. Same shadcn CSS
+ * variable convention; aliased semantic tokens layered on top for
+ * monitoring-specific roles (ok / warn / err / muted-data).
+ */
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #f7f8fa;
+  --foreground: #0d1117;
+
+  --card: #ffffff;
+  --card-foreground: #0d1117;
+
+  --popover: #ffffff;
+  --popover-foreground: #0d1117;
+
+  --primary: #1652f0;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f0f2f5;
+  --secondary-foreground: #0d1117;
+
+  --muted: #f0f2f5;
+  --muted-foreground: #4b5563;
+
+  --accent: #e4e7ec;
+  --accent-foreground: #0d1117;
+
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+
+  --border: #e4e7ec;
+  --input: #e4e7ec;
+  --ring: #1652f0;
+
+  --radius: 5px;
+
+  /* Semantic monitoring aliases */
+  --ok: #00a36c;
+  --ok-foreground: #ffffff;
+  --ok-muted: rgba(0,163,108,0.10);
+  --warn: #d97706;
+  --warn-foreground: #ffffff;
+  --warn-muted: rgba(217,119,6,0.10);
+  --err: #dc2626;
+  --err-foreground: #ffffff;
+  --err-muted: rgba(220,38,38,0.10);
+  --info: #1652f0;
+  --info-muted: rgba(22,82,240,0.08);
+
+  --surface: #ffffff;
+  --elevated: #f0f2f5;
+  --data-grid-line: #eef0f3;
+}
+
+.dark {
+  /* Operator console — deep black with subtle warm undertones to
+   * avoid the harsh "pure-#000 / pure-#fff" Material-default look.
+   */
+  --background: #0a0c10;
+  --foreground: #e6e8eb;
+
+  --card: #11141a;
+  --card-foreground: #e6e8eb;
+
+  --popover: #161a22;
+  --popover-foreground: #e6e8eb;
+
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
+
+  --secondary: #161a22;
+  --secondary-foreground: #e6e8eb;
+
+  --muted: #161a22;
+  --muted-foreground: #7d8694;
+
+  --accent: #1e2530;
+  --accent-foreground: #e6e8eb;
+
+  --destructive: #f43f5e;
+  --destructive-foreground: #ffffff;
+
+  --border: #1d222b;
+  --input: #161a22;
+  --ring: #3b82f6;
+
+  --ok: #10b981;
+  --ok-foreground: #ffffff;
+  --ok-muted: rgba(16,185,129,0.12);
+  --warn: #f59e0b;
+  --warn-foreground: #0a0c10;
+  --warn-muted: rgba(245,158,11,0.12);
+  --err: #f43f5e;
+  --err-foreground: #ffffff;
+  --err-muted: rgba(244,63,94,0.12);
+  --info: #3b82f6;
+  --info-muted: rgba(59,130,246,0.10);
+
+  --surface: #11141a;
+  --elevated: #161a22;
+  --data-grid-line: #1a1f28;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ok: var(--ok);
+  --color-ok-foreground: var(--ok-foreground);
+  --color-ok-muted: var(--ok-muted);
+  --color-warn: var(--warn);
+  --color-warn-foreground: var(--warn-foreground);
+  --color-warn-muted: var(--warn-muted);
+  --color-err: var(--err);
+  --color-err-foreground: var(--err-foreground);
+  --color-err-muted: var(--err-muted);
+  --color-info: var(--info);
+  --color-info-muted: var(--info-muted);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 6px);
+  --radius-2xl: calc(var(--radius) + 10px);
+  --radius-full: 9999px;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  letter-spacing: -0.02em;
+}
+
+/* All numeric data uses the mono face. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1, 'zero' 1, 'ss01' 1;
+}
+.font-mono.tabular {
+  font-feature-settings: 'tnum' 1, 'ss01' 1, 'cv11' 1;
+}
+
+/* Subtle value-change pulse for live numeric cells. */
+@keyframes pulse-up {
+  0%   { background-color: var(--ok-muted); }
+  100% { background-color: transparent; }
+}
+@keyframes pulse-down {
+  0%   { background-color: var(--err-muted); }
+  100% { background-color: transparent; }
+}
+.pulse-up   { animation: pulse-up 600ms ease-out; }
+.pulse-down { animation: pulse-down 600ms ease-out; }
+
+/* Health pill blink (used by header when status flips). */
+@keyframes blink-soft {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.blink-soft { animation: blink-soft 1.2s ease-in-out infinite; }
+
+/* Scrollbars — slim, themed. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: var(--radius-full);
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted-foreground); }
+
+/* AG Grid theme overrides — operator-console density. */
+.ag-theme-quartz,
+.ag-theme-quartz-dark {
+  --ag-header-background-color: transparent;
+  --ag-header-foreground-color: var(--muted-foreground);
+  --ag-background-color: var(--card);
+  --ag-foreground-color: var(--card-foreground);
+  --ag-border-color: var(--border);
+  --ag-row-border-color: var(--data-grid-line);
+  --ag-odd-row-background-color: transparent;
+  --ag-row-hover-color: var(--accent);
+  --ag-selected-row-background-color: var(--info-muted);
+  --ag-font-family: var(--font-sans);
+  --ag-font-size: 12px;
+  --ag-grid-size: 5px;
+  --ag-header-height: 30px;
+  --ag-row-height: 32px;
+  --ag-cell-horizontal-padding: 10px;
+  --ag-header-column-separator-display: none;
+  --ag-borders: solid 0;
+  --ag-borders-row: solid 1px;
+}
+.ag-header-cell-text {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+  font-size: 10.5px;
+}
+.ag-cell .tabular-cell {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1, 'ss01' 1;
+}
+
+/* Sparkline path — subtle glow in dark mode. */
+.dark .sparkline-path {
+  filter: drop-shadow(0 0 1px rgba(59,130,246,0.5));
+}
