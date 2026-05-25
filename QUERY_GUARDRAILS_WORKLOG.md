@@ -443,7 +443,7 @@ without estimation) is also independently useful as a backstop.
 
 | # | Session | Status |
 |---|---|---|
-| G1 | Parse-time validators | ⏳ pending |
+| G1 | Parse-time validators | ✅ done — `QueryLimits` + `validate_with_limits` + `validate_view_graph` in cq-core; `[query_limits]` block in `cqserver.toml`; wired through `WsConfig`/`TcpConfig` to `RouterContext` (ready for G3); view-graph validation runs at server startup. 10 unit tests in `query::tests::g1_*`. |
 | G2 | Cost estimator + `/admin/explain` | ⏳ pending |
 | G3 | Subscribe-time enforcement | ⏳ pending |
 | G4 | Runtime caps + observability | ⏳ pending |

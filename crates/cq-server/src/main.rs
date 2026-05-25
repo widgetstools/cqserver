@@ -206,6 +206,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(topics = topics.len(), "Topic registry initialized");
 
+    // Query Guardrails G1: validate the view graph (chain depth,
+    // passthrough bodies, cycles) before we register any view. A
+    // failure here is a config-time error and prevents startup.
+    {
+        let query_limits = server_config.query_limits.to_core();
+        let mut view_sources: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut view_bodies: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for v in &server_config.views {
+            view_sources.insert(v.name.clone(), v.source.clone());
+            view_bodies.insert(v.name.clone(), v.sql.clone());
+        }
+        cq_core::query::validate_view_graph(&view_sources, &view_bodies, &query_limits)
+            .map_err(|e| format!("query_limits: {}", e))?;
+    }
+
     // S20 materialized views. Each view declares an aggregate query
     // over an existing source topic; the server creates the view
     // topic, registers it in the same `topics` map (so subscribers
@@ -323,6 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if read_only {
         info!("Replication role = standby — transports running in read-only mode (publishes will be rejected)");
     }
+    let query_limits = server_config.query_limits.to_core();
     let ws_config = WsConfig {
         listen_addr: server_config.websocket_addr.clone(),
         path: server_config.websocket_path.clone(),
@@ -331,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bookmark_store: Some(bookmark_store.clone()),
         spillover: spillover_ctx.clone(),
         read_only,
+        query_limits,
     };
     let tcp_config = TcpConfig {
         listen_addr: server_config.tcp_addr.clone(),
@@ -340,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bookmark_store: Some(bookmark_store),
         spillover: spillover_ctx,
         read_only,
+        query_limits,
     };
 
     let heartbeat_cfg = HeartbeatConfig {

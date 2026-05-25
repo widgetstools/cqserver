@@ -50,6 +50,48 @@ pub struct ServerConfig {
     /// default).
     #[serde(default)]
     pub shards: Vec<ShardEntry>,
+    /// Query Guardrails G1: structural limits enforced at parse / view
+    /// registration time. See `cq_core::query::QueryLimits`.
+    #[serde(default)]
+    pub query_limits: QueryLimitsConfig,
+}
+
+/// TOML representation of `cq_core::query::QueryLimits`. Defined here
+/// (not in cq-core) so the deserialization shape lives next to the
+/// rest of the server config; converted to the cq-core type via
+/// `to_core()`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct QueryLimitsConfig {
+    pub max_pivot_in_list_size: usize,
+    pub max_view_chain_depth: usize,
+    pub reject_degenerate_groupby: bool,
+    pub reject_passthrough_views: bool,
+}
+
+impl Default for QueryLimitsConfig {
+    fn default() -> Self {
+        // Mirror cq_core::query::QueryLimits::default() so behavior
+        // stays consistent if a user omits the [query_limits] block.
+        let core = cq_core::query::QueryLimits::default();
+        Self {
+            max_pivot_in_list_size: core.max_pivot_in_list_size,
+            max_view_chain_depth: core.max_view_chain_depth,
+            reject_degenerate_groupby: core.reject_degenerate_groupby,
+            reject_passthrough_views: core.reject_passthrough_views,
+        }
+    }
+}
+
+impl QueryLimitsConfig {
+    pub fn to_core(self) -> cq_core::query::QueryLimits {
+        cq_core::query::QueryLimits {
+            max_pivot_in_list_size: self.max_pivot_in_list_size,
+            max_view_chain_depth: self.max_view_chain_depth,
+            reject_degenerate_groupby: self.reject_degenerate_groupby,
+            reject_passthrough_views: self.reject_passthrough_views,
+        }
+    }
 }
 
 /// One row of the static shard table. The topic-prefix uses
@@ -546,6 +588,7 @@ impl Default for ServerConfig {
             transport: TransportConfig::default(),
             logging: crate::logging::LoggingConfig::default(),
             shards: Vec::new(),
+            query_limits: QueryLimitsConfig::default(),
         }
     }
 }

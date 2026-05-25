@@ -60,6 +60,9 @@ pub struct TcpConfig {
     /// rejected with a `read-only follower` error. Set by main.rs
     /// when `ServerConfig.replication.role == Standby`.
     pub read_only: bool,
+    /// Query Guardrails (G1+) structural limits. Defaults to
+    /// `cq_core::query::QueryLimits::default()`.
+    pub query_limits: cq_core::query::QueryLimits,
 }
 
 impl Default for TcpConfig {
@@ -72,6 +75,7 @@ impl Default for TcpConfig {
             bookmark_store: None,
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         }
     }
 }
@@ -107,6 +111,7 @@ pub async fn start_tcp_server(
             bookmark_store: bookmark_store.clone(),
             spillover: config.spillover.clone(),
             read_only: config.read_only,
+            query_limits: config.query_limits,
         };
         let queue_capacity = config.outbound_queue_capacity;
         let tls_acceptor = config.tls_acceptor.clone();
@@ -291,6 +296,7 @@ mod tests {
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -431,6 +437,7 @@ mod tests {
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
             read_only: true,
+            query_limits: cq_core::query::QueryLimits::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -544,6 +551,7 @@ mod tests {
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -652,6 +660,7 @@ mod tests {
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         };
         let server = tokio::spawn(async move {
             loop {
@@ -846,6 +855,7 @@ mod tests {
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -993,6 +1003,7 @@ mod tests {
             bookmark_store: crate::router::new_bookmark_store(),
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         };
         let server = tokio::spawn(async move {
             loop {

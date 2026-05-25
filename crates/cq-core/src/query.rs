@@ -1688,6 +1688,209 @@ pub enum QueryError {
     /// the executor lands.
     #[error("Not yet implemented: {0}")]
     NotYetImplemented(String),
+    /// Query Guardrails G1: a parsed query exceeded a configured
+    /// structural limit (PIVOT IN-list cardinality, degenerate
+    /// GROUP BY on dedup keys, view chain depth, or pointless
+    /// `SELECT * FROM source` view body). The message names the
+    /// specific rule and how to raise it.
+    #[error("Query exceeds limit: {0}")]
+    LimitExceeded(String),
+}
+
+/// Query Guardrails G1: parse-time structural limits, applied to a
+/// `ParsedQuery` (and, for view-chain depth, to a config-time view
+/// dependency graph). All fields have conservative defaults — see
+/// `QueryLimits::default()`. The `[query_limits]` block in
+/// `cqserver.toml` lets operators override per-deployment.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryLimits {
+    /// Maximum number of literals allowed in a static
+    /// `PIVOT (...) FOR col IN (lit, lit, ...)` IN-list. Each value
+    /// becomes an output column, so the wire payload scales linearly.
+    pub max_pivot_in_list_size: usize,
+    /// Maximum nesting depth for views-on-views. A view whose source
+    /// is another view counts as depth 2; a chain of three views is
+    /// depth 3. Reject at config load when the static graph would
+    /// exceed this.
+    pub max_view_chain_depth: usize,
+    /// When `true`, reject `GROUP BY col` where `col` is the topic's
+    /// dedup key (or a superset that includes all dedup-key columns
+    /// and nothing else). Such a "group-by" is degenerate — every
+    /// group is a single row, identical to projecting the columns.
+    /// The developer almost certainly meant a different aggregation
+    /// axis.
+    pub reject_degenerate_groupby: bool,
+    /// When `true`, reject a view body that is literally
+    /// `SELECT * FROM "source"` with no WHERE / aggregation /
+    /// projection — subscribing to the source topic directly is
+    /// equivalent and strictly faster (no view-evaluator overhead).
+    pub reject_passthrough_views: bool,
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            // 100 columns is already wide; defends against accidental
+            // PIVOT over a long IN list (e.g., 500 CUSIPs).
+            max_pivot_in_list_size: 100,
+            // 3 deep is the practical ceiling — beyond that the
+            // dependency graph is hard to reason about and lag
+            // amplifies.
+            max_view_chain_depth: 3,
+            reject_degenerate_groupby: true,
+            reject_passthrough_views: true,
+        }
+    }
+}
+
+impl ParsedQuery {
+    /// Run all configured structural checks against this parsed
+    /// query. Returns `Ok(())` if the query passes; otherwise
+    /// `QueryError::LimitExceeded` naming the specific rule.
+    ///
+    /// Caller is expected to provide:
+    /// - `dedup_keys`: the topic's key columns by name (or by index
+    ///   on the schema this query was parsed against). Used by the
+    ///   degenerate-groupby rule.
+    ///
+    /// Note: view-chain depth + passthrough-view rejection live on
+    /// the view registration path, not here — those checks need the
+    /// full view graph and are run once at config load.
+    pub fn validate_with_limits(
+        &self,
+        limits: &QueryLimits,
+        dedup_keys_by_index: &[usize],
+    ) -> Result<(), QueryError> {
+        // PIVOT IN-list cap. Only applies to *static* pivots (the
+        // dynamic `IN ANY` form has an empty `pivot_values` until
+        // execution discovers them; we rely on the runtime cap in
+        // G4 for that path).
+        if let Some(p) = &self.pivot {
+            if !p.dynamic && p.pivot_values.len() > limits.max_pivot_in_list_size {
+                return Err(QueryError::LimitExceeded(format!(
+                    "PIVOT IN-list has {} values; max_pivot_in_list_size = {}. \
+                     Reduce the IN list, switch to a narrower aggregate, or raise \
+                     [query_limits].max_pivot_in_list_size.",
+                    p.pivot_values.len(),
+                    limits.max_pivot_in_list_size,
+                )));
+            }
+        }
+
+        // Degenerate GROUP BY: GROUP BY of exactly the dedup-key
+        // column set is a no-op aggregate. We allow GROUP BY that
+        // includes the dedup keys AS A STRICT SUBSET of more columns
+        // (e.g., GROUP BY key, region — still meaningful), and
+        // allow GROUP BY that omits some key columns. Only the
+        // exact-set-of-key-cols case is rejected.
+        if limits.reject_degenerate_groupby
+            && !self.aggregates.is_empty()
+            && !dedup_keys_by_index.is_empty()
+            && self.group_by.len() == dedup_keys_by_index.len()
+        {
+            let groupby: std::collections::BTreeSet<usize> =
+                self.group_by.iter().copied().collect();
+            let keys: std::collections::BTreeSet<usize> =
+                dedup_keys_by_index.iter().copied().collect();
+            if groupby == keys {
+                return Err(QueryError::LimitExceeded(
+                    "GROUP BY enumerates exactly the dedup-key columns — \
+                     every group is one row. Either remove the GROUP BY \
+                     (project the columns directly) or group by a coarser \
+                     dimension. Set [query_limits].reject_degenerate_groupby = \
+                     false to allow this query."
+                        .into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Query Guardrails G1: scan a set of view definitions and reject if
+/// any chain (view → view → ... → topic) exceeds the configured
+/// depth, or if any view body is a pointless `SELECT * FROM source`.
+///
+/// `view_sources` maps every view's `name` to its `source` (which may
+/// be another view's name, or a topic). Topic names are inferred as
+/// "anything not in the keyset." Cycles are flagged as
+/// `LimitExceeded` rather than recursed into.
+pub fn validate_view_graph(
+    view_sources: &HashMap<String, String>,
+    view_bodies: &HashMap<String, String>,
+    limits: &QueryLimits,
+) -> Result<(), QueryError> {
+    // Passthrough view bodies — purely structural string match after
+    // whitespace normalization. We accept slightly-formatted
+    // variants like `select  *  from "/x"` and `SELECT * FROM /x`.
+    if limits.reject_passthrough_views {
+        for (name, body) in view_bodies {
+            if is_passthrough_select(body) {
+                return Err(QueryError::LimitExceeded(format!(
+                    "View {name:?} body is a pointless `SELECT * FROM source` — \
+                     subscribers should connect to the source topic directly. \
+                     Set [query_limits].reject_passthrough_views = false to allow."
+                )));
+            }
+        }
+    }
+
+    // View chain depth — walk each view's source chain.
+    for view in view_sources.keys() {
+        let mut depth = 1usize;
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(view.clone());
+        let mut cur = view.clone();
+        while let Some(src) = view_sources.get(&cur) {
+            if !view_sources.contains_key(src) {
+                break; // landed on a topic, stop
+            }
+            // Cycle check FIRST — a cycle would also exceed depth, but
+            // the user benefits from a precise "you have a cycle"
+            // error rather than an indirect "depth exceeded" one.
+            if !visited.insert(src.clone()) {
+                return Err(QueryError::LimitExceeded(format!(
+                    "View {view:?} chain forms a cycle through {src:?}; \
+                     views may not reference themselves transitively."
+                )));
+            }
+            depth += 1;
+            if depth > limits.max_view_chain_depth {
+                return Err(QueryError::LimitExceeded(format!(
+                    "View {view:?} chain depth {depth} exceeds \
+                     max_view_chain_depth = {}. Flatten the view stack or \
+                     raise [query_limits].max_view_chain_depth.",
+                    limits.max_view_chain_depth,
+                )));
+            }
+            cur = src.clone();
+        }
+    }
+
+    Ok(())
+}
+
+/// Heuristic: does this SQL string look like `SELECT * FROM x` with
+/// no other clauses? Quoted-identifier source names accepted.
+fn is_passthrough_select(sql: &str) -> bool {
+    let normalized = sql
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    // SELECT * FROM <token> with optional quotes; nothing after.
+    let prefix = "select * from ";
+    if !normalized.starts_with(prefix) {
+        return false;
+    }
+    let rest = normalized[prefix.len()..].trim_end_matches(';').trim();
+    // Allow at most a single bare identifier or a quoted identifier.
+    // No WHERE / GROUP / ORDER / LIMIT / JOIN / PIVOT etc.
+    if rest.contains(' ') {
+        return false;
+    }
+    !rest.is_empty()
 }
 
 /// S20 — execute a JOIN query. Pulls every left-store row that
@@ -2342,5 +2545,137 @@ mod tests {
         let result = execute_join_query(&query, &left, &right).unwrap();
         // JPM + BAC are the only Banks rows.
         assert_eq!(result.rows.len(), 2);
+    }
+
+    // ─── Query Guardrails G1 ──────────────────────────────────────────
+
+    fn limits_strict() -> QueryLimits {
+        QueryLimits {
+            max_pivot_in_list_size: 3,
+            max_view_chain_depth: 2,
+            reject_degenerate_groupby: true,
+            reject_passthrough_views: true,
+        }
+    }
+
+    #[test]
+    fn g1_pivot_in_list_under_cap_passes() {
+        let (schema, _store) = make_store();
+        let q = parse_query(
+            "SELECT * FROM t PIVOT (SUM(quantity) FOR desk IN ('RATES', 'EQUITIES'))",
+            &schema,
+        )
+        .unwrap();
+        // No dedup-key info; rule for groupby doesn't trigger on a pivot.
+        q.validate_with_limits(&limits_strict(), &[]).unwrap();
+    }
+
+    #[test]
+    fn g1_pivot_in_list_over_cap_rejected() {
+        let (schema, _store) = make_store();
+        let q = parse_query(
+            "SELECT * FROM t PIVOT (SUM(quantity) FOR desk \
+             IN ('A', 'B', 'C', 'D', 'E'))",
+            &schema,
+        )
+        .unwrap();
+        let err = q.validate_with_limits(&limits_strict(), &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("PIVOT IN-list"), "got: {msg}");
+        assert!(msg.contains("max_pivot_in_list_size"), "got: {msg}");
+    }
+
+    #[test]
+    fn g1_degenerate_groupby_exact_dedup_key_rejected() {
+        let (schema, _store) = make_store();
+        // dedup key = "symbol" (index 0); GROUP BY symbol with an
+        // aggregate is the degenerate case.
+        let q = parse_query(
+            "SELECT symbol, SUM(quantity) FROM t GROUP BY symbol",
+            &schema,
+        )
+        .unwrap();
+        let err = q
+            .validate_with_limits(&limits_strict(), &[0])
+            .unwrap_err();
+        assert!(format!("{err}").contains("dedup-key columns"));
+    }
+
+    #[test]
+    fn g1_groupby_strict_superset_of_dedup_key_allowed() {
+        let (schema, _store) = make_store();
+        // GROUP BY (symbol, desk) — strict superset of the dedup key.
+        // Still meaningful: groups by (symbol, desk) buckets, so allow.
+        let q = parse_query(
+            "SELECT symbol, desk, SUM(quantity) FROM t GROUP BY symbol, desk",
+            &schema,
+        )
+        .unwrap();
+        q.validate_with_limits(&limits_strict(), &[0]).unwrap();
+    }
+
+    #[test]
+    fn g1_groupby_coarser_than_dedup_key_allowed() {
+        let (schema, _store) = make_store();
+        // GROUP BY desk — coarser than the dedup key; valid aggregate.
+        let q = parse_query(
+            "SELECT desk, SUM(quantity) FROM t GROUP BY desk",
+            &schema,
+        )
+        .unwrap();
+        q.validate_with_limits(&limits_strict(), &[0]).unwrap();
+    }
+
+    #[test]
+    fn g1_passthrough_view_rejected() {
+        let mut bodies = HashMap::new();
+        bodies.insert("/v".to_string(), "SELECT * FROM \"/source\"".to_string());
+        let view_sources = HashMap::new();
+        let err = validate_view_graph(&view_sources, &bodies, &limits_strict()).unwrap_err();
+        assert!(format!("{err}").contains("pointless `SELECT * FROM"));
+    }
+
+    #[test]
+    fn g1_passthrough_view_with_where_allowed() {
+        let mut bodies = HashMap::new();
+        bodies.insert(
+            "/v".to_string(),
+            "SELECT * FROM \"/source\" WHERE x = 1".to_string(),
+        );
+        let view_sources = HashMap::new();
+        validate_view_graph(&view_sources, &bodies, &limits_strict()).unwrap();
+    }
+
+    #[test]
+    fn g1_view_chain_at_cap_allowed() {
+        // /a → /b → /topic. Depth 2 chain (just /a's path).
+        let mut sources = HashMap::new();
+        sources.insert("/a".to_string(), "/b".to_string());
+        sources.insert("/b".to_string(), "/topic".to_string());
+        let bodies = HashMap::new();
+        validate_view_graph(&sources, &bodies, &limits_strict()).unwrap();
+    }
+
+    #[test]
+    fn g1_view_chain_over_cap_rejected() {
+        // /a → /b → /c → /topic. Depth 3 for /a — over the cap of 2.
+        let mut sources = HashMap::new();
+        sources.insert("/a".to_string(), "/b".to_string());
+        sources.insert("/b".to_string(), "/c".to_string());
+        sources.insert("/c".to_string(), "/topic".to_string());
+        let bodies = HashMap::new();
+        let err = validate_view_graph(&sources, &bodies, &limits_strict()).unwrap_err();
+        assert!(format!("{err}").contains("chain depth"));
+    }
+
+    #[test]
+    fn g1_view_cycle_rejected() {
+        // /a → /b → /a — cycle.
+        let mut sources = HashMap::new();
+        sources.insert("/a".to_string(), "/b".to_string());
+        sources.insert("/b".to_string(), "/a".to_string());
+        let bodies = HashMap::new();
+        let err = validate_view_graph(&sources, &bodies, &limits_strict()).unwrap_err();
+        assert!(format!("{err}").contains("cycle"));
     }
 }

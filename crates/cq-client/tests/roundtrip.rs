@@ -57,6 +57,7 @@ async fn spawn_test_server() -> (String, Arc<DashMap<String, SharedTopic>>) {
         bookmark_store: cq_transport::router::new_bookmark_store(),
         spillover: None,
         read_only: false,
+        query_limits: cq_core::query::QueryLimits::default(),
     };
     tokio::spawn(async move {
         loop {

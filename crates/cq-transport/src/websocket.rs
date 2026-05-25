@@ -33,6 +33,9 @@ pub struct WsConfig {
     /// rejected with a `read-only follower` error. Set by main.rs
     /// when `ServerConfig.replication.role == Standby`.
     pub read_only: bool,
+    /// Query Guardrails (G1+) structural limits. Defaults to
+    /// `cq_core::query::QueryLimits::default()`.
+    pub query_limits: cq_core::query::QueryLimits,
 }
 
 impl Default for WsConfig {
@@ -45,6 +48,7 @@ impl Default for WsConfig {
             bookmark_store: None,
             spillover: None,
             read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
         }
     }
 }
@@ -76,6 +80,7 @@ pub async fn start_ws_server(
             bookmark_store: bookmark_store.clone(),
             spillover: config.spillover.clone(),
             read_only: config.read_only,
+            query_limits: config.query_limits,
         };
         let queue_capacity = config.outbound_queue_capacity;
 

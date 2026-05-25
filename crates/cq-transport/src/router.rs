@@ -342,6 +342,15 @@ pub struct RouterContext {
     /// and would diverge across followers). Set from
     /// `ServerConfig.replication.role == Standby` in main.rs.
     pub read_only: bool,
+    /// Query Guardrails (G1+): structural limits to apply at subscribe
+    /// time. `validate_with_limits` runs on the `ParsedQuery` before
+    /// any topic state is touched; rejected queries return an Error
+    /// ACK with a precise reason. Defaults to
+    /// `cq_core::query::QueryLimits::default()` which is conservative
+    /// (max_pivot_in_list_size = 100, max_view_chain_depth = 3,
+    /// reject_degenerate_groupby = true,
+    /// reject_passthrough_views = true).
+    pub query_limits: cq_core::query::QueryLimits,
 }
 
 /// Server-wide spillover configuration, captured in [`RouterContext`]
