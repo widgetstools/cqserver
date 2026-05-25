@@ -10,7 +10,8 @@ import { QueuesPage } from '@/pages/QueuesPage';
 import { ViewsPage } from '@/pages/ViewsPage';
 import { ReplicationPage } from '@/pages/ReplicationPage';
 import { ConfigPage } from '@/pages/ConfigPage';
-import { PlaceholderPage } from '@/pages/PlaceholderPage';
+import { MetricsPage } from '@/pages/MetricsPage';
+import { ExplainPage } from '@/pages/ExplainPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -39,26 +40,8 @@ export function App() {
                 <Route path="/replication" element={<ReplicationPage />} />
                 <Route path="/views" element={<ViewsPage />} />
                 <Route path="/queues" element={<QueuesPage />} />
-                <Route
-                  path="/metrics"
-                  element={
-                    <PlaceholderPage
-                      title="Metrics"
-                      description="Live Prometheus series browser + pinned sparklines."
-                      worklogRef="U6"
-                    />
-                  }
-                />
-                <Route
-                  path="/explain"
-                  element={
-                    <PlaceholderPage
-                      title="Query Explain"
-                      description="Estimate query cost before subscribing. Depends on QUERY_GUARDRAILS G2."
-                      worklogRef="U6"
-                    />
-                  }
-                />
+                <Route path="/metrics" element={<MetricsPage />} />
+                <Route path="/explain" element={<ExplainPage />} />
                 <Route path="/config" element={<ConfigPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>

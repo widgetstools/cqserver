@@ -108,6 +108,35 @@ export interface ViewInfo {
   tap_capacity: number;
 }
 
+export interface ExplainResponse {
+  estimated_source_rows: number;
+  estimated_result_rows: number;
+  estimated_result_bytes: number;
+  estimated_join_fanout_avg: number | null;
+  used_indexes: string[];
+  assumptions: string[];
+  confidence: 'high' | 'medium' | 'low';
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(`${adminBase}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let detail = '';
+    try {
+      const j = (await r.json()) as { error?: string };
+      detail = j?.error ?? '';
+    } catch {
+      detail = await r.text();
+    }
+    throw new Error(`${r.status}: ${detail || r.statusText}`);
+  }
+  return (await r.json()) as T;
+}
+
 export interface ShardForResponse {
   topic: string;
   instance_url: string;
@@ -125,6 +154,8 @@ export const adminApi = {
   queues: () => get<QueueInfo[]>('/queues'),
   views: () => get<ViewInfo[]>('/admin/views'),
   configToml: () => getText('/admin/config'),
+  explain: (topic: string, sql: string) =>
+    postJson<ExplainResponse>('/admin/explain', { topic, sql }),
   metricsText: () => getText('/metrics'),
   replication: () => get<ReplicationStatus>('/admin/replication'),
   shardFor: (topic: string) =>

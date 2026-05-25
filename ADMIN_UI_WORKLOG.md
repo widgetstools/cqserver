@@ -366,7 +366,7 @@ not available" empty state).
 | U3 | Topics page + topic detail | ⏳ pending |
 | U4 | Subscriptions + Queues | ✅ done — new server endpoint `GET /queues` (queue snapshots), `AdminState.queues` plumbed through `main.rs`. Admin UI: `SubscriptionsPage` (AG-Grid + summary strip with active/conflated/near-full/slow counts + per-row drop-sub via `DELETE /subscriptions/:id` + slow-consumer alert banner). `QueuesPage` (card-per-queue with buffered / consumers / sequence; "no consumers" badge when queue is backed up). |
 | U5 | Views + Replication + Config | ✅ done — server: `/admin/views` (per-view name/source/SQL/capacity), `/admin/config` (rendered TOML with env-var substitutions applied), enriched `/admin/replication` (role/peer/listen/topics). UI: `ViewsPage` (split list + detail with SQL pane + source linkage), `ReplicationPage` (topology card + per-topic shipped/applied/acked/lag table from `cq_repl_*` metrics), `ConfigPage` (line-numbered TOML viewer with cheap syntax highlighting + in-file search + copy-to-clipboard). |
-| U6 | Metrics explorer + Query Explain | ⏳ pending |
+| U6 | Metrics explorer + Query Explain | ✅ done — `MetricsPage` parses `/metrics` Prometheus text, browses by metric name, supports per-series pinning to a sparkline grid that persists across reloads via `localStorage`. `ExplainPage` form (topic dropdown + SQL textarea) calls `POST /admin/explain` and renders rows/bytes/source/fanout stats + confidence badge + used-indexes + assumptions list. Both unblocked by the QUERY_GUARDRAILS G2 endpoint shipped earlier. |
 | U7 | Polish + production build | ⏳ pending |
 
 ## Related worklogs
