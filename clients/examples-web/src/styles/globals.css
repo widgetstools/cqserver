@@ -123,34 +123,192 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   font-feature-settings: 'tnum' 1, 'zero' 1, 'ss01' 1;
 }
 
-/* ── ATLAS SIGNATURE TYPOGRAPHY ───────────────────────────────────
- * Big "EX.NN" rubric in JetBrains Mono — the visual hallmark of the
- * examples app. Coloured with the system's mint-teal accent.
+/* ── TAB STRIP — slim, single row ──────────────────────────────
+ * Tabs collapse to `serial + shortLabel`. Active gets mint-teal
+ * serial color + 2px teal underline; inactive stays muted with
+ * hover-reveal of the label. No icons, no all-caps — minimum
+ * visual chrome over a navigation device used hundreds of times.
  */
-.atlas-serial {
-  font-family: var(--sf-font-mono);
-  font-variant-numeric: tabular-nums;
-  font-feature-settings: 'tnum' 1, 'ss01' 1;
-  font-size: clamp(34px, 4vw, 52px);
-  font-weight: 600;
-  line-height: 0.95;
-  letter-spacing: -0.045em;
-  color: var(--sf-teal);
-  text-shadow: 0 0 24px var(--sf-teal-soft);
+.atlas-tabstrip-wrap {
+  border-bottom: 1px solid var(--sf-border);
+  background: hsl(var(--card));
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex-shrink: 0;
 }
-.atlas-title {
-  font-size: clamp(14px, 1.4vw, 17px);
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--sf-t-0);
+.atlas-tabstrip-wrap::-webkit-scrollbar { display: none; }
+
+.atlas-tabstrip {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  border: 0;
+  padding: 0 4px;
+  height: 32px;
 }
-.atlas-subtitle {
-  font-size: var(--sf-fs-sm);
+
+.atlas-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  font-size: 11.5px;
   font-weight: 400;
   color: var(--sf-t-2);
+  cursor: pointer;
+  white-space: nowrap;
   letter-spacing: -0.002em;
+  transition: color 120ms ease;
 }
+.atlas-tab::after { display: none; }
+.atlas-tab:hover { color: var(--sf-t-1); }
+.atlas-tab:hover .atlas-tab-serial { color: var(--sf-t-1); }
+.atlas-tab[data-state="active"] {
+  color: var(--sf-t-0);
+  border-bottom-color: var(--sf-teal);
+}
+.atlas-tab[data-state="active"] .atlas-tab-serial {
+  color: var(--sf-teal);
+}
+
+.atlas-tab-serial {
+  font-family: var(--sf-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  color: var(--sf-t-3);
+  transition: color 120ms ease;
+}
+.atlas-tab-label {
+  font-family: var(--sf-font-sans);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+
+/* ── CONTEXT BAR — single 32px row that names the active example
+ *    Replaces the previous 120px hero rubric.
+ */
+.atlas-context {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 32px;
+  padding: 0 16px 0 18px;
+  border-bottom: 1px solid var(--sf-border);
+  background: hsl(var(--card));
+  flex-shrink: 0;
+}
+.atlas-context::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--sf-teal);
+  box-shadow: 0 0 6px var(--sf-teal-soft);
+}
+
+.atlas-context-serial {
+  font-family: var(--sf-font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--sf-teal);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.atlas-context-title {
+  margin: 0;
+  font-family: var(--sf-font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--sf-t-0);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.atlas-context-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  flex-shrink: 0;
+}
+.atlas-context-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--sf-font-mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--sf-t-2);
+}
+.atlas-context-tag::before {
+  content: '';
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.atlas-context-tag[data-kind="join"]   { color: #6cc4d5; }
+.atlas-context-tag[data-kind="view"]   { color: #b59cf0; }
+.atlas-context-tag[data-kind="filter"] { color: var(--sf-warn); }
+.atlas-context-tag[data-kind="agg"]    { color: var(--sf-up); }
+.atlas-context-tag[data-kind="pivot"]  { color: var(--sf-down-hi); }
+.atlas-context-tag[data-kind="stream"] { color: var(--sf-teal); }
+.atlas-context-tag[data-kind="window"] { color: var(--sf-info); }
+
+.atlas-context-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.atlas-context-path {
+  font-family: var(--sf-font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--sf-t-3);
+  letter-spacing: 0.03em;
+}
+
+/* Pulsing LIVE pill — appears only when the example streams. */
+.atlas-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--sf-font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--sf-teal);
+}
+.atlas-live-pill::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--sf-teal);
+  box-shadow: 0 0 0 0 var(--sf-teal-ring);
+  animation: atlas-live-pulse 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes atlas-live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--sf-teal-ring); transform: scale(1); }
+  50%      { box-shadow: 0 0 0 6px transparent;        transform: scale(0.9); }
+}
+
+/* The legacy `.atlas-eyebrow` is still referenced in a couple of
+ * panel headers (PropList tags, "Selected · …" labels). Keep it as
+ * a thin utility class. */
 .atlas-eyebrow {
   font-family: var(--sf-font-mono);
   font-size: var(--sf-fs-2xs);
@@ -160,46 +318,6 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   color: var(--sf-t-2);
 }
 .atlas-eyebrow .dot { color: var(--sf-teal); }
-
-/* Capsule tags showing which cqserver features an example uses. */
-.feature-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: 18px;
-  padding: 0 7px;
-  border: 1px solid var(--sf-border);
-  border-radius: 9999px;
-  font-family: var(--sf-font-mono);
-  font-size: 9.5px;
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--sf-t-2);
-  background: transparent;
-  transition: color 100ms, border-color 100ms;
-}
-.feature-tag::before {
-  content: '';
-  width: 4px; height: 4px;
-  border-radius: 50%;
-  background: var(--sf-t-2);
-  opacity: 0.6;
-}
-.feature-tag[data-kind="join"]   { color: #67e8f9; border-color: rgba(103,232,249,0.30); }
-.feature-tag[data-kind="join"]::before   { background: #67e8f9; opacity: 1; }
-.feature-tag[data-kind="view"]   { color: #c084fc; border-color: rgba(192,132,252,0.30); }
-.feature-tag[data-kind="view"]::before   { background: #c084fc; opacity: 1; }
-.feature-tag[data-kind="filter"] { color: var(--sf-warn); border-color: rgba(245,193,75,0.32); }
-.feature-tag[data-kind="filter"]::before { background: var(--sf-warn); opacity: 1; }
-.feature-tag[data-kind="agg"]    { color: var(--sf-up); border-color: var(--sf-up-soft); }
-.feature-tag[data-kind="agg"]::before    { background: var(--sf-up); opacity: 1; }
-.feature-tag[data-kind="pivot"]  { color: var(--sf-down-hi); border-color: var(--sf-down-soft); }
-.feature-tag[data-kind="pivot"]::before  { background: var(--sf-down-hi); opacity: 1; }
-.feature-tag[data-kind="stream"] { color: var(--sf-teal); border-color: var(--sf-teal-soft); }
-.feature-tag[data-kind="stream"]::before { background: var(--sf-teal); opacity: 1; }
-.feature-tag[data-kind="window"] { color: var(--sf-info); border-color: var(--sf-info-soft); }
-.feature-tag[data-kind="window"]::before { background: var(--sf-info); opacity: 1; }
 
 /* ── HEATMAP — diverging buckets ───────────────────────────────── */
 .heatmap-cell {
