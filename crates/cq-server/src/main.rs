@@ -287,6 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ReplicationRole::Standby => "standby".into(),
             },
             peer: server_config.replication.peer.clone(),
+            peers: server_config.replication.peers.clone(),
             listen: server_config.replication.listen.clone(),
         }),
         raw_config_toml: Arc::new(raw_config_toml),
@@ -530,7 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         result = run_replication(
             repl_role,
-            server_config.replication.peer.clone(),
+            server_config.replication.resolve_peers(),
             server_config.replication.listen.clone(),
             repl_topics_for_ship,
             topics.clone(),
@@ -636,7 +637,7 @@ async fn shutdown(topics: &Arc<DashMap<String, SharedTopic>>) {
 
 async fn run_replication(
     role: ReplicationRole,
-    peer: Option<String>,
+    peers: Vec<String>,
     listen: Option<String>,
     ship_topics: Vec<(String, PathBuf)>,
     standby_topics: Arc<DashMap<String, SharedTopic>>,
@@ -651,18 +652,43 @@ async fn run_replication(
             Ok(())
         }
         ReplicationRole::Primary => {
-            let peer = peer.ok_or("replication.peer required for primary role")?;
-            let cfg = repl_ship::ShipperConfig {
-                peer,
-                topics: ship_topics,
-                filter,
-                transform,
-                topic_refs,
-                ..Default::default()
-            };
-            repl_ship::run(cfg)
-                .await
-                .map_err(|e| format!("shipper: {}", e).into())
+            if peers.is_empty() {
+                return Err(
+                    "replication.peer or replication.peers required for primary role".into(),
+                );
+            }
+            // Multi-peer fanout (C0 enabler): spawn one shipper task
+            // per peer. Each task reads from the same per-topic txlog
+            // directories independently (read-only operation, safe to
+            // share across processes/tasks). Each peer maintains its
+            // own ack stream → topic.mark_replicated() bumps the
+            // barrier on the SLOWEST peer's ack, which is the safe
+            // choice for an at-least-once guarantee.
+            let mut handles = Vec::with_capacity(peers.len());
+            for peer in peers {
+                let cfg = repl_ship::ShipperConfig {
+                    peer: peer.clone(),
+                    topics: ship_topics.clone(),
+                    filter: filter.clone(),
+                    transform: transform.clone(),
+                    topic_refs: topic_refs.clone(),
+                    ..Default::default()
+                };
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = repl_ship::run(cfg).await {
+                        tracing::warn!(peer = %peer, error = %e, "Shipper task exited");
+                    }
+                }));
+            }
+            // The shipper's run() loops internally on reconnect; the
+            // only way these tasks exit is on a fatal error (which
+            // they log above). Wait on all of them indefinitely —
+            // if every shipper somehow exits, return so the caller
+            // can decide what to do.
+            for h in handles {
+                let _ = h.await;
+            }
+            Ok(())
         }
         ReplicationRole::Standby => {
             let listen = listen.ok_or("replication.listen required for standby role")?;

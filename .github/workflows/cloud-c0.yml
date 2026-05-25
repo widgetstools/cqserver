@@ -1,0 +1,73 @@
+name: Cloud C0 (local replication harness)
+
+# Validates the replication protocol + replica-reads pattern via a
+# 1-leader + 2-followers docker-compose stack on the GitHub Actions
+# runner. Zero cloud spend; runs in <5 min on the free tier.
+
+on:
+  push:
+    branches: [main, msrv-1.78]
+  pull_request:
+    paths:
+      - 'crates/cq-replication/**'
+      - 'crates/cq-server/**'
+      - 'crates/cq-transport/**'
+      - 'crates/cq-core/**'
+      - 'tests/cloud/**'
+      - '.github/workflows/cloud-c0.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  c0:
+    name: 1 leader + 2 followers, convergence + failover
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: c0
+
+      # Build the binary once on the host. The Dockerfile.runtime
+      # only COPYs it in.
+      - name: Build release binary
+        run: cargo build --release -p cq-server -p cq-loadgen
+
+      - name: Show docker version
+        run: docker version
+
+      - name: Bring up the local cluster
+        working-directory: tests/cloud
+        run: make local-up
+
+      - name: Run convergence assertions
+        working-directory: tests/cloud
+        run: make local-test
+
+      - name: Capture logs on failure
+        if: failure()
+        working-directory: tests/cloud
+        run: |
+          echo "::group::leader logs"
+          docker logs cq-c0-leader || true
+          echo "::endgroup::"
+          echo "::group::follower1 logs"
+          docker logs cq-c0-follower1 || true
+          echo "::endgroup::"
+          echo "::group::follower2 logs"
+          docker logs cq-c0-follower2 || true
+          echo "::endgroup::"
+          echo "::group::admin/replication on each"
+          curl -s http://127.0.0.1:8085/admin/replication || true; echo
+          curl -s http://127.0.0.1:8086/admin/replication || true; echo
+          curl -s http://127.0.0.1:8087/admin/replication || true; echo
+          echo "::endgroup::"
+
+      - name: Tear down the local cluster
+        if: always()
+        working-directory: tests/cloud
+        run: make local-down

@@ -360,7 +360,7 @@ artifact + a paragraph in a follow-up document.
 
 | # | Session | Status |
 |---|---|---|
-| C0 | Local docker-compose cluster + CI gate | ⏳ pending |
+| C0 | Local docker-compose cluster + CI gate | ✅ done — enabler `[replication].peers: Vec<String>` shipped (one shipper task per peer); `tests/cloud/` harness with `Dockerfile.runtime`, `docker-compose.local.yml`, per-service TOML configs, `assert-converged.sh`, `Makefile` targets, GitHub Actions workflow at `.github/workflows/cloud-c0.yml`. End-to-end verified on host (no Docker required): leader fans out to 2 followers, both apply every entry (rows=502 seq=502 across all three), follower2 caught up via Hello-with-highwater within ~1.4s after kill+restart. |
 | C1 | AWS Spot 4-node bench (Terraform + wrapper + cost guardrails) | ⏳ pending |
 | C2 | Pre-release 24-hour soak workflow | ⏳ pending |
 

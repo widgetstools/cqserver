@@ -61,6 +61,11 @@ pub struct AdminState {
 pub struct ReplicationView {
     pub role: String, // "standalone" | "primary" | "standby"
     pub peer: Option<String>,
+    /// Multi-peer fanout (C0 enabler). When `role = primary` and
+    /// `[replication].peers` is set, every peer the shipper ships to
+    /// shows up here. Single-peer deploys leave this empty and use
+    /// `peer` instead.
+    pub peers: Vec<String>,
     pub listen: Option<String>,
 }
 
@@ -329,6 +334,7 @@ async fn replication_status(State(s): State<AdminState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "role": s.replication.role,
         "peer": s.replication.peer,
+        "peers": s.replication.peers,
         "listen": s.replication.listen,
         "topics": topics,
     }))
@@ -529,6 +535,7 @@ mod tests {
             replication: Arc::new(ReplicationView {
                 role: "standalone".into(),
                 peer: None,
+                peers: Vec::new(),
                 listen: None,
             }),
             raw_config_toml: Arc::new(String::new()),
@@ -596,6 +603,7 @@ mod tests {
             replication: Arc::new(ReplicationView {
                 role: "standalone".into(),
                 peer: None,
+                peers: Vec::new(),
                 listen: None,
             }),
             raw_config_toml: Arc::new(String::new()),

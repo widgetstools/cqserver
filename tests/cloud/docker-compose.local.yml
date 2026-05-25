@@ -1,0 +1,88 @@
+# Local replication harness — CLOUD_REPLICATION_TEST_WORKLOG C0.
+#
+# Topology:
+#   leader   :8085 admin   :9007 tcp   :9008 ws   ships -> follower1:9010 + follower2:9010
+#   follower1 :8086 admin  :9017 tcp   :9018 ws   receives on :9010
+#   follower2 :8087 admin  :9027 tcp   :9028 ws   receives on :9010
+#   loadgen  (no exposed ports; runs `cq-loadgen` against the follower URIs)
+#
+# All three cqservers run the same image, differentiated by their
+# mounted `cqserver.toml`. Each /admin port is also published to
+# the host so the operator can open three browsers / curl freely.
+#
+# The compose-network is `cq-cloud` bridge. Hostnames `leader`,
+# `follower1`, `follower2` are resolvable inside.
+
+services:
+  leader:
+    container_name: cq-c0-leader
+    image: cqserver:local
+    build:
+      context: ../..
+      dockerfile: tests/cloud/Dockerfile.runtime
+    networks:
+      cq-cloud:
+        aliases: [leader]
+    ports:
+      - "127.0.0.1:9007:9007"   # tcp transport
+      - "127.0.0.1:9008:9008"   # ws transport
+      - "127.0.0.1:8085:8085"   # admin + /ui
+    volumes:
+      - ./configs/leader.toml:/etc/cqserver/cqserver.toml:ro
+      - leader-txlog:/var/lib/cqserver/txlog
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8085/healthz"]
+      interval: 2s
+      timeout: 2s
+      start_period: 5s
+      retries: 20
+
+  follower1:
+    container_name: cq-c0-follower1
+    image: cqserver:local
+    networks:
+      cq-cloud:
+        aliases: [follower1]
+    ports:
+      - "127.0.0.1:9017:9007"
+      - "127.0.0.1:9018:9008"
+      - "127.0.0.1:8086:8085"
+    volumes:
+      - ./configs/follower1.toml:/etc/cqserver/cqserver.toml:ro
+      - follower1-txlog:/var/lib/cqserver/txlog
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8085/healthz"]
+      interval: 2s
+      timeout: 2s
+      start_period: 5s
+      retries: 20
+
+  follower2:
+    container_name: cq-c0-follower2
+    image: cqserver:local
+    networks:
+      cq-cloud:
+        aliases: [follower2]
+    ports:
+      - "127.0.0.1:9027:9007"
+      - "127.0.0.1:9028:9008"
+      - "127.0.0.1:8087:8085"
+    volumes:
+      - ./configs/follower2.toml:/etc/cqserver/cqserver.toml:ro
+      - follower2-txlog:/var/lib/cqserver/txlog
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8085/healthz"]
+      interval: 2s
+      timeout: 2s
+      start_period: 5s
+      retries: 20
+
+networks:
+  cq-cloud:
+    name: cq-cloud
+    driver: bridge
+
+volumes:
+  leader-txlog:
+  follower1-txlog:
+  follower2-txlog:

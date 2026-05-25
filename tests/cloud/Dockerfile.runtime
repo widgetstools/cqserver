@@ -1,0 +1,42 @@
+# Thin runtime image for cqserver — CLOUD_REPLICATION_TEST_WORKLOG C0.
+#
+# Doesn't build the binary itself; expects `target/release/cqserver` to
+# exist on the host. The Makefile in `tests/cloud/` enforces this by
+# running `cargo build --release -p cq-server` before `docker compose
+# up`. Keeping the build OUT of Docker is deliberate:
+#
+#   - cargo's build cache survives between iterations (5-10s vs 5 min)
+#   - We don't need musl / static linking; glibc Debian works fine
+#   - Re-builds map to host-CPU usage, not Docker BuildKit overhead
+#
+# If you ever need a from-scratch in-Docker build (e.g. CI on a clean
+# runner) use the multi-stage `Dockerfile.cibuild` variant — see the
+# accompanying CI workflow.
+
+FROM debian:bookworm-slim
+
+# `ca-certificates` for outbound TLS (replication-over-TLS in
+# follow-up sessions); `curl` for in-container health checks.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# cqserver doesn't need root; create a service user.
+RUN groupadd -r cq && useradd -r -g cq -d /var/lib/cqserver -s /sbin/nologin cq \
+    && mkdir -p /var/lib/cqserver /etc/cqserver /etc/cqserver/schemas \
+    && chown -R cq:cq /var/lib/cqserver /etc/cqserver
+
+# Copy the host-built binary in. Same path the Makefile produces.
+COPY --chown=cq:cq target/release/cqserver /usr/local/bin/cqserver
+RUN chmod 0755 /usr/local/bin/cqserver
+
+USER cq
+WORKDIR /var/lib/cqserver
+
+HEALTHCHECK --interval=2s --timeout=2s --start-period=5s --retries=20 \
+    CMD curl -fsS http://127.0.0.1:8085/healthz || exit 1
+
+# Config path comes via --config; each compose service mounts its own
+# rendered TOML at /etc/cqserver/cqserver.toml.
+ENTRYPOINT ["/usr/local/bin/cqserver"]
+CMD ["--config", "/etc/cqserver/cqserver.toml"]

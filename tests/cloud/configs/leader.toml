@@ -1,0 +1,39 @@
+# cqserver C0 — leader (role=primary, ships to follower1 + follower2)
+
+tcp_addr       = "0.0.0.0:9007"
+websocket_addr = "0.0.0.0:9008"
+websocket_path = "/cq/json"
+admin_addr     = "0.0.0.0:8085"
+
+heartbeat_interval_s     = 60
+heartbeat_idle_timeout_s = 600
+
+[transport]
+outbound_queue_capacity = 2048
+sow_batch_size          = 200
+
+[txlog]
+directory = "/var/lib/cqserver/txlog"
+
+[replication]
+role  = "primary"
+# Multi-peer fanout: the shipper spawns one task per address.
+# Each follower's receiver listens on :9010 inside the compose
+# network; hostnames resolve via the docker bridge.
+peers = ["follower1:9010", "follower2:9010"]
+
+# Persist=true so the txlog exists for the shipper to read.
+# Inline columns keep the config self-contained (no schema files
+# needed). Conflation off so subscriber-visible delivery semantics
+# match the shipper's per-mutation events 1:1.
+[[topics]]
+name             = "/c0-orders"
+key              = ["order_id"]
+persist          = true
+initial_capacity = 10000
+columns          = [
+  { name = "order_id", type = "string" },
+  { name = "book",     type = "string" },
+  { name = "qty",      type = "long"   },
+  { name = "price",    type = "double" },
+]

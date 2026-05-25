@@ -304,8 +304,19 @@ pub struct ReplicationConfig {
     #[serde(default)]
     pub role: ReplicationRole,
     /// Address of the peer (primary→standby) when `role = primary`.
+    /// **Deprecated** in favor of `peers`; kept for backward
+    /// compatibility. If both are set the union is used.
     #[serde(default)]
     pub peer: Option<String>,
+    /// Multi-peer replication targets. When non-empty (or `peer` is
+    /// set), `role = primary` spawns one shipper task per peer; each
+    /// ships the same txlog stream to its own follower. Lets a
+    /// single leader fan out to N followers from one process,
+    /// which is the replica-reads deployment shape — see
+    /// `docs/deploy/replica-reads.md` and
+    /// `CLOUD_REPLICATION_TEST_WORKLOG.md`.
+    #[serde(default)]
+    pub peers: Vec<String>,
     /// Listen address for the standby's replication acceptor when
     /// `role = standby`.
     #[serde(default)]
@@ -319,6 +330,27 @@ pub struct ReplicationConfig {
     /// JSON fields from outbound entries.
     #[serde(default)]
     pub transform: Option<cq_replication::filter::TransformSpec>,
+}
+
+impl ReplicationConfig {
+    /// Resolve the effective set of peer addresses for the shipper.
+    /// Concatenates `peer` (if set) with `peers` and dedups. Returns
+    /// empty if neither field is populated — the caller (main.rs)
+    /// converts that to a startup error when `role = primary`.
+    pub fn resolve_peers(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(p) = &self.peer {
+            if !p.is_empty() && !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        for p in &self.peers {
+            if !p.is_empty() && !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
