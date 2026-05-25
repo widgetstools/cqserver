@@ -473,7 +473,14 @@ pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) 
         Command::Logon => handle_logon(session, msg, &ctx.auth),
         Command::Publish => handle_publish(session, msg, ctx),
         Command::DeltaPublish => handle_delta_publish(session, msg, ctx),
-        Command::Sow => handle_sow(session, msg, &ctx.topics, &ctx.auth, ctx.sow_batch_size),
+        Command::Sow => handle_sow(
+            session,
+            msg,
+            &ctx.topics,
+            &ctx.auth,
+            ctx.sow_batch_size,
+            &ctx.query_limits,
+        ),
         Command::SowAndSubscribe => handle_sow_and_subscribe(session, msg, ctx, false),
         Command::DeltaSubscribe => handle_sow_and_subscribe(session, msg, ctx, true),
         Command::Subscribe => handle_subscribe(session, msg, ctx),
@@ -863,6 +870,7 @@ fn handle_sow(
     topics: &Arc<DashMap<String, SharedTopic>>,
     auth: &SharedAuth,
     sow_batch_size: usize,
+    query_limits: &cq_core::query::QueryLimits,
 ) {
     let topic_name = match &msg.topic {
         Some(t) => t.clone(),
@@ -897,6 +905,8 @@ fn handle_sow(
     let topic_label = topic_name.clone();
     let batch_size = sow_batch_size;
 
+    let hard_max_rows = query_limits.hard_max_sow_result_rows;
+    let hard_max_bytes = query_limits.hard_max_sow_result_bytes;
     tokio::spawn(async move {
         deliver_streaming_snapshot(
             topic,
@@ -908,6 +918,8 @@ fn handle_sow(
             codec_slot,
             tx,
             batch_size,
+            hard_max_rows,
+            hard_max_bytes,
         )
         .await;
     });
@@ -1159,6 +1171,8 @@ fn handle_sow_and_subscribe(
                 let batch_size = ctx.sow_batch_size;
                 let topic_for_task = topic.clone();
                 let sql_for_task = snapshot_sql.clone();
+                let hard_max_rows = ctx.query_limits.hard_max_sow_result_rows;
+                let hard_max_bytes = ctx.query_limits.hard_max_sow_result_bytes;
                 tokio::spawn(async move {
                     // ack_cmd_id = None: the ack was sent
                     // synchronously above.
@@ -1172,6 +1186,8 @@ fn handle_sow_and_subscribe(
                         codec_slot,
                         tx,
                         batch_size,
+                        hard_max_rows,
+                        hard_max_bytes,
                     )
                     .await;
                 });
@@ -1814,6 +1830,11 @@ async fn deliver_streaming_snapshot(
     codec_slot: crate::session::SharedCodec,
     tx: crate::session::OutboundTx,
     batch_size: usize,
+    // Query Guardrails G4 runtime caps. `0` = disabled. When non-zero,
+    // streaming aborts after this many rows / bytes have been emitted
+    // on the wire, with an error frame to the client and a metric.
+    hard_max_rows: u64,
+    hard_max_bytes: u64,
 ) {
     use crate::session::encode_frame;
     use std::time::Instant;
@@ -1874,6 +1895,13 @@ async fn deliver_streaming_snapshot(
     // serializations and don't share the win.
     let mut batches_sent: usize = 0;
     let mut rows_sent: usize = 0;
+    // G4: track bytes emitted on the wire so we can abort if a
+    // runaway snapshot exceeds the byte cap. Updated per-batch
+    // (after the frame is built) on the JSON path; the slow path
+    // estimates from row count × 256 B since the encoded frame
+    // length isn't easily exposed by tokio-tungstenite here.
+    let mut bytes_sent: u64 = 0;
+    let mut aborted_reason: Option<String> = None;
     use cq_protocol::serialization::Codec;
     let total: usize = if matches!(codec, Codec::Json) {
         // ── JSON fast path with encode-once-fanout cache ─────────
@@ -1928,8 +1956,9 @@ async fn deliver_streaming_snapshot(
 
         // Stream every cached batch as a sow_batch frame. Reading the
         // cache is read-only; encoder ran (or didn't) above.
-        for batch in batches.iter() {
+        'json_loop: for batch in batches.iter() {
             let n = batch.len();
+            let batch_bytes: u64 = batch.iter().map(|r| r.len() as u64).sum();
             if let Some(f) = crate::session::build_sow_batch_json_frame(&sub_id, batch) {
                 if tx.send(f).await.is_err() {
                     tracing::warn!(
@@ -1943,6 +1972,25 @@ async fn deliver_streaming_snapshot(
             }
             batches_sent += 1;
             rows_sent += n;
+            bytes_sent += batch_bytes;
+
+            // G4: enforce runtime caps. Hard rejection at this point
+            // returns a partial result + error frame so the client sees
+            // some data and a clear "cap fired" reason.
+            if hard_max_rows > 0 && rows_sent as u64 > hard_max_rows {
+                aborted_reason = Some(format!(
+                    "rows_emitted = {} exceeded hard_max_sow_result_rows = {}",
+                    rows_sent, hard_max_rows,
+                ));
+                break 'json_loop;
+            }
+            if hard_max_bytes > 0 && bytes_sent > hard_max_bytes {
+                aborted_reason = Some(format!(
+                    "bytes_emitted = {} exceeded hard_max_sow_result_bytes = {}",
+                    bytes_sent, hard_max_bytes,
+                ));
+                break 'json_loop;
+            }
         }
         rows_sent
     } else {
@@ -1975,6 +2023,11 @@ async fn deliver_streaming_snapshot(
 
         while let Some(batch) = batch_rx.recv().await {
             let n = batch.len();
+            // Estimate bytes for the slow-path cap. Without access to
+            // the encoded frame size, use a coarse 256 B/row guess —
+            // adequate as a runaway-stopper since hard_max_bytes is
+            // sized in MB not KB.
+            let batch_bytes: u64 = (n as u64).saturating_mul(256);
             if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, batch)) {
                 if tx.send(f).await.is_err() {
                     tracing::warn!(
@@ -1988,6 +2041,21 @@ async fn deliver_streaming_snapshot(
             }
             batches_sent += 1;
             rows_sent += n;
+            bytes_sent += batch_bytes;
+            if hard_max_rows > 0 && rows_sent as u64 > hard_max_rows {
+                aborted_reason = Some(format!(
+                    "rows_emitted = {} exceeded hard_max_sow_result_rows = {}",
+                    rows_sent, hard_max_rows,
+                ));
+                break;
+            }
+            if hard_max_bytes > 0 && bytes_sent > hard_max_bytes {
+                aborted_reason = Some(format!(
+                    "bytes_emitted = {} exceeded hard_max_sow_result_bytes = {}",
+                    bytes_sent, hard_max_bytes,
+                ));
+                break;
+            }
         }
 
         match iter_handle.await {
@@ -2002,6 +2070,29 @@ async fn deliver_streaming_snapshot(
         }
     };
 
+    // G4: if the runtime cap fired, send a clear error frame BEFORE
+    // group_end so the client sees both the partial data and the
+    // abort reason. Also record an estimate-vs-actual metric so
+    // operators can see when caps are firing.
+    if let Some(reason) = &aborted_reason {
+        tracing::warn!(
+            session = %session_id,
+            topic = %topic_label,
+            rows_sent,
+            bytes_sent,
+            reason,
+            "SOW snapshot aborted — runtime cap exceeded"
+        );
+        metrics::counter!(
+            "cq_query_runtime_capped_total",
+            "topic" => topic_label.clone()
+        )
+        .increment(1);
+        if let Some(f) = encode_frame(codec, &CqMessage::error(None, reason)) {
+            let _ = tx.send(f).await;
+        }
+    }
+
     if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
         let _ = tx.send(f).await;
     }
@@ -2011,6 +2102,10 @@ async fn deliver_streaming_snapshot(
         .increment(total as u64);
     metrics::histogram!("cq_sow_query_latency_us", "topic" => topic_label.clone())
         .record(started.elapsed().as_micros() as f64);
+    metrics::histogram!("cq_sow_actual_rows", "topic" => topic_label.clone())
+        .record(total as f64);
+    metrics::histogram!("cq_sow_actual_bytes", "topic" => topic_label.clone())
+        .record(bytes_sent as f64);
     tracing::info!(
         session = %session_id,
         topic = %topic_label,

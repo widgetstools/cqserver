@@ -73,6 +73,8 @@ pub struct QueryLimitsConfig {
     pub max_group_estimated_cardinality: u64,
     pub warn_sow_rows_threshold: u64,
     pub warn_sow_bytes_threshold: u64,
+    pub hard_max_sow_result_rows: u64,
+    pub hard_max_sow_result_bytes: u64,
 }
 
 impl Default for QueryLimitsConfig {
@@ -91,6 +93,8 @@ impl Default for QueryLimitsConfig {
             max_group_estimated_cardinality: core.max_group_estimated_cardinality,
             warn_sow_rows_threshold: core.warn_sow_rows_threshold,
             warn_sow_bytes_threshold: core.warn_sow_bytes_threshold,
+            hard_max_sow_result_rows: core.hard_max_sow_result_rows,
+            hard_max_sow_result_bytes: core.hard_max_sow_result_bytes,
         }
     }
 }
@@ -108,6 +112,8 @@ impl QueryLimitsConfig {
             max_group_estimated_cardinality: self.max_group_estimated_cardinality,
             warn_sow_rows_threshold: self.warn_sow_rows_threshold,
             warn_sow_bytes_threshold: self.warn_sow_bytes_threshold,
+            hard_max_sow_result_rows: self.hard_max_sow_result_rows,
+            hard_max_sow_result_bytes: self.hard_max_sow_result_bytes,
         }
     }
 }

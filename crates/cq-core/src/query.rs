@@ -1747,6 +1747,17 @@ pub struct QueryLimits {
     /// Soft warning threshold for estimated result bytes. `0`
     /// disables.
     pub warn_sow_bytes_threshold: u64,
+    /// Query Guardrails G4: runtime backstops. Even when G3's
+    /// pre-flight estimate passes, the actual SOW stream may
+    /// blow past expectations (skewed data, low-confidence
+    /// estimate, dynamic PIVOT exploding). When the actual row
+    /// count emitted on the wire exceeds this, the stream
+    /// aborts cleanly with an error frame to the client.
+    /// `0` disables.
+    pub hard_max_sow_result_rows: u64,
+    /// Same as `hard_max_sow_result_rows` but for emitted bytes
+    /// (sum of `sow_batch` frame body lengths). `0` disables.
+    pub hard_max_sow_result_bytes: u64,
 }
 
 impl Default for QueryLimits {
@@ -1772,6 +1783,12 @@ impl Default for QueryLimits {
             // see "you're approaching" before "you're rejected."
             warn_sow_rows_threshold: 100_000,
             warn_sow_bytes_threshold: 10_000_000,
+            // G4 runtime caps. Generous defaults — these are
+            // the catch-all when an estimate-time check missed.
+            // 5M rows or 500MB stops a runaway SOW; raise for
+            // bulk-export workloads or set 0 to disable.
+            hard_max_sow_result_rows: 5_000_000,
+            hard_max_sow_result_bytes: 500_000_000,
         }
     }
 }

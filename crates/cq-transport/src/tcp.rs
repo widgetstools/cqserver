@@ -528,6 +528,161 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
     }
 
+    /// Query Guardrails G4: the runtime SOW row cap fires when a
+    /// snapshot exceeds the configured limit. The client receives a
+    /// partial result (some rows), then an error frame naming the
+    /// cap, then group_end. Verifies through the real TCP stack so
+    /// the abort path's wire shape is exercised end-to-end.
+    #[tokio::test]
+    async fn tcp_g4_runtime_row_cap_aborts_sow() {
+        use cq_protocol::command::Status;
+
+        let topics: Arc<DashMap<String, SharedTopic>> = Arc::new(DashMap::new());
+        let schema = Arc::new(Schema::from_strs(
+            &["symbol", "price"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let topic = Topic::new(
+            TopicConfig {
+                name: "/cap".into(),
+                key_fields: vec!["symbol".into()],
+                persist: false,
+                conflation_ms: None,
+                index_columns: vec![],
+                expire_seconds: None,
+            },
+            schema,
+            128,
+        );
+        let shared: SharedTopic = Arc::new(topic);
+        // Publish 50 rows directly (no router involved — we want SOW
+        // input, not the publish pipeline).
+        for i in 0..50 {
+            let mut row = serde_json::Map::new();
+            row.insert("symbol".into(), format!("SYM{i:04}").into());
+            row.insert("price".into(), (100.0 + i as f64).into());
+            shared.upsert_map(&row).unwrap();
+        }
+        topics.insert("/cap".into(), shared);
+
+        let registry = new_registry();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Tight cap: abort after 10 rows on the wire.
+        let mut limits = cq_core::query::QueryLimits::default();
+        limits.hard_max_sow_result_rows = 10;
+        // Disable the estimate-side hard cap so we ONLY exercise the
+        // runtime cap path (otherwise G3 would reject before G4 fires).
+        limits.max_sow_estimated_rows = 0;
+        limits.max_sow_estimated_bytes = 0;
+
+        let ctx = RouterContext {
+            topics: topics.clone(),
+            sessions: registry.clone(),
+            queues: crate::queue::new_queue_registry(),
+            auth: std::sync::Arc::new(crate::auth::AuthStore::disabled()),
+            sow_batch_size: 4, // small batch so the cap fires mid-stream
+            bookmark_store: crate::router::new_bookmark_store(),
+            spillover: None,
+            read_only: false,
+            query_limits: limits,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tcp_connection(
+                stream,
+                peer.to_string(),
+                ctx,
+                HeartbeatConfig::DISABLED,
+                DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            )
+            .await;
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut cr, mut cw) = client.into_split();
+
+        async fn write_msg(w: &mut tokio::net::tcp::OwnedWriteHalf, msg: &CqMessage) {
+            let json = serde_json::to_vec(msg).unwrap();
+            let mut out = BytesMut::new();
+            encode_frame(&json, &mut out);
+            w.write_all(&out).await.unwrap();
+        }
+        async fn read_msg(
+            r: &mut tokio::net::tcp::OwnedReadHalf,
+            buf: &mut BytesMut,
+        ) -> CqMessage {
+            loop {
+                match decode_frame(buf) {
+                    Ok(Some(payload)) => return serde_json::from_slice(&payload).unwrap(),
+                    Ok(None) => {
+                        let n = r.read_buf(buf).await.unwrap();
+                        assert!(n > 0, "unexpected EOF");
+                    }
+                    Err(e) => panic!("decode error: {}", e),
+                }
+            }
+        }
+
+        let mut sow_msg = CqMessage::new(Command::SowAndSubscribe);
+        sow_msg.topic = Some("/cap".into());
+        sow_msg.command_id = Some("c1".into());
+        write_msg(&mut cw, &sow_msg).await;
+
+        let mut rbuf = BytesMut::with_capacity(8192);
+
+        // Collect frames until we see either the runtime-cap error
+        // (Ack/status=Error) or group_end. Both should appear before
+        // we time out.
+        let mut rows_received = 0usize;
+        let mut saw_cap_error = false;
+        let mut saw_group_end = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !(saw_cap_error && saw_group_end) {
+            let m = tokio::time::timeout(
+                Duration::from_millis(800),
+                read_msg(&mut cr, &mut rbuf),
+            )
+            .await;
+            let m = match m {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match m.command {
+                Command::Ack => {
+                    if matches!(m.status, Some(Status::Error)) {
+                        let reason = m.reason.unwrap_or_default();
+                        if reason.contains("hard_max_sow_result_rows") {
+                            saw_cap_error = true;
+                        }
+                    }
+                }
+                Command::SowBatch => {
+                    if let Some(serde_json::Value::Array(rows)) = m.data {
+                        rows_received += rows.len();
+                    }
+                }
+                Command::GroupBegin => {}
+                Command::GroupEnd => {
+                    saw_group_end = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_cap_error, "expected runtime-cap error frame");
+        assert!(saw_group_end, "expected group_end after abort");
+        assert!(
+            rows_received <= 14, // 10 cap + 1 batch of size <= 4 already in flight
+            "expected at most 14 rows on the wire, got {rows_received}"
+        );
+
+        drop(cw);
+        drop(cr);
+        let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+    }
+
     /// Verify the server pushes heartbeats on the configured interval and
     /// closes the connection after the idle timeout elapses.
     #[tokio::test]
