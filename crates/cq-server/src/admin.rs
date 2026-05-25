@@ -62,6 +62,7 @@ pub async fn start_admin_server(
         .route("/admin/shrink-store-all", post(shrink_store_all))
         .route("/admin/replication", get(replication_status))
         .route("/admin/shard-for/:topic", get(shard_for))
+        .route("/admin/explain", post(explain_query))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -328,6 +329,61 @@ async fn get_metrics(State(s): State<AdminState>) -> impl IntoResponse {
         [("content-type", "text/plain; version=0.0.4")],
         s.prom.render(),
     )
+}
+
+#[derive(serde::Deserialize)]
+struct ExplainRequest {
+    /// Topic against which the query will be parsed and executed.
+    /// Schema is read from this topic; the query may still reference
+    /// other topics via JOIN, but JOIN cost estimation is deferred.
+    topic: String,
+    /// SQL to estimate. Same dialect the subscribe path uses.
+    sql: String,
+}
+
+/// `POST /admin/explain` — estimate the cost of a query before
+/// subscribing. Returns the `QueryCostEstimate` from cq-core as JSON.
+/// Operator-facing tool for the admin UI's Query Explain screen
+/// (admin-ui U6) and for ad-hoc debugging.
+async fn explain_query(
+    State(s): State<AdminState>,
+    Json(req): Json<ExplainRequest>,
+) -> impl IntoResponse {
+    let topic = match s.topics.get(&req.topic) {
+        Some(t) => t.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("topic not found: {}", req.topic),
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    match topic.estimate_cost(&req.sql) {
+        Ok(est) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "estimated_source_rows": est.estimated_source_rows,
+                "estimated_result_rows": est.estimated_result_rows,
+                "estimated_result_bytes": est.estimated_result_bytes,
+                "estimated_join_fanout_avg": est.estimated_join_fanout_avg,
+                "used_indexes": est.used_indexes,
+                "assumptions": est.assumptions,
+                "confidence": est.confidence.as_str(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("{}", e),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

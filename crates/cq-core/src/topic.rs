@@ -1151,6 +1151,30 @@ impl Topic {
         crate::query::execute_join_query(parsed, &left_state.store, &right_state.store)
     }
 
+    /// Query Guardrails G2: parse `sql` against this topic's schema
+    /// and return a structural cost estimate (row count, byte count,
+    /// confidence). Does NOT execute the query — purely consults the
+    /// secondary index for distinct-value counts and group cardinality.
+    /// Used by `POST /admin/explain` and (in G3) by the subscribe-time
+    /// enforcement gate.
+    pub fn estimate_cost(
+        &self,
+        sql: &str,
+    ) -> Result<crate::cost_estimator::QueryCostEstimate, QueryError> {
+        let state = self.state.read();
+        let parsed = parse_query(sql, &state.schema)?;
+        // JOIN cost is left for a follow-up — the right-side topic
+        // lookup needs the topic registry, which the Topic alone
+        // doesn't carry. /admin/explain accepts non-join SQL today.
+        Ok(crate::cost_estimator::estimate_cost(
+            &parsed,
+            &state.store,
+            &state.schema,
+            Some(&state.secondary_index),
+            None,
+        ))
+    }
+
     pub fn query(&self, sql: &str) -> Result<QueryResult, QueryError> {
         let state = self.state.read();
         let parsed = parse_query(sql, &state.schema)?;

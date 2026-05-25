@@ -1,4 +1,5 @@
 pub mod conflation;
+pub mod cost_estimator;
 pub mod flatten;
 pub mod predicate;
 pub mod query;

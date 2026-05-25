@@ -250,6 +250,26 @@ impl SecondaryIndex {
         inner.get(key)
     }
 
+    /// Query Guardrails G2: count of distinct values currently held for
+    /// this column. Returns `None` when the column isn't indexed (the
+    /// cost estimator falls back to "unknown" in that case and skips
+    /// the row-count estimate). Cheap — just a map size lookup.
+    pub fn distinct_value_count(&self, col: usize) -> Option<usize> {
+        self.by_col.get(&col).map(|inner| inner.len())
+    }
+
+    /// Query Guardrails G2: total non-null row count for this column,
+    /// summed across all distinct values. Returns `None` when the
+    /// column isn't indexed.
+    pub fn non_null_row_count(&self, col: usize) -> Option<u64> {
+        let inner = self.by_col.get(&col)?;
+        let mut sum = 0u64;
+        for bm in inner.values() {
+            sum += bm.len();
+        }
+        Some(sum)
+    }
+
     /// True iff this column has a range index (S30). For now the
     /// range index is built for every indexed column, so this is
     /// just `covers(col)`. Kept as a distinct method so future

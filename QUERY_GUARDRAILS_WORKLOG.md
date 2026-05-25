@@ -444,7 +444,7 @@ without estimation) is also independently useful as a backstop.
 | # | Session | Status |
 |---|---|---|
 | G1 | Parse-time validators | ✅ done — `QueryLimits` + `validate_with_limits` + `validate_view_graph` in cq-core; `[query_limits]` block in `cqserver.toml`; wired through `WsConfig`/`TcpConfig` to `RouterContext` (ready for G3); view-graph validation runs at server startup. 10 unit tests in `query::tests::g1_*`. |
-| G2 | Cost estimator + `/admin/explain` | ⏳ pending |
+| G2 | Cost estimator + `/admin/explain` | ✅ done — `cq_core::cost_estimator::{estimate_cost, QueryCostEstimate, ConfidenceLevel}`; `SecondaryIndex::{distinct_value_count, non_null_row_count}`; `Topic::estimate_cost`; `POST /admin/explain` endpoint. 6 unit tests. |
 | G3 | Subscribe-time enforcement | ⏳ pending |
 | G4 | Runtime caps + observability | ⏳ pending |
 | G5 | Per-user query budgets | ⏳ pending |

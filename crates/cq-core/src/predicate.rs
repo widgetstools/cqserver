@@ -189,7 +189,7 @@ impl CompiledPredicate {
         out
     }
 
-    fn collect_referenced(&self, out: &mut Vec<usize>) {
+    pub fn collect_referenced(&self, out: &mut Vec<usize>) {
         use CompiledPredicate::*;
         match self {
             EqDouble { col, .. }
