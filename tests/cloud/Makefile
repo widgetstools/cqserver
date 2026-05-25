@@ -1,21 +1,27 @@
-# C0 — local replication harness. See CLOUD_REPLICATION_TEST_WORKLOG.md.
+# tests/cloud — replication test harness. See CLOUD_REPLICATION_TEST_WORKLOG.md.
 #
-# Targets:
+# C0 (loopback docker-compose):
 #   make build        — cargo build --release -p cq-server (host)
 #   make local-up     — build + docker compose up -d
 #   make local-test   — run convergence + failure-injection assertions
 #   make local-down   — tear down + remove volumes
 #   make local-logs   — tail every cqserver container's logs
 #   make local-status — one-line summary per container
+#
+# Two-Mac lab (real-network test, $0): see lab/README.md.
+#   make lab-help     — print the two-Mac setup procedure
 
 REPO_ROOT := $(shell git rev-parse --show-toplevel 2>/dev/null || (cd ../.. && pwd))
 COMPOSE   := docker compose -f docker-compose.local.yml
 BINARY    := $(REPO_ROOT)/target/release/cqserver
 
-.PHONY: build local-up local-test local-down local-logs local-status help
+.PHONY: build local-up local-test local-down local-logs local-status help lab-help
 
 help:
 	@awk 'BEGIN{FS=" — "} /^#   make/{sub(/^#   /,"  "); print}' $(MAKEFILE_LIST)
+
+lab-help:
+	@cat lab/README.md
 
 build:
 	@if [ ! -x "$(BINARY)" ] || [ "$(BINARY)" -ot "$(REPO_ROOT)/crates/cq-server/src/main.rs" ]; then \

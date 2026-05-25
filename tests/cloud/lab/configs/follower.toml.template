@@ -1,0 +1,43 @@
+# cqserver lab — follower (role=standby; receives txlog stream from
+# the leader on a different Mac).
+#
+# Env vars:
+#   LAB_TXLOG_DIR — default: /tmp/cqserver-lab/follower/txlog
+#   LAB_BIND_IP   — default 0.0.0.0 (let the leader connect from
+#                   anywhere on the LAN); use 127.0.0.1 for the
+#                   one-Mac smoke test.
+
+tcp_addr       = "${LAB_BIND_IP:-0.0.0.0}:9007"
+websocket_addr = "${LAB_BIND_IP:-0.0.0.0}:9008"
+websocket_path = "/cq/json"
+admin_addr     = "${LAB_BIND_IP:-0.0.0.0}:8085"
+
+heartbeat_interval_s     = 60
+heartbeat_idle_timeout_s = 600
+
+[transport]
+outbound_queue_capacity = 2048
+sow_batch_size          = 200
+
+[txlog]
+directory = "${LAB_TXLOG_DIR:-/tmp/cqserver-lab/follower/txlog}"
+
+[replication]
+role   = "standby"
+listen = "${LAB_BIND_IP:-0.0.0.0}:9010"
+
+# Same topic + schema as the leader. Replication won't apply entries
+# for topics this server doesn't know about (the receiver logs
+# "Replicated entry for unknown topic — skipping"), so the schema
+# must match exactly across leader + follower.
+[[topics]]
+name             = "/lab-orders"
+key              = ["order_id"]
+persist          = true
+initial_capacity = 100000
+columns          = [
+  { name = "order_id", type = "string" },
+  { name = "book",     type = "string" },
+  { name = "qty",      type = "long"   },
+  { name = "price",    type = "double" },
+]

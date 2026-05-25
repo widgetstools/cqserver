@@ -52,13 +52,38 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Minimal CLI: just `--config <path>` (or `-c <path>`). Anything
+/// else is ignored — we deliberately don't pull in a full clap
+/// dependency here to keep cqserver's binary lean.
+fn parse_config_arg() -> Option<std::path::PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--config" || a == "-c" {
+            if let Some(p) = args.next() {
+                return Some(std::path::PathBuf::from(p));
+            }
+        } else if let Some(rest) = a.strip_prefix("--config=") {
+            return Some(std::path::PathBuf::from(rest));
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the config FIRST so the logging section can drive tracing
     // sink installation. Bootstrapping issue: before logging is up,
     // we can't surface errors via tracing — `load_config` returns
     // them straight to stderr via the `?` operator instead.
-    let (server_config, config_dir, raw_config_toml) = config::load_config_with_raw()?;
+    // Honor `--config <path>` so operators can run cqserver from any
+    // working directory pointing at any config file. Without an arg,
+    // falls back to the historical `./config/cqserver.toml` lookup so
+    // existing start-demo.sh / Makefiles keep working.
+    let config_override = parse_config_arg();
+    let (server_config, config_dir, raw_config_toml) = match config_override {
+        Some(path) => config::load_config_from_with_raw(&path)?,
+        None => config::load_config_with_raw()?,
+    };
 
     // Install tracing sinks from `[logging]`. Errors opening
     // individual sink files are returned so we can warn about them

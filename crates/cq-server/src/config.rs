@@ -709,14 +709,7 @@ pub fn load_config_with_raw() -> Result<
 > {
     let config_path = std::path::Path::new("config/cqserver.toml");
     if config_path.exists() {
-        let raw = std::fs::read_to_string(config_path)?;
-        let content = substitute_env_vars(&raw)?;
-        let config: ServerConfig = toml::from_str(&content)?;
-        let dir = config_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        Ok((config, dir, content))
+        load_config_from_with_raw(config_path)
     } else {
         tracing::info!("No config file found, using defaults");
         Ok((
@@ -725,6 +718,31 @@ pub fn load_config_with_raw() -> Result<
             "# no config/cqserver.toml found; running with defaults\n".to_string(),
         ))
     }
+}
+
+/// Like `load_config_with_raw` but takes an explicit config-file
+/// path. Used by `--config <path>` to let operators run cqserver
+/// from any CWD. The returned `PathBuf` is the directory the file
+/// lives in (used to resolve relative `schema_file` paths in
+/// `[[topics]]`).
+pub fn load_config_from_with_raw(
+    config_path: &std::path::Path,
+) -> Result<(ServerConfig, std::path::PathBuf, String), Box<dyn std::error::Error>> {
+    if !config_path.exists() {
+        return Err(format!(
+            "config file not found at {}",
+            config_path.display()
+        )
+        .into());
+    }
+    let raw = std::fs::read_to_string(config_path)?;
+    let content = substitute_env_vars(&raw)?;
+    let config: ServerConfig = toml::from_str(&content)?;
+    let dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    Ok((config, dir, content))
 }
 
 /// Apply `${VAR}` and `${VAR:-default}` substitution to a TOML
