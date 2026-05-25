@@ -19,7 +19,7 @@ export default defineConfig({
         manualChunks: (id) => {
           if (id.includes('node_modules/ag-grid')) return 'ag-grid';
           if (id.includes('node_modules/recharts')) return 'recharts';
-          if (id.includes('node_modules/dockview')) return 'dockview';
+          if (id.includes('node_modules/@widgetstools')) return 'dockmanager';
           if (id.includes('node_modules/@codemirror') || id.includes('node_modules/@uiw/react-codemirror')) return 'codemirror';
         },
       },

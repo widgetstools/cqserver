@@ -5,9 +5,11 @@
 @import "@fontsource/inter/700.css";
 @import "@fontsource-variable/jetbrains-mono";
 
-/* dockview-react base styles — we pull in only the structural CSS;
- * theme colors are overridden by our own tokens below. */
-@import "dockview-react/dist/styles/dockview.css";
+/* @widgetstools/react-dock-manager — its bundled styles ship both
+ * structural CSS and a default HSL theme palette (light + .dark).
+ * We override the `--dock-*` variables further down so the dock
+ * chrome inherits our Atlas operator-console palette. */
+@import "@widgetstools/react-dock-manager/styles.css";
 
 /*
  * cqserver Atlas — example field guide
@@ -446,39 +448,70 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
 .ag-cell .num-pos { color: var(--ok); }
 .ag-cell .num-neg { color: var(--err); }
 
-/* ── DOCKVIEW OVERRIDES (match operator console) ─────────────── */
-.dockview-theme-abyss,
-.dv-react-context {
-  --dv-paneview-active-outline-color: var(--signal);
-  --dv-tabs-and-actions-container-background-color: var(--card);
-  --dv-tabs-and-actions-container-font-size: 11px;
-  --dv-tab-divider-color: var(--border);
-  --dv-group-view-background-color: var(--card);
-  --dv-tabs-container-scrollbar-color: var(--border);
-  --dv-icon-hover-background-color: var(--accent);
-  --dv-floating-box-shadow: none;
-  --dv-active-tab-background-color: var(--background);
-  --dv-active-tab-color: var(--foreground);
-  --dv-inactive-tab-background-color: var(--card);
-  --dv-inactive-tab-color: var(--muted-foreground);
-  --dv-tab-close-icon: var(--muted-foreground);
-  --dv-drag-over-background-color: var(--signal-muted);
-  --dv-drag-over-border-color: var(--signal);
-  --dv-separator-border: var(--border);
-  --dv-paneview-header-border-color: var(--border);
-  --dv-background-color: var(--background);
+/* ── DOCK MANAGER (@widgetstools/react-dock-manager) ───────────
+ * The package's CSS expects HSL triplets without the hsl() wrapper
+ * (e.g. `220 17% 97%`) so it can compose `hsl(var(--dock-bg) / 0.5)`
+ * internally. We override these to match the Atlas operator-console
+ * palette — same hex values used elsewhere, just transcribed to HSL.
+ */
+:root {
+  --dock-bg:                 220 17% 97%;   /* matches --background light */
+  --dock-surface:            0 0% 100%;     /* matches --card light */
+  --dock-surface-alt:        220 20% 95%;
+  --dock-panel-header:       220 14% 91%;   /* matches --border light */
+  --dock-tab-bar:            0 0% 100%;
+  --dock-tab-active:         0 0% 100%;
+  --dock-tab-text:           218 13% 34%;   /* muted-foreground */
+  --dock-tab-text-active:    213 30% 7%;    /* foreground */
+  --dock-text:               213 30% 7%;
+  --dock-text-secondary:     218 13% 34%;
+  --dock-text-muted:         220 8% 55%;
+  --dock-border:             220 14% 91%;
+  --dock-splitter:           220 14% 88%;
+  --dock-splitter-hover:     6 100% 62%;    /* signal */
+  --dock-hover:              220 14% 91%;
+  --dock-primary:            6 100% 62%;    /* signal */
+  --dock-tab-overflow-bg:    220 14% 91%;
+  --dock-tab-overflow-hover: 220 14% 86%;
+  --dock-scrollbar-thumb:    220 8% 70%;
+  --dock-scrollbar-track:    transparent;
 }
-.dv-default-tab {
-  border-bottom: 1px solid var(--border);
+
+.dark {
+  --dock-bg:                 225 28% 4%;
+  --dock-surface:            225 21% 7%;
+  --dock-surface-alt:        225 18% 10%;
+  --dock-panel-header:       220 17% 14%;
+  --dock-tab-bar:            225 21% 7%;
+  --dock-tab-active:         225 28% 4%;
+  --dock-tab-text:           217 9% 55%;
+  --dock-tab-text-active:    220 12% 92%;
+  --dock-text:               220 12% 92%;
+  --dock-text-secondary:     217 9% 65%;
+  --dock-text-muted:         217 9% 50%;
+  --dock-border:             220 17% 14%;
+  --dock-splitter:           220 17% 18%;
+  --dock-splitter-hover:     5 100% 65%;     /* signal */
+  --dock-hover:              220 17% 16%;
+  --dock-primary:            5 100% 65%;     /* signal */
+  --dock-tab-overflow-bg:    225 21% 7%;
+  --dock-tab-overflow-hover: 220 17% 14%;
+  --dock-scrollbar-thumb:    220 17% 22%;
+  --dock-scrollbar-track:    transparent;
+}
+
+/* The package writes the active tab indicator as a bottom border on
+ * a child element; harmonise its weight + colour with the rest of
+ * the Atlas (signal coral underline, 2px). */
+.cq-dock [data-dock-target] {
+  font-family: var(--font-sans);
+}
+.cq-dock .dock-tab,
+.cq-dock [class*="dock-tab"] {
   font-family: var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  font-size: 10px;
-  padding: 0 12px;
-}
-.dv-default-tab.dv-active-tab {
-  border-bottom-color: var(--signal) !important;
-  color: var(--foreground);
+  font-size: 10.5px;
 }
 
 /* ── PANEL CHROME ─────────────────────────────────────────────── */

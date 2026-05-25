@@ -1,84 +1,140 @@
-import { useCallback, useMemo, type ReactNode } from 'react';
+import { useMemo, useCallback, type ReactNode } from 'react';
 import {
-  DockviewReact,
-  type DockviewReadyEvent,
-  type IDockviewPanelProps,
+  DockManagerCore,
+  type WidgetProps,
+} from '@widgetstools/react-dock-manager';
+import {
+  createDefaultState,
   type DockviewApi,
-} from 'dockview-react';
+  type DockPosition,
+} from '@widgetstools/dock-manager-core';
+import { useTheme } from '@/components/theme/ThemeProvider';
 
 /**
- * DockSurface — declarative dock-manager wrapper.
+ * DockSurface — declarative dock-manager wrapper around the
+ * `@widgetstools/react-dock-manager` `DockManagerCore` component.
  *
- * An example builds a `panels` object mapping panel-id → render-fn,
+ * An example builds a `panels` object mapping panel-id → render-fn
  * plus a `layout` array describing initial geometry (which panels
- * appear where). The surface boots Dockview, registers each panel as
- * a stable React component, then constructs the layout in `onReady`.
+ * appear where). The surface boots DockManagerCore with the empty
+ * default state, then in `onReady` calls `api.addPanel(...)` in
+ * sequence to assemble the layout. Panel content is rendered via
+ * `renderPanel` so each panel-id resolves to its registered React
+ * subtree.
  *
- * Panels are draggable, dockable, splitable, tabbable. State is not
- * persisted across reloads — examples are meant to be reset-friendly.
+ * The package's `theme` prop is forwarded from the Atlas theme so
+ * dark/light toggle propagates into the dock chrome too.
  */
 
-export type DockDirection = 'right' | 'below' | 'left' | 'above';
+// Our authoring type — examples write these as if describing
+// directional steps (`below` is more readable than `bottom`). We map
+// to the package's `DockPosition` underneath.
+export type DockDirection = 'right' | 'below' | 'left' | 'above' | 'center';
+
+const DIRECTION_TO_POSITION: Record<DockDirection, DockPosition> = {
+  right: 'right',
+  below: 'bottom',
+  left: 'left',
+  above: 'top',
+  center: 'center',
+};
 
 export interface DockPanelSpec {
   id: string;
-  /** Display title in the tab strip. */
   title: string;
-  /** Render-fn producing the panel body. */
   render: () => ReactNode;
 }
 
 export interface DockLayoutStep {
-  /** Panel ID to add. */
   id: string;
-  /** Relative direction from `relativeTo`. Omit for the first panel. */
   direction?: DockDirection;
-  /** Reference panel ID. Omit for the first panel. */
   relativeTo?: string;
-  /** Optional sizing hint as a fraction (0..1). */
+  /** Reserved for future use (no per-step sizing in this surface yet). */
   size?: number;
 }
 
 interface DockSurfaceProps {
   panels: DockPanelSpec[];
   layout: DockLayoutStep[];
-  /** Optional onReady listener (e.g. to grab the api for external commands). */
   onReady?: (api: DockviewApi) => void;
 }
 
 export function DockSurface({ panels, layout, onReady }: DockSurfaceProps) {
-  const components = useMemo(() => {
-    const map: Record<string, (props: IDockviewPanelProps) => ReactNode> = {};
-    for (const p of panels) {
-      map[p.id] = () => <>{p.render()}</>;
-    }
-    return map;
+  const { theme } = useTheme();
+
+  const initialState = useMemo(() => createDefaultState(), []);
+
+  const byId = useMemo(() => {
+    const m = new Map<string, DockPanelSpec>();
+    for (const p of panels) m.set(p.id, p);
+    return m;
   }, [panels]);
 
-  const handleReady = useCallback((ev: DockviewReadyEvent) => {
-    const api = ev.api;
-    for (const step of layout) {
-      const spec = panels.find((p) => p.id === step.id);
-      if (!spec) continue;
-      api.addPanel({
-        id: step.id,
-        component: step.id,
-        title: spec.title,
-        position: step.relativeTo
-          ? { referencePanel: step.relativeTo, direction: step.direction }
-          : undefined,
-        initialWidth: step.size ? Math.max(220, step.size * 1200) : undefined,
-      });
-    }
-    onReady?.(api);
-  }, [layout, panels, onReady]);
+  // renderPanel is called by the core whenever a panel's content
+  // needs to mount. We dispatch by panelId into our spec registry so
+  // every example panel produces its real React subtree.
+  const renderPanel = useCallback(
+    (panelId: string, _panel: unknown, _api: unknown): ReactNode => {
+      const spec = byId.get(panelId);
+      if (!spec) return null;
+      return spec.render();
+    },
+    [byId],
+  );
+
+  // Tab labels: the package defaults to `panel.title`. We can leave
+  // this undefined so the default mono uppercase-tracked styling
+  // from the styles.css applies; pass our own only if we want extra
+  // chrome later.
+  const widgets = useMemo<Record<string, React.ComponentType<WidgetProps>>>(() => ({}), []);
+
+  const handleReady = useCallback(
+    (api: DockviewApi) => {
+      // Build the layout step-by-step. The first added panel goes
+      // into whatever group `createDefaultState` provided; every
+      // subsequent panel is docked relative to a previously added
+      // panel's group via `targetGroupId` + `position`.
+      for (let i = 0; i < layout.length; i++) {
+        const step = layout[i]!;
+        const spec = byId.get(step.id);
+        if (!spec) continue;
+
+        if (i === 0 || !step.relativeTo) {
+          api.addPanel({
+            id: step.id,
+            panelId: step.id,
+            title: spec.title,
+            widgetType: step.id,
+          });
+          continue;
+        }
+
+        const groupId = api.getGroupForPanel(step.relativeTo);
+        const dir = step.direction ?? 'right';
+        api.addPanel({
+          id: step.id,
+          panelId: step.id,
+          title: spec.title,
+          widgetType: step.id,
+          targetGroupId: groupId ?? undefined,
+          position: DIRECTION_TO_POSITION[dir],
+        });
+      }
+
+      onReady?.(api);
+    },
+    [layout, byId, onReady],
+  );
 
   return (
     <div className="w-full h-full">
-      <DockviewReact
-        components={components}
+      <DockManagerCore
+        initialState={initialState}
+        widgets={widgets}
+        renderPanel={renderPanel}
         onReady={handleReady}
-        className="dv-react-context"
+        theme={theme}
+        className="cq-dock"
       />
     </div>
   );

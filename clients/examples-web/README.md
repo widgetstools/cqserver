@@ -55,7 +55,7 @@ panels, where each panel is one of:
 - Tailwind v4 (CSS variables shared with the admin UI design system)
 - shadcn primitives (Radix-based: tabs, slot, separator, tooltip)
 - AG Grid Community 35
-- dockview-react 4 (dock manager)
+- `@widgetstools/react-dock-manager` 1.0 (dock manager — first-party)
 - CodeMirror 6 (SQL grammar)
 - marked v18 (embedded docs)
 - lucide-react (icons)
