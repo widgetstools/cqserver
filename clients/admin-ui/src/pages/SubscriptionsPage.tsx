@@ -189,6 +189,7 @@ export function SubscriptionsPage() {
             value={filterText}
             onChange={(e) => setFilterText(e.target.value)}
             placeholder="Filter…"
+            data-page-filter
             className="h-7 w-44 px-2 rounded-md border border-border bg-input text-[12px] text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
           <Button

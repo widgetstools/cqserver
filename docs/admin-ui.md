@@ -104,6 +104,49 @@ shows green when `/healthz` is reachable and red when it isn't.
 Total production bundle (post-Vite minify): ~310 KB gzipped JS,
 ~10 KB gzipped CSS.
 
+## Keyboard shortcuts (Windows-style)
+
+Bindings use `Ctrl` and `Alt` exclusively — no `⌘` — so the same
+shortcut sheet works across Windows, Linux, and (with Ctrl, not Cmd)
+macOS.
+
+| Combo | Action |
+|---|---|
+| **Ctrl+K** | Open command palette (search across routes, topics, actions) |
+| **Ctrl+/** | Open this cheat sheet from anywhere |
+| **F5** | Re-poll the current page's data (no full page reload) |
+| **Ctrl+F** | Focus the page's filter input (Topics, Subscriptions, Metrics, Config) |
+| **Esc** | Close any open modal / palette / cheat sheet |
+| **Alt+1** | Jump to Overview |
+| **Alt+2** | Jump to Subscriptions |
+| **Alt+3** | Jump to Replication |
+| **Alt+4** | Jump to Topics |
+| **Alt+5** | Jump to Views |
+| **Alt+6** | Jump to Queues |
+| **Alt+7** | Jump to Metrics |
+| **Alt+8** | Jump to Explain |
+| **Alt+9** | Jump to Config |
+| ↑ / ↓ | Navigate within the command palette |
+| Enter | Run the highlighted palette item |
+
+Sidebar items show their `Alt+N` hint on hover. The keyboard icon in
+the header opens the same cheat sheet (handy for operators who haven't
+discovered the Ctrl+/ trigger yet).
+
+### Implementation notes
+
+- The keyboard layer lives in
+  [`src/lib/keyboard.tsx`](../clients/admin-ui/src/lib/keyboard.tsx) —
+  a single document-level keydown handler dispatches to a registry of
+  `useShortcut`-registered callbacks.
+- Shortcuts do **not** fire when an INPUT / TEXTAREA / SELECT / content-
+  editable element is focused — operators can type filters without
+  accidentally triggering F5 or Alt+1. Exceptions: `Escape` and
+  `Ctrl+K` always fire (the latter is the escape hatch when something
+  else has focus).
+- Both modals auto-close on route change so a navigation triggered
+  from the palette doesn't leave the overlay lingering.
+
 ## Aesthetic direction
 
 Operator console — Bloomberg × Linear. Decisions baked in:
@@ -136,12 +179,5 @@ Operator console — Bloomberg × Linear. Decisions baked in:
 ## Worklog
 
 The full session-by-session build history is in
-[`ADMIN_UI_WORKLOG.md`](../ADMIN_UI_WORKLOG.md). U1 → U7 are all
-shipped. Polish items deferred from U7:
-
-- ⌘K command palette (`drop sub abc123`, `rotate /trades`, etc.)
-- Vim-style keyboard navigation across the sidebar (j/k, gg)
-- React Suspense at route boundaries to eliminate the brief blank
-  flash between page transitions
-
-Each is a small, independent follow-up.
+[`ADMIN_UI_WORKLOG.md`](../ADMIN_UI_WORKLOG.md). U1 → U7 plus the
+Windows-style hotkey + code-splitting follow-up are all shipped.

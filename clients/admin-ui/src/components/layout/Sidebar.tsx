@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom';
+import { NavLink, useNavigate } from 'react-router-dom';
 import {
   Activity,
   Database,
@@ -12,6 +12,7 @@ import {
   Beaker,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useShortcut } from '@/lib/keyboard';
 
 interface NavItem {
   to: string;
@@ -40,7 +41,30 @@ const GROUP_LABEL: Record<NavItem['group'], string> = {
   system: 'System',
 };
 
+/** Returns the flat index (1-based) of an item in NAV. Used for the
+ *  Alt+N keyboard hint shown next to each sidebar row. */
+function navOrdinal(to: string): number {
+  return NAV.findIndex((n) => n.to === to) + 1;
+}
+
 export function Sidebar() {
+  const navigate = useNavigate();
+  // Alt+1..9 — jump to NAV[i-1].to. We expand this manually rather
+  // than looping so each useShortcut call has a stable identity
+  // and React's rules-of-hooks are happy.
+  const nav = (i: number) => () => {
+    if (NAV[i]) navigate(NAV[i].to);
+  };
+  useShortcut({ label: `Jump to ${NAV[0]?.label ?? '#1'}`, combo: 'alt+1', run: nav(0), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[1]?.label ?? '#2'}`, combo: 'alt+2', run: nav(1), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[2]?.label ?? '#3'}`, combo: 'alt+3', run: nav(2), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[3]?.label ?? '#4'}`, combo: 'alt+4', run: nav(3), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[4]?.label ?? '#5'}`, combo: 'alt+5', run: nav(4), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[5]?.label ?? '#6'}`, combo: 'alt+6', run: nav(5), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[6]?.label ?? '#7'}`, combo: 'alt+7', run: nav(6), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[7]?.label ?? '#8'}`, combo: 'alt+8', run: nav(7), group: 'navigation' });
+  useShortcut({ label: `Jump to ${NAV[8]?.label ?? '#9'}`, combo: 'alt+9', run: nav(8), group: 'navigation' });
+
   return (
     <aside className="w-[228px] shrink-0 flex flex-col border-r border-border bg-card">
       <div className="px-4 py-3.5 border-b border-border">
@@ -64,38 +88,54 @@ export function Sidebar() {
               {GROUP_LABEL[group]}
             </div>
             <ul>
-              {NAV.filter((n) => n.group === group).map(({ to, label, icon: Icon }) => (
-                <li key={to}>
-                  <NavLink
-                    to={to}
-                    end={to === '/'}
-                    className={({ isActive }) =>
-                      cn(
-                        'group relative flex items-center gap-2.5 px-4 py-1.5 text-[12.5px] transition-colors',
-                        isActive
-                          ? 'text-foreground'
-                          : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
-                      )
-                    }
-                  >
-                    {({ isActive }) => (
-                      <>
-                        {isActive ? (
-                          <span className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-[2px] bg-primary rounded-r-sm" />
-                        ) : null}
-                        <Icon
-                          size={14}
-                          className={cn(
-                            'shrink-0',
-                            isActive ? 'text-primary' : 'text-muted-foreground/80',
-                          )}
-                        />
-                        <span className="flex-1">{label}</span>
-                      </>
-                    )}
-                  </NavLink>
-                </li>
-              ))}
+              {NAV.filter((n) => n.group === group).map(({ to, label, icon: Icon }) => {
+                const ord = navOrdinal(to);
+                return (
+                  <li key={to}>
+                    <NavLink
+                      to={to}
+                      end={to === '/'}
+                      className={({ isActive }) =>
+                        cn(
+                          'group relative flex items-center gap-2.5 px-4 py-1.5 text-[12.5px] transition-colors',
+                          isActive
+                            ? 'text-foreground'
+                            : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+                        )
+                      }
+                    >
+                      {({ isActive }) => (
+                        <>
+                          {isActive ? (
+                            <span className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-[2px] bg-primary rounded-r-sm" />
+                          ) : null}
+                          <Icon
+                            size={14}
+                            className={cn(
+                              'shrink-0',
+                              isActive ? 'text-primary' : 'text-muted-foreground/80',
+                            )}
+                          />
+                          <span className="flex-1">{label}</span>
+                          {ord >= 1 && ord <= 9 ? (
+                            <span
+                              className={cn(
+                                'shrink-0 font-mono text-[9.5px] px-1 py-px rounded border opacity-0 group-hover:opacity-100 transition-opacity',
+                                isActive
+                                  ? 'border-primary/40 text-primary'
+                                  : 'border-border text-muted-foreground/70',
+                              )}
+                              aria-label={`Press Alt+${ord} to jump here`}
+                            >
+                              Alt+{ord}
+                            </span>
+                          ) : null}
+                        </>
+                      )}
+                    </NavLink>
+                  </li>
+                );
+              })}
             </ul>
           </div>
         ))}

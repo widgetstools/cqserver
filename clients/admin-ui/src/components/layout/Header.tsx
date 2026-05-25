@@ -1,13 +1,15 @@
 import { useQuery } from '@tanstack/react-query';
-import { Moon, Sun, Wifi, WifiOff } from 'lucide-react';
+import { Keyboard, Moon, Sun, Wifi, WifiOff } from 'lucide-react';
 import { useTheme } from '@/components/theme/ThemeProvider';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { adminApi, adminBase } from '@/lib/admin';
+import { useKeyboardContext } from '@/lib/keyboard';
 import { cn } from '@/lib/utils';
 
 export function Header() {
   const { theme, toggleTheme } = useTheme();
+  const { showCheatSheet } = useKeyboardContext();
 
   const health = useQuery({
     queryKey: ['healthz'],
@@ -65,6 +67,23 @@ export function Header() {
       </div>
 
       <div className="flex-1" />
+
+      {/* Keyboard shortcuts */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={showCheatSheet}
+            aria-label="show keyboard shortcuts"
+          >
+            <Keyboard size={14} />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          Shortcuts (<kbd className="font-mono text-[10px]">Ctrl+/</kbd>)
+        </TooltipContent>
+      </Tooltip>
 
       {/* Theme toggle */}
       <Tooltip>

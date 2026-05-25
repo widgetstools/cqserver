@@ -14,6 +14,23 @@ export default defineConfig(({ command }) => ({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  build: {
+    // AG-Grid is large and only used on two pages — split it into
+    // its own named chunk so the first-load bundle stays small.
+    // Recharts gets a similar treatment.
+    rollupOptions: {
+      output: {
+        manualChunks: (id) => {
+          if (id.includes('node_modules/ag-grid')) return 'ag-grid';
+          if (id.includes('node_modules/recharts')) return 'recharts';
+        },
+      },
+    },
+    // We've split deliberately; raise the warn floor so the build
+    // log stays useful for unexpected bloat instead of crying wolf
+    // about AG-Grid + recharts which we already know about.
+    chunkSizeWarningLimit: 700,
+  },
   server: {
     port: 5174,
     strictPort: false,

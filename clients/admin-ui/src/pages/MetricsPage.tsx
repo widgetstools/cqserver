@@ -149,6 +149,7 @@ export function MetricsPage() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Filter metrics…"
+              data-page-filter
               className="h-7 w-56 pl-7 pr-2 rounded-md border border-border bg-input text-[12px] font-mono text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
             />
           </div>
