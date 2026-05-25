@@ -1725,6 +1725,28 @@ pub struct QueryLimits {
     /// projection — subscribing to the source topic directly is
     /// equivalent and strictly faster (no view-evaluator overhead).
     pub reject_passthrough_views: bool,
+    /// Query Guardrails G3: pre-flight rejection thresholds. A
+    /// subscribe whose `estimated_result_rows > max_sow_estimated_rows`
+    /// is rejected before any state is touched. Estimates come from
+    /// `cost_estimator::estimate_cost`. `0` disables the check.
+    pub max_sow_estimated_rows: u64,
+    /// Same as `max_sow_estimated_rows` but for estimated wire bytes.
+    /// `0` disables.
+    pub max_sow_estimated_bytes: u64,
+    /// Reject a query whose JOIN fanout (`avg right-side rows per
+    /// USING value`) exceeds this. `0` disables.
+    pub max_join_estimated_fanout: u64,
+    /// Reject when GROUP BY cardinality estimate exceeds this. `0`
+    /// disables.
+    pub max_group_estimated_cardinality: u64,
+    /// Soft warning threshold for estimated result rows. When the
+    /// estimate exceeds this but stays under
+    /// `max_sow_estimated_rows`, the subscribe proceeds but a
+    /// metric and log line are emitted. `0` disables.
+    pub warn_sow_rows_threshold: u64,
+    /// Soft warning threshold for estimated result bytes. `0`
+    /// disables.
+    pub warn_sow_bytes_threshold: u64,
 }
 
 impl Default for QueryLimits {
@@ -1739,8 +1761,109 @@ impl Default for QueryLimits {
             max_view_chain_depth: 3,
             reject_degenerate_groupby: true,
             reject_passthrough_views: true,
+            // G3 hard caps. 1M rows / 100 MB / 10x fanout / 100K
+            // groups are conservative but never zero — operators
+            // who want the guardrails OFF should set the field to 0.
+            max_sow_estimated_rows: 1_000_000,
+            max_sow_estimated_bytes: 100_000_000,
+            max_join_estimated_fanout: 10,
+            max_group_estimated_cardinality: 100_000,
+            // Soft warnings at 1/10 of the hard cap so operators
+            // see "you're approaching" before "you're rejected."
+            warn_sow_rows_threshold: 100_000,
+            warn_sow_bytes_threshold: 10_000_000,
         }
     }
+}
+
+/// Query Guardrails G3: outcome of comparing a `QueryCostEstimate`
+/// against a `QueryLimits`. Bundles per-rule warnings (proceed but
+/// log) and rejections (return error).
+#[derive(Debug, Clone)]
+pub struct LimitCheckOutcome {
+    /// `true` if any hard cap was exceeded. Caller must NOT proceed.
+    pub rejected: bool,
+    /// Human-readable message naming the first rule that was
+    /// exceeded — populated when `rejected = true`.
+    pub reject_reason: Option<String>,
+    /// Soft warnings that fired. Caller should log + metric these
+    /// but proceed with the subscribe.
+    pub warnings: Vec<String>,
+}
+
+impl LimitCheckOutcome {
+    pub fn ok() -> Self {
+        Self { rejected: false, reject_reason: None, warnings: Vec::new() }
+    }
+}
+
+/// G3: compare a cost estimate against the configured limits.
+/// Hard-cap violations populate `rejected`; soft-threshold
+/// crossings populate `warnings`. Zero-valued limits are skipped
+/// (i.e., disabled).
+pub fn check_estimate_against_limits(
+    estimate: &crate::cost_estimator::QueryCostEstimate,
+    limits: &QueryLimits,
+) -> LimitCheckOutcome {
+    let mut out = LimitCheckOutcome::ok();
+
+    if limits.max_sow_estimated_rows > 0
+        && estimate.estimated_result_rows > limits.max_sow_estimated_rows
+    {
+        out.rejected = true;
+        out.reject_reason = Some(format!(
+            "estimated_result_rows = {} exceeds max_sow_estimated_rows = {}. \
+             Add a narrower WHERE filter, switch to an aggregate, or contact \
+             ops to raise [query_limits].max_sow_estimated_rows.",
+            estimate.estimated_result_rows, limits.max_sow_estimated_rows,
+        ));
+        return out;
+    }
+    if limits.max_sow_estimated_bytes > 0
+        && estimate.estimated_result_bytes > limits.max_sow_estimated_bytes
+    {
+        out.rejected = true;
+        out.reject_reason = Some(format!(
+            "estimated_result_bytes = {} exceeds max_sow_estimated_bytes = {}. \
+             Project fewer columns, use an aggregate, or raise \
+             [query_limits].max_sow_estimated_bytes.",
+            estimate.estimated_result_bytes, limits.max_sow_estimated_bytes,
+        ));
+        return out;
+    }
+    if limits.max_join_estimated_fanout > 0 {
+        if let Some(f) = estimate.estimated_join_fanout_avg {
+            if f.is_finite() && f > limits.max_join_estimated_fanout as f64 {
+                out.rejected = true;
+                out.reject_reason = Some(format!(
+                    "estimated_join_fanout_avg = {:.1} exceeds \
+                     max_join_estimated_fanout = {}. The USING column is too \
+                     low-cardinality on the right side — pick a more selective \
+                     join key.",
+                    f, limits.max_join_estimated_fanout,
+                ));
+                return out;
+            }
+        }
+    }
+
+    if limits.warn_sow_rows_threshold > 0
+        && estimate.estimated_result_rows > limits.warn_sow_rows_threshold
+    {
+        out.warnings.push(format!(
+            "estimated_result_rows = {} above warn_sow_rows_threshold = {}",
+            estimate.estimated_result_rows, limits.warn_sow_rows_threshold,
+        ));
+    }
+    if limits.warn_sow_bytes_threshold > 0
+        && estimate.estimated_result_bytes > limits.warn_sow_bytes_threshold
+    {
+        out.warnings.push(format!(
+            "estimated_result_bytes = {} above warn_sow_bytes_threshold = {}",
+            estimate.estimated_result_bytes, limits.warn_sow_bytes_threshold,
+        ));
+    }
+    out
 }
 
 impl ParsedQuery {
@@ -2555,6 +2678,7 @@ mod tests {
             max_view_chain_depth: 2,
             reject_degenerate_groupby: true,
             reject_passthrough_views: true,
+            ..QueryLimits::default()
         }
     }
 
@@ -2666,6 +2790,102 @@ mod tests {
         let bodies = HashMap::new();
         let err = validate_view_graph(&sources, &bodies, &limits_strict()).unwrap_err();
         assert!(format!("{err}").contains("chain depth"));
+    }
+
+    // ─── Query Guardrails G3 ──────────────────────────────────────────
+
+    fn fake_estimate(rows: u64, bytes: u64, fanout: Option<f64>)
+        -> crate::cost_estimator::QueryCostEstimate
+    {
+        crate::cost_estimator::QueryCostEstimate {
+            estimated_source_rows: rows,
+            estimated_result_rows: rows,
+            estimated_result_bytes: bytes,
+            estimated_join_fanout_avg: fanout,
+            used_indexes: vec![],
+            assumptions: vec![],
+            confidence: crate::cost_estimator::ConfidenceLevel::High,
+        }
+    }
+
+    #[test]
+    fn g3_estimate_under_caps_passes() {
+        let limits = QueryLimits::default();
+        let est = fake_estimate(500, 50_000, None);
+        let out = check_estimate_against_limits(&est, &limits);
+        assert!(!out.rejected);
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn g3_rejects_when_rows_exceed_hard_cap() {
+        let limits = QueryLimits {
+            max_sow_estimated_rows: 1_000,
+            ..QueryLimits::default()
+        };
+        let est = fake_estimate(2_000, 1_000, None);
+        let out = check_estimate_against_limits(&est, &limits);
+        assert!(out.rejected);
+        let reason = out.reject_reason.unwrap();
+        assert!(reason.contains("max_sow_estimated_rows"), "got: {reason}");
+    }
+
+    #[test]
+    fn g3_rejects_when_bytes_exceed_hard_cap() {
+        let limits = QueryLimits {
+            max_sow_estimated_rows: 0, // disable rows check so bytes fires
+            max_sow_estimated_bytes: 1_000,
+            ..QueryLimits::default()
+        };
+        let est = fake_estimate(100, 50_000, None);
+        let out = check_estimate_against_limits(&est, &limits);
+        assert!(out.rejected);
+        assert!(out
+            .reject_reason
+            .unwrap()
+            .contains("max_sow_estimated_bytes"));
+    }
+
+    #[test]
+    fn g3_rejects_when_join_fanout_exceeds_cap() {
+        let limits = QueryLimits {
+            max_join_estimated_fanout: 5,
+            ..QueryLimits::default()
+        };
+        let est = fake_estimate(100, 1_000, Some(20.0));
+        let out = check_estimate_against_limits(&est, &limits);
+        assert!(out.rejected);
+        assert!(out.reject_reason.unwrap().contains("fanout"));
+    }
+
+    #[test]
+    fn g3_warns_when_above_soft_threshold_but_under_hard_cap() {
+        let limits = QueryLimits {
+            warn_sow_rows_threshold: 500,
+            max_sow_estimated_rows: 10_000,
+            ..QueryLimits::default()
+        };
+        let est = fake_estimate(1_000, 1_000, None);
+        let out = check_estimate_against_limits(&est, &limits);
+        assert!(!out.rejected);
+        assert_eq!(out.warnings.len(), 1);
+        assert!(out.warnings[0].contains("warn_sow_rows_threshold"));
+    }
+
+    #[test]
+    fn g3_zero_caps_disable_checks() {
+        let limits = QueryLimits {
+            max_sow_estimated_rows: 0,
+            max_sow_estimated_bytes: 0,
+            max_join_estimated_fanout: 0,
+            warn_sow_rows_threshold: 0,
+            warn_sow_bytes_threshold: 0,
+            ..QueryLimits::default()
+        };
+        let est = fake_estimate(u64::MAX / 2, u64::MAX / 2, Some(1e9));
+        let out = check_estimate_against_limits(&est, &limits);
+        assert!(!out.rejected, "all caps disabled — must not reject");
+        assert!(out.warnings.is_empty());
     }
 
     #[test]

@@ -67,6 +67,12 @@ pub struct QueryLimitsConfig {
     pub max_view_chain_depth: usize,
     pub reject_degenerate_groupby: bool,
     pub reject_passthrough_views: bool,
+    pub max_sow_estimated_rows: u64,
+    pub max_sow_estimated_bytes: u64,
+    pub max_join_estimated_fanout: u64,
+    pub max_group_estimated_cardinality: u64,
+    pub warn_sow_rows_threshold: u64,
+    pub warn_sow_bytes_threshold: u64,
 }
 
 impl Default for QueryLimitsConfig {
@@ -79,6 +85,12 @@ impl Default for QueryLimitsConfig {
             max_view_chain_depth: core.max_view_chain_depth,
             reject_degenerate_groupby: core.reject_degenerate_groupby,
             reject_passthrough_views: core.reject_passthrough_views,
+            max_sow_estimated_rows: core.max_sow_estimated_rows,
+            max_sow_estimated_bytes: core.max_sow_estimated_bytes,
+            max_join_estimated_fanout: core.max_join_estimated_fanout,
+            max_group_estimated_cardinality: core.max_group_estimated_cardinality,
+            warn_sow_rows_threshold: core.warn_sow_rows_threshold,
+            warn_sow_bytes_threshold: core.warn_sow_bytes_threshold,
         }
     }
 }
@@ -90,6 +102,12 @@ impl QueryLimitsConfig {
             max_view_chain_depth: self.max_view_chain_depth,
             reject_degenerate_groupby: self.reject_degenerate_groupby,
             reject_passthrough_views: self.reject_passthrough_views,
+            max_sow_estimated_rows: self.max_sow_estimated_rows,
+            max_sow_estimated_bytes: self.max_sow_estimated_bytes,
+            max_join_estimated_fanout: self.max_join_estimated_fanout,
+            max_group_estimated_cardinality: self.max_group_estimated_cardinality,
+            warn_sow_rows_threshold: self.warn_sow_rows_threshold,
+            warn_sow_bytes_threshold: self.warn_sow_bytes_threshold,
         }
     }
 }

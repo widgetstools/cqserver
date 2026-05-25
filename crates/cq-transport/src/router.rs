@@ -957,6 +957,54 @@ fn handle_sow_and_subscribe(
 
     let sql = build_sql(&msg);
 
+    // Query Guardrails G3: pre-flight cost check. Run the estimator
+    // against the source topic; reject if any hard cap exceeded, log
+    // + metric if any soft threshold crossed. Bookmark replays skip
+    // this — their cost model is "txlog entries since bookmark," not
+    // SOW row count, so the SOW-shaped estimate doesn't apply.
+    if msg.bookmark.is_none() && msg.since_timestamp_ms.is_none() && !msg.most_recent {
+        if let Some(topic) = topics.get(&topic_name) {
+            match topic.estimate_cost(&sql) {
+                Ok(est) => {
+                    let outcome = cq_core::query::check_estimate_against_limits(
+                        &est,
+                        &ctx.query_limits,
+                    );
+                    if outcome.rejected {
+                        metrics::counter!(
+                            "cq_query_rejected_total",
+                            "reason" => "estimate_over_limit"
+                        )
+                        .increment(1);
+                        let _ = session.send_message(&CqMessage::error(
+                            msg.command_id,
+                            outcome.reject_reason.as_deref().unwrap_or("query rejected"),
+                        ));
+                        return;
+                    }
+                    for warning in &outcome.warnings {
+                        metrics::counter!(
+                            "cq_query_warned_total",
+                            "reason" => "estimate_above_soft_threshold"
+                        )
+                        .increment(1);
+                        tracing::warn!(topic = %topic_name, %warning, "query estimate above soft threshold");
+                    }
+                }
+                Err(e) => {
+                    // Parse / unknown column / etc. Return the
+                    // structured error so the client sees a clean
+                    // diagnostic instead of a stalled SOW.
+                    let _ = session.send_message(&CqMessage::error(
+                        msg.command_id,
+                        &format!("{e}"),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
     // Resolve the effective replay starting point. Precedence (most
     // specific to least):
     //   1. Explicit `bookmark` (sequence number) — verbatim.

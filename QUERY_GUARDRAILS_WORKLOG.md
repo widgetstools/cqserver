@@ -445,7 +445,7 @@ without estimation) is also independently useful as a backstop.
 |---|---|---|
 | G1 | Parse-time validators | ✅ done — `QueryLimits` + `validate_with_limits` + `validate_view_graph` in cq-core; `[query_limits]` block in `cqserver.toml`; wired through `WsConfig`/`TcpConfig` to `RouterContext` (ready for G3); view-graph validation runs at server startup. 10 unit tests in `query::tests::g1_*`. |
 | G2 | Cost estimator + `/admin/explain` | ✅ done — `cq_core::cost_estimator::{estimate_cost, QueryCostEstimate, ConfidenceLevel}`; `SecondaryIndex::{distinct_value_count, non_null_row_count}`; `Topic::estimate_cost`; `POST /admin/explain` endpoint. 6 unit tests. |
-| G3 | Subscribe-time enforcement | ⏳ pending |
+| G3 | Subscribe-time enforcement | ✅ done — `QueryLimits` extended with hard caps (max_sow_estimated_rows/bytes/fanout/group_card) + soft warns; `check_estimate_against_limits()` returns a structured outcome; wired into `handle_sow_and_subscribe` so a rejected query returns an error frame BEFORE any SOW work begins; bookmark replays exempt. Metrics: `cq_query_rejected_total{reason}`, `cq_query_warned_total{reason}`. 6 unit tests. |
 | G4 | Runtime caps + observability | ⏳ pending |
 | G5 | Per-user query budgets | ⏳ pending |
 
