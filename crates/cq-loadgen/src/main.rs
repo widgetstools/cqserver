@@ -39,6 +39,13 @@ enum Scenario {
     /// Each sub gets a focused snapshot (~10K rows on the demo's
     /// 80-book dataset) instead of the firehose's full 865K rows.
     Stress2kReal,
+    /// One-shot measurement of the "trader dashboard" pivot:
+    /// SELECT book, sector, SUM(pnl), SUM(exposure)
+    /// FROM /positions JOIN /securities USING (cusip)
+    /// GROUP BY book, sector.
+    /// Reports rows + bytes + latency. Result set is small
+    /// (|books| × |sectors|) regardless of underlying position count.
+    TraderViewPivot,
 }
 
 #[derive(Parser, Debug)]
@@ -97,6 +104,9 @@ async fn main() -> Result<()> {
         }
         Scenario::Stress2kReal => {
             scenarios::stress_2k_real(&cfg).await?.print();
+        }
+        Scenario::TraderViewPivot => {
+            scenarios::trader_view_pivot(&cfg).await?;
         }
     };
     Ok(())

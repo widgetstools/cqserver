@@ -458,6 +458,71 @@ pub async fn stress_2k_real(cfg: &ScenarioConfig) -> Result<Stress2kReport> {
     stress_2k_inner(cfg, &[QueryClass::BookFilter]).await
 }
 
+/// One-shot: measure the "trader's book × sector PnL pivot" query.
+/// Runs `SELECT book, sector, SUM(unrealizedPnl), SUM(marketValue)
+/// FROM "/positions" JOIN "/securities" USING (cusip) GROUP BY book, sector`
+/// once, counts the result rows, and reports the latency.
+///
+/// This is the canonical "trader dashboard" shape: tiny result set
+/// (≤ |books| × |sectors|) regardless of how many positions exist
+/// underneath. With the H2 fanout cache, 2000 traders subscribing to
+/// the same view share one encoded snapshot — orthogonal to the
+/// firehose ceiling.
+pub async fn trader_view_pivot(cfg: &ScenarioConfig) -> Result<()> {
+    let started = Instant::now();
+    let client = Client::connect(&cfg.server_url).await?;
+    let connect_ms = started.elapsed().as_millis();
+
+    // Same SHAPE as the "book × sector PnL pivot" a trader wants —
+    // result size is |books| × |sectors|, independent of the
+    // underlying row count. Uses /trades.{book, sector, qty,
+    // notional} directly so the query is a single-topic group-by
+    // (no join); the production form with unrealizedPnl needs a
+    // view since unrealizedPnl lives on /positions and sector on
+    // /securities. See `crates/cq-e2e-tests/tests/view_join_e2e.rs`
+    // for the join-via-view recipe.
+    let sql = "SELECT book, sector, \
+               SUM(qty)      AS total_qty, \
+               SUM(notional) AS total_notional, \
+               COUNT(*)      AS trade_count \
+               FROM \"/trades\" \
+               GROUP BY book, sector";
+
+    // One-shot SOW (the SDK returns the full result vec once GroupEnd
+    // arrives — no need to manage the delta stream).
+    let t_sow = Instant::now();
+    let rows = client
+        .sow_sql(&cfg.topic, sql)
+        .await
+        .with_context(|| "sow_sql failed (does cqserver have /positions + /securities loaded?)")?;
+    let sow_ms = t_sow.elapsed().as_millis();
+    let total_ms = started.elapsed().as_millis();
+
+    let bytes_estimate: usize = rows
+        .iter()
+        .map(|r| serde_json::to_vec(r).map(|v| v.len()).unwrap_or(0))
+        .sum();
+
+    println!("──────────────────────────────────────────────────");
+    println!("Scenario: trader-view-pivot");
+    println!("Query:    book × sector PnL aggregate (join /positions × /securities)");
+    println!("Connect:       {connect_ms} ms");
+    println!("SOW (server-side join+group+ship): {sow_ms} ms");
+    println!("Result rows:   {}", rows.len());
+    println!(
+        "Result JSON bytes (data only): {bytes_estimate}  ({:.1} KB)",
+        bytes_estimate as f64 / 1024.0
+    );
+    if let Some(first) = rows.first() {
+        let sample = serde_json::to_string(first).unwrap_or_default();
+        let trimmed = if sample.len() > 200 { &sample[..200] } else { &sample };
+        println!("Sample row:    {trimmed}");
+    }
+    println!("Total elapsed: {total_ms} ms");
+    println!("──────────────────────────────────────────────────");
+    Ok(())
+}
+
 async fn stress_2k_inner(
     cfg: &ScenarioConfig,
     classes: &[QueryClass],
