@@ -33,6 +33,12 @@ enum Scenario {
     /// `/stats` over the measurement window and reports peak / steady
     /// RSS, connect-time histogram, and per-class delivery throughput.
     Stress2k,
+    /// Realistic-payload variant of stress2k: every subscriber issues
+    /// `subscribe(topic, "book = 'BOOK-N'")` with N varying per-sub —
+    /// the AMPS-typical "trader watches their own book" pattern.
+    /// Each sub gets a focused snapshot (~10K rows on the demo's
+    /// 80-book dataset) instead of the firehose's full 865K rows.
+    Stress2kReal,
 }
 
 #[derive(Parser, Debug)]
@@ -88,6 +94,9 @@ async fn main() -> Result<()> {
         Scenario::Stress2k => {
             // stress2k has its own richer report shape — print directly.
             scenarios::stress_2k(&cfg).await?.print();
+        }
+        Scenario::Stress2kReal => {
+            scenarios::stress_2k_real(&cfg).await?.print();
         }
     };
     Ok(())

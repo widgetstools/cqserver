@@ -283,7 +283,48 @@ enum QueryClass {
     /// — static PIVOT (S43). Tests anchor-key bucketing under the
     /// continuous path.
     StaticPivot,
+    /// Realistic-payload class: `subscribe(topic, "book = 'BOOK-N'")` where
+    /// N varies per-subscriber (idx modulo `BOOK_CARDINALITY`). Models the
+    /// "trader watches their own book" pattern that dominates real AMPS
+    /// deployments — each sub gets a focused SOW of a few thousand rows
+    /// instead of the full topic. Used by the stress-2k-real scenario.
+    BookFilter,
 }
+
+/// Book universe for the BookFilter class. Mirrors the names produced by
+/// `clients/ts/examples/fi-data.ts::buildBooks(80)` so the WHERE clause
+/// actually matches rows in the live demo data. Each sub picks
+/// `BOOKS[idx % BOOKS.len()]` so 2000 subs distribute across all 80
+/// books (~25 subs per book → realistic hot-topic shape).
+const BOOKS: &[&str] = &[
+    "BOOK-BASIS-APAC-01", "BOOK-BASIS-EMEA-01", "BOOK-BASIS-EU-01",
+    "BOOK-BASIS-LATAM-01", "BOOK-BASIS-UK-01", "BOOK-BASIS-US-01",
+    "BOOK-CARRY-APAC-01", "BOOK-CARRY-EMEA-01", "BOOK-CARRY-EU-01",
+    "BOOK-CARRY-LATAM-01", "BOOK-CARRY-UK-01", "BOOK-CARRY-US-01",
+    "BOOK-CREDIT-HY", "BOOK-CREDIT-HY-APAC-01", "BOOK-CREDIT-HY-EMEA-01",
+    "BOOK-CREDIT-HY-EU-01", "BOOK-CREDIT-HY-LATAM-01", "BOOK-CREDIT-HY-UK-01",
+    "BOOK-CREDIT-HY-US-01", "BOOK-CREDIT-HY-US-02", "BOOK-CREDIT-IG",
+    "BOOK-CREDIT-IG-APAC-01", "BOOK-CREDIT-IG-EMEA-01", "BOOK-CREDIT-IG-EU-01",
+    "BOOK-CREDIT-IG-LATAM-01", "BOOK-CREDIT-IG-UK-01", "BOOK-CREDIT-IG-US-01",
+    "BOOK-CREDIT-IG-US-02", "BOOK-CURVE-APAC-01", "BOOK-CURVE-EMEA-01",
+    "BOOK-CURVE-EU-01", "BOOK-CURVE-LATAM-01", "BOOK-CURVE-UK-01",
+    "BOOK-CURVE-US-01", "BOOK-FLOW-APAC-01", "BOOK-FLOW-EMEA-01",
+    "BOOK-FLOW-EU-01", "BOOK-FLOW-LATAM-01", "BOOK-FLOW-UK-01",
+    "BOOK-FLOW-US-01", "BOOK-MM-APAC-01", "BOOK-MM-EMEA-01",
+    "BOOK-MM-EU-01", "BOOK-MM-LATAM-01", "BOOK-MM-UK-01",
+    "BOOK-MM-US-01", "BOOK-MUNI", "BOOK-MUNI-APAC-01",
+    "BOOK-MUNI-EMEA-01", "BOOK-MUNI-EU-01", "BOOK-MUNI-LATAM-01",
+    "BOOK-MUNI-UK-01", "BOOK-MUNI-US-01", "BOOK-PROP",
+    "BOOK-PROP-APAC-01", "BOOK-PROP-EMEA-01", "BOOK-PROP-EU-01",
+    "BOOK-PROP-LATAM-01", "BOOK-PROP-UK-01", "BOOK-PROP-US-01",
+    "BOOK-RATES", "BOOK-RATES-APAC-01", "BOOK-RATES-EMEA-01",
+    "BOOK-RATES-EU-01", "BOOK-RATES-LATAM-01", "BOOK-RATES-UK-01",
+    "BOOK-RATES-US-01", "BOOK-RATES-US-02", "BOOK-RELVAL-APAC-01",
+    "BOOK-RELVAL-EMEA-01", "BOOK-RELVAL-EU-01", "BOOK-RELVAL-LATAM-01",
+    "BOOK-RELVAL-UK-01", "BOOK-RELVAL-US-01", "BOOK-RV-APAC-01",
+    "BOOK-RV-EMEA-01", "BOOK-RV-EU-01", "BOOK-RV-LATAM-01",
+    "BOOK-RV-UK-01", "BOOK-RV-US-01",
+];
 
 impl QueryClass {
     fn name(self) -> &'static str {
@@ -292,6 +333,7 @@ impl QueryClass {
             QueryClass::SimpleWhere => "where",
             QueryClass::GroupBy => "group_by",
             QueryClass::StaticPivot => "static_pivot",
+            QueryClass::BookFilter => "book_filter",
         }
     }
 }
@@ -395,6 +437,31 @@ impl Stress2kReport {
 ///   4. After the window, sample once more for `final_rss_mb`, drop the
 ///      subscribers, and return the report.
 pub async fn stress_2k(cfg: &ScenarioConfig) -> Result<Stress2kReport> {
+    stress_2k_inner(
+        cfg,
+        &[
+            QueryClass::Firehose,
+            QueryClass::SimpleWhere,
+            QueryClass::GroupBy,
+            QueryClass::StaticPivot,
+        ],
+    )
+    .await
+}
+
+/// Realistic-payload variant: every sub uses a per-book filter
+/// (`book = 'BOOK-N'`) so it gets a focused snapshot of a single
+/// book (~10K rows on the demo's 80-book dataset) instead of the
+/// 865K-row firehose. Models the production pattern where each
+/// trader subscribes to their own book.
+pub async fn stress_2k_real(cfg: &ScenarioConfig) -> Result<Stress2kReport> {
+    stress_2k_inner(cfg, &[QueryClass::BookFilter]).await
+}
+
+async fn stress_2k_inner(
+    cfg: &ScenarioConfig,
+    classes: &[QueryClass],
+) -> Result<Stress2kReport> {
     use cq_client::admin::AdminClient;
 
     // Connect-storm pacing: 50 subs per wave, 200 ms between waves =
@@ -414,12 +481,6 @@ pub async fn stress_2k(cfg: &ScenarioConfig) -> Result<Stress2kReport> {
 
     let (baseline_rss_mb, baseline_subs_server) = read_rss_subs(&admin).await?;
 
-    let classes = [
-        QueryClass::Firehose,
-        QueryClass::SimpleWhere,
-        QueryClass::GroupBy,
-        QueryClass::StaticPivot,
-    ];
     let counters: Vec<Arc<ClassCounters>> =
         (0..classes.len()).map(|_| Arc::new(ClassCounters::new())).collect();
 
@@ -576,6 +637,7 @@ async fn run_one_subscriber(
     let connect_us = t_connect.elapsed().as_micros() as u64;
 
     let t_subscribe = Instant::now();
+    let book_filter_sql = format!("book = '{}'", BOOKS[idx % BOOKS.len()]);
     let sub_fut = async {
         match class {
             QueryClass::Firehose => client.subscribe(&topic, None).await,
@@ -597,6 +659,10 @@ async fn run_one_subscriber(
                     )
                     .await
             }
+            // Realistic-payload class: a single-book filter constructed
+            // from this sub's index, so 2000 subs distribute across all
+            // 80 books (~25 subs per book).
+            QueryClass::BookFilter => client.subscribe(&topic, Some(&book_filter_sql)).await,
         }
     };
     // Subscribes that include `sow_and_subscribe_sql` against /trades
