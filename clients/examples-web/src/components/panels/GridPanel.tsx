@@ -5,9 +5,8 @@ import {
   ModuleRegistry,
   type ColDef,
 } from 'ag-grid-community';
-import 'ag-grid-community/styles/ag-grid.css';
-import 'ag-grid-community/styles/ag-theme-quartz.css';
 import { useTheme } from '@/components/theme/ThemeProvider';
+import { getAgGridTheme } from '@/lib/aggrid-theme';
 import { PanelChrome } from './PanelChrome';
 
 ModuleRegistry.registerModules([AllCommunityModule]);
@@ -23,6 +22,15 @@ interface GridPanelProps<T> {
   onRowClick?: (row: T) => void;
 }
 
+/**
+ * GridPanel — consumes the AG Grid v33+ Theming API.
+ *
+ * The grid receives a `theme={...}` object built by the Stockflux
+ * factory in `@/lib/aggrid-theme`, parameterised by the current
+ * `(palette, mode)` from the Atlas ThemeProvider. No legacy
+ * `ag-grid.css` / `ag-theme-quartz.css` imports — the v33+ API
+ * generates all styling from the theme object's parameters.
+ */
 export function GridPanel<T extends Record<string, unknown>>({
   title,
   rows,
@@ -31,13 +39,15 @@ export function GridPanel<T extends Record<string, unknown>>({
   right,
   onRowClick,
 }: GridPanelProps<T>) {
-  const { theme } = useTheme();
+  const { theme, palette } = useTheme();
 
   const cols = useMemo<ColDef[]>(() => {
     if (!visible) return colDefs;
     const ix = new Map(colDefs.map((c) => [c.field, c]));
     return visible.map((f) => ix.get(f)).filter((c): c is ColDef => !!c);
   }, [colDefs, visible]);
+
+  const agTheme = useMemo(() => getAgGridTheme(palette, theme), [palette, theme]);
 
   return (
     <PanelChrome
@@ -50,9 +60,9 @@ export function GridPanel<T extends Record<string, unknown>>({
         )
       }
     >
-      <div className={`ag-theme-${theme === 'dark' ? 'quartz-dark' : 'quartz'} w-full h-full`}>
+      <div className="w-full h-full">
         <AgGridReact
-          theme="legacy"
+          theme={agTheme}
           rowData={rows}
           columnDefs={cols}
           rowHeight={28}

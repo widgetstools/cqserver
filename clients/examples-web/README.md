@@ -60,15 +60,31 @@ panels, where each panel is one of:
 - marked v18 (embedded docs)
 - lucide-react (icons)
 
-## Design notes
+## Design system — Stockflux
 
-The Atlas inherits all design tokens from the admin UI and adds **one
-distinct signature accent** — electric coral `--signal: #ff5e4f` —
-reserved for the EX.NN rubrics and active dock-tab indicators. This
-makes it instantly obvious whether you're looking at the admin
-console (no coral) or the examples app (coral everywhere).
+The Atlas inherits the **Stockflux design system** (`/staruidesign1`).
+Tokens come straight from that system and live verbatim under
+[`src/styles/tokens.css`](src/styles/tokens.css) and
+[`src/styles/palettes.css`](src/styles/palettes.css):
 
-Aesthetic direction: **operator console — Bloomberg × Linear** with a
-typographic "field guide" overlay. Hairline borders only; no shadows.
-JetBrains Mono for every number, identifier, and SQL token; Inter for
-UI chrome. Dense by default — depth from information, not elevation.
+- **shadcn-style HSL triplets** on the standard variables (no `hsl()`
+  wrapper), surfaced to Tailwind v4 via `@theme inline { --color-*:
+  hsl(var(--*)); }`.
+- **Theme selectors** use `[data-theme="dark"|"light"]` on
+  `<html>` plus `[data-palette="teal|indigo|amber|slate|grey"]`.
+  `ThemeProvider` writes both.
+- **Trading semantics** locked across palettes: `--sf-up` (mint-teal,
+  positive), `--sf-down` (rose, negative), `--sf-flat`.
+- **Signature accent** is Stockflux mint-teal (`--sf-teal`), used for
+  EX.NN rubrics, active sidebar rows, dock-tab indicators, panel
+  marker dots, CodeMirror keyword highlights.
+
+### AG Grid
+
+AG Grid uses the **v33+ Theming API** — no `ag-theme-quartz.css`
+import. The factory at [`src/lib/aggrid-theme.ts`](src/lib/aggrid-theme.ts)
+builds and caches a `themeQuartz.withPart(iconSetQuartzBold).withParams(...)`
+object per `(palette, mode)` pair (ported from the Stockflux
+`aggrid-theme.js`). `GridPanel` reads the current palette + theme from
+the `ThemeProvider` and passes the cached theme object via
+`<AgGridReact theme={...} />`.
