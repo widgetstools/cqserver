@@ -31,7 +31,10 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>
         <TooltipProvider delayDuration={200}>
-          <BrowserRouter>
+          {/* In production the bundle is served from /ui/* by cqserver;
+              dev mode serves from /. import.meta.env.BASE_URL is set
+              by Vite (matches the `base` option) and ends with a `/`. */}
+          <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
             <Routes>
               <Route element={<AppShell />}>
                 <Route index element={<OverviewPage />} />

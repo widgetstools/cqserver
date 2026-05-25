@@ -3,8 +3,12 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
 
-export default defineConfig({
+// Production: the cqserver mounts the SPA under /ui/* via tower-http
+// ServeDir, so assets must resolve to /ui/assets/... not /assets/...
+// Dev (vite serve on :5174): the SPA is at the root, base stays /.
+export default defineConfig(({ command }) => ({
   plugins: [react(), tailwindcss()],
+  base: command === 'build' ? '/ui/' : '/',
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -21,4 +25,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

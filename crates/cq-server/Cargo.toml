@@ -26,6 +26,10 @@ anyhow.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 axum.workspace = true
+# Serves the admin-ui static bundle under /ui (U7). `fs` feature
+# pulls in the ServeDir + ServeFile services; no compression /
+# CORS layers loaded since we don't need them here.
+tower-http = { version = "0.6", features = ["fs"] }
 memory-stats = "1.2"
 
 # Custom allocator: jemalloc returns freed pages to the OS more

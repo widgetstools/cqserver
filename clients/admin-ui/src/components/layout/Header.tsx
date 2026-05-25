@@ -61,7 +61,7 @@ export function Header() {
       {/* Endpoint label */}
       <div className="hidden md:flex items-baseline gap-1.5 text-[11px] text-muted-foreground">
         <span className="uppercase tracking-[0.08em]">admin</span>
-        <code className="font-mono text-foreground">{adminBase || '/admin-api'}</code>
+        <code className="font-mono text-foreground">{adminBase || 'same origin'}</code>
       </div>
 
       <div className="flex-1" />

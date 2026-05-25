@@ -68,7 +68,7 @@ pub async fn start_admin_server(
     addr: String,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(admin_ui))
         .route("/fi-demo", get(fi_demo_ui))
         .route("/healthz", get(healthz))
@@ -87,6 +87,30 @@ pub async fn start_admin_server(
         .route("/admin/views", get(get_views))
         .route("/admin/config", get(get_config_toml))
         .with_state(state);
+
+    // U7: serve the admin-ui static bundle under /ui. Resolved
+    // from `CQSERVER_ADMIN_UI_DIR` (override) or
+    // `./clients/admin-ui/dist` relative to the process CWD
+    // (the demo + standard dev layout). If the dir is missing,
+    // log + skip — the JSON admin endpoints work either way.
+    let ui_dir = std::env::var("CQSERVER_ADMIN_UI_DIR")
+        .unwrap_or_else(|_| "clients/admin-ui/dist".to_string());
+    if std::path::Path::new(&ui_dir).is_dir() {
+        let index = std::path::Path::new(&ui_dir).join("index.html");
+        // ServeDir with a fallback to index.html so client-side
+        // routes (e.g. /ui/topics) hit the SPA shell on hard-reload.
+        let serve = tower_http::services::ServeDir::new(&ui_dir)
+            .fallback(tower_http::services::ServeFile::new(index));
+        app = app.nest_service("/ui", serve);
+        info!(dir = %ui_dir, "Admin UI mounted at /ui");
+    } else {
+        info!(
+            dir = %ui_dir,
+            "Admin UI dist not found; /ui will 404. Build with \
+             `cd clients/admin-ui && npm run build` or set \
+             CQSERVER_ADMIN_UI_DIR to mount."
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!(addr = %addr, "Admin HTTP server listening");

@@ -15,9 +15,23 @@
  *   GET    /admin/shard-for/:topic
  */
 
-const DEFAULT_BASE = (import.meta.env.VITE_ADMIN_URL as string | undefined) ?? '/admin-api';
+// Admin API base URL resolution:
+//   1. VITE_ADMIN_URL env var wins (dev override against a remote host).
+//   2. If the app is being served from the cqserver itself under `/ui/*`
+//      (the production deploy), the admin endpoints are at the same
+//      origin's root — base is empty string.
+//   3. Otherwise (Vite dev server on :5174), use `/admin-api` which the
+//      dev server proxies to http://127.0.0.1:8085.
+function resolveAdminBase(): string {
+  const override = (import.meta.env.VITE_ADMIN_URL as string | undefined);
+  if (override) return override.replace(/\/+$/, '');
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/ui')) {
+    return '';
+  }
+  return '/admin-api';
+}
 
-export const adminBase = DEFAULT_BASE.replace(/\/+$/, '');
+export const adminBase = resolveAdminBase();
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(`${adminBase}${path}`);
