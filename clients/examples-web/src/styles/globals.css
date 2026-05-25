@@ -1,0 +1,701 @@
+@import "tailwindcss";
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* dockview-react base styles — we pull in only the structural CSS;
+ * theme colors are overridden by our own tokens below. */
+@import "dockview-react/dist/styles/dockview.css";
+
+/*
+ * cqserver Atlas — example field guide
+ * Inherits the operator-console palette from the admin UI; layers a
+ * single signature accent (--signal) that does NOT appear in the
+ * admin so the two apps remain instantly distinguishable.
+ */
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #f7f8fa;
+  --foreground: #0d1117;
+
+  --card: #ffffff;
+  --card-foreground: #0d1117;
+
+  --popover: #ffffff;
+  --popover-foreground: #0d1117;
+
+  --primary: #1652f0;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f0f2f5;
+  --secondary-foreground: #0d1117;
+
+  --muted: #f0f2f5;
+  --muted-foreground: #4b5563;
+
+  --accent: #e4e7ec;
+  --accent-foreground: #0d1117;
+
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+
+  --border: #e4e7ec;
+  --input: #e4e7ec;
+  --ring: #1652f0;
+
+  --radius: 5px;
+
+  --ok: #00a36c;
+  --ok-foreground: #ffffff;
+  --ok-muted: rgba(0,163,108,0.10);
+  --warn: #d97706;
+  --warn-foreground: #ffffff;
+  --warn-muted: rgba(217,119,6,0.10);
+  --err: #dc2626;
+  --err-foreground: #ffffff;
+  --err-muted: rgba(220,38,38,0.10);
+  --info: #1652f0;
+  --info-muted: rgba(22,82,240,0.08);
+
+  --surface: #ffffff;
+  --elevated: #f0f2f5;
+  --data-grid-line: #eef0f3;
+
+  /* SIGNATURE — Atlas-only accent. Electric coral. Reserved for
+   * EX.NN rubrics, active-tab indicators, focused dock-tab pills. */
+  --signal: #ff4d3d;
+  --signal-foreground: #ffffff;
+  --signal-muted: rgba(255,77,61,0.10);
+
+  /* Heatmap diverging scale — perceptually balanced, hand-tuned. */
+  --hm-neg-3: #b91c1c;
+  --hm-neg-2: #dc2626;
+  --hm-neg-1: #f87171;
+  --hm-zero:  #1d2026;
+  --hm-pos-1: #34d399;
+  --hm-pos-2: #10b981;
+  --hm-pos-3: #047857;
+}
+
+.dark {
+  --background: #08090d;
+  --foreground: #e8eaee;
+
+  --card: #0f1116;
+  --card-foreground: #e8eaee;
+
+  --popover: #14161c;
+  --popover-foreground: #e8eaee;
+
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
+
+  --secondary: #14161c;
+  --secondary-foreground: #e8eaee;
+
+  --muted: #14161c;
+  --muted-foreground: #818b97;
+
+  --accent: #1c2029;
+  --accent-foreground: #e8eaee;
+
+  --destructive: #f43f5e;
+  --destructive-foreground: #ffffff;
+
+  --border: #1d212a;
+  --input: #14161c;
+  --ring: #3b82f6;
+
+  --ok: #10b981;
+  --ok-foreground: #ffffff;
+  --ok-muted: rgba(16,185,129,0.12);
+  --warn: #f59e0b;
+  --warn-foreground: #08090d;
+  --warn-muted: rgba(245,158,11,0.12);
+  --err: #f43f5e;
+  --err-foreground: #ffffff;
+  --err-muted: rgba(244,63,94,0.12);
+  --info: #3b82f6;
+  --info-muted: rgba(59,130,246,0.10);
+
+  --surface: #0f1116;
+  --elevated: #14161c;
+  --data-grid-line: #181c25;
+
+  --signal: #ff5e4f;
+  --signal-foreground: #08090d;
+  --signal-muted: rgba(255,94,79,0.13);
+
+  --hm-neg-3: #7f1d1d;
+  --hm-neg-2: #b91c1c;
+  --hm-neg-1: #ef4444;
+  --hm-zero:  #14161c;
+  --hm-pos-1: #10b981;
+  --hm-pos-2: #059669;
+  --hm-pos-3: #065f46;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ok: var(--ok);
+  --color-ok-foreground: var(--ok-foreground);
+  --color-ok-muted: var(--ok-muted);
+  --color-warn: var(--warn);
+  --color-warn-foreground: var(--warn-foreground);
+  --color-warn-muted: var(--warn-muted);
+  --color-err: var(--err);
+  --color-err-foreground: var(--err-foreground);
+  --color-err-muted: var(--err-muted);
+  --color-info: var(--info);
+  --color-info-muted: var(--info-muted);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-signal: var(--signal);
+  --color-signal-foreground: var(--signal-foreground);
+  --color-signal-muted: var(--signal-muted);
+
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 6px);
+  --radius-2xl: calc(var(--radius) + 10px);
+  --radius-full: 9999px;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+* { border-color: var(--border); }
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv11' 1;
+}
+
+h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1, 'zero' 1, 'ss01' 1;
+}
+
+/* ── ATLAS SIGNATURE TYPOGRAPHY ───────────────────────────────────
+ * The "EX.NN" rubric is the visual hallmark of the examples app.
+ * Huge JetBrains Mono, tight tracking, signal-colored, sitting
+ * beside an ALL-CAPS Inter title and a hairline.
+ */
+.atlas-serial {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1, 'ss01' 1;
+  font-size: clamp(34px, 4vw, 52px);
+  font-weight: 600;
+  line-height: 0.95;
+  letter-spacing: -0.045em;
+  color: var(--signal);
+  text-shadow: 0 0 24px var(--signal-muted);
+}
+.atlas-title {
+  font-size: clamp(14px, 1.4vw, 17px);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--foreground);
+}
+.atlas-subtitle {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted-foreground);
+  letter-spacing: -0.002em;
+}
+.atlas-eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+.atlas-eyebrow .dot {
+  color: var(--signal);
+}
+
+/* Capsule tags showing which cqserver features an example uses. */
+.feature-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  background: transparent;
+  transition: color 100ms, border-color 100ms;
+}
+.feature-tag::before {
+  content: '';
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: var(--muted-foreground);
+  opacity: 0.6;
+}
+.feature-tag[data-kind="join"]   { color: #67e8f9; border-color: rgba(103,232,249,0.30); }
+.feature-tag[data-kind="join"]::before   { background: #67e8f9; opacity: 1; }
+.feature-tag[data-kind="view"]   { color: #c084fc; border-color: rgba(192,132,252,0.30); }
+.feature-tag[data-kind="view"]::before   { background: #c084fc; opacity: 1; }
+.feature-tag[data-kind="filter"] { color: #facc15; border-color: rgba(250,204,21,0.30); }
+.feature-tag[data-kind="filter"]::before { background: #facc15; opacity: 1; }
+.feature-tag[data-kind="agg"]    { color: #4ade80; border-color: rgba(74,222,128,0.30); }
+.feature-tag[data-kind="agg"]::before    { background: #4ade80; opacity: 1; }
+.feature-tag[data-kind="pivot"]  { color: #fb7185; border-color: rgba(251,113,133,0.30); }
+.feature-tag[data-kind="pivot"]::before  { background: #fb7185; opacity: 1; }
+.feature-tag[data-kind="stream"] { color: var(--signal); border-color: color-mix(in oklab, var(--signal) 35%, transparent); }
+.feature-tag[data-kind="stream"]::before { background: var(--signal); opacity: 1; }
+.feature-tag[data-kind="window"] { color: #38bdf8; border-color: rgba(56,189,248,0.30); }
+.feature-tag[data-kind="window"]::before { background: #38bdf8; opacity: 1; }
+
+/* ── ATLAS INDEX (left rail) ─────────────────────────────────── */
+.atlas-row {
+  display: grid;
+  grid-template-columns: 30px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 8px 14px;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  transition: background-color 100ms, border-color 100ms;
+}
+.atlas-row:hover {
+  background-color: var(--accent);
+}
+.atlas-row[data-active="true"] {
+  border-left-color: var(--signal);
+  background-color: color-mix(in oklab, var(--signal) 6%, transparent);
+}
+.atlas-row[data-active="true"] .atlas-row-num { color: var(--signal); }
+
+.atlas-row-num {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.atlas-row-label {
+  font-size: 12.5px;
+  color: var(--foreground);
+  font-weight: 500;
+  line-height: 1.2;
+}
+.atlas-row-sub {
+  font-size: 10.5px;
+  color: var(--muted-foreground);
+  margin-top: 2px;
+  letter-spacing: -0.002em;
+}
+.atlas-row-tags {
+  display: flex;
+  gap: 3px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.atlas-row-tags .feature-tag {
+  height: 14px;
+  font-size: 8.5px;
+  padding: 0 5px;
+}
+
+/* ── HEATMAP ─────────────────────────────────────────────────── */
+.heatmap-cell {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  transition: background-color 600ms cubic-bezier(0.4, 0, 0.2, 1),
+              transform 200ms;
+  user-select: none;
+  cursor: default;
+}
+.heatmap-cell:hover {
+  transform: scale(1.06);
+  z-index: 2;
+  border-color: var(--foreground);
+  box-shadow: 0 0 0 1px var(--foreground);
+}
+.heatmap-cell[data-bucket="-3"] { background-color: var(--hm-neg-3); color: #fff5f5; }
+.heatmap-cell[data-bucket="-2"] { background-color: var(--hm-neg-2); color: #fff5f5; }
+.heatmap-cell[data-bucket="-1"] { background-color: var(--hm-neg-1); color: #fff; }
+.heatmap-cell[data-bucket="0"]  { background-color: var(--hm-zero); color: var(--muted-foreground); }
+.heatmap-cell[data-bucket="1"]  { background-color: var(--hm-pos-1); color: #022c1e; }
+.heatmap-cell[data-bucket="2"]  { background-color: var(--hm-pos-2); color: #ecfdf5; }
+.heatmap-cell[data-bucket="3"]  { background-color: var(--hm-pos-3); color: #ecfdf5; }
+
+@keyframes hm-flash {
+  0%   { box-shadow: inset 0 0 0 2px var(--signal); }
+  100% { box-shadow: inset 0 0 0 0 transparent; }
+}
+.heatmap-cell.flash { animation: hm-flash 700ms ease-out; }
+
+/* ── VALUE PULSE (live cells) ─────────────────────────────────── */
+@keyframes pulse-up {
+  0%   { background-color: var(--ok-muted); }
+  100% { background-color: transparent; }
+}
+@keyframes pulse-down {
+  0%   { background-color: var(--err-muted); }
+  100% { background-color: transparent; }
+}
+.pulse-up   { animation: pulse-up 600ms ease-out; }
+.pulse-down { animation: pulse-down 600ms ease-out; }
+
+/* ── STAGGERED LOAD ─────────────────────────────────────────── */
+@keyframes atlas-fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up {
+  animation: atlas-fade-up 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ── SCROLLBARS ───────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: var(--radius-full);
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted-foreground); }
+
+/* ── AG GRID OVERRIDES ────────────────────────────────────────── */
+.ag-theme-quartz,
+.ag-theme-quartz-dark {
+  --ag-header-background-color: transparent;
+  --ag-header-foreground-color: var(--muted-foreground);
+  --ag-background-color: var(--card);
+  --ag-foreground-color: var(--card-foreground);
+  --ag-border-color: var(--border);
+  --ag-row-border-color: var(--data-grid-line);
+  --ag-odd-row-background-color: transparent;
+  --ag-row-hover-color: var(--accent);
+  --ag-selected-row-background-color: var(--info-muted);
+  --ag-font-family: var(--font-sans);
+  --ag-font-size: 12px;
+  --ag-grid-size: 5px;
+  --ag-header-height: 28px;
+  --ag-row-height: 30px;
+  --ag-cell-horizontal-padding: 9px;
+  --ag-header-column-separator-display: none;
+  --ag-borders: solid 0;
+  --ag-borders-row: solid 1px;
+}
+.ag-header-cell-text {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+.ag-cell .tabular-cell {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1, 'ss01' 1;
+}
+.ag-cell .num-pos { color: var(--ok); }
+.ag-cell .num-neg { color: var(--err); }
+
+/* ── DOCKVIEW OVERRIDES (match operator console) ─────────────── */
+.dockview-theme-abyss,
+.dv-react-context {
+  --dv-paneview-active-outline-color: var(--signal);
+  --dv-tabs-and-actions-container-background-color: var(--card);
+  --dv-tabs-and-actions-container-font-size: 11px;
+  --dv-tab-divider-color: var(--border);
+  --dv-group-view-background-color: var(--card);
+  --dv-tabs-container-scrollbar-color: var(--border);
+  --dv-icon-hover-background-color: var(--accent);
+  --dv-floating-box-shadow: none;
+  --dv-active-tab-background-color: var(--background);
+  --dv-active-tab-color: var(--foreground);
+  --dv-inactive-tab-background-color: var(--card);
+  --dv-inactive-tab-color: var(--muted-foreground);
+  --dv-tab-close-icon: var(--muted-foreground);
+  --dv-drag-over-background-color: var(--signal-muted);
+  --dv-drag-over-border-color: var(--signal);
+  --dv-separator-border: var(--border);
+  --dv-paneview-header-border-color: var(--border);
+  --dv-background-color: var(--background);
+}
+.dv-default-tab {
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  padding: 0 12px;
+}
+.dv-default-tab.dv-active-tab {
+  border-bottom-color: var(--signal) !important;
+  color: var(--foreground);
+}
+
+/* ── PANEL CHROME ─────────────────────────────────────────────── */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  height: 26px;
+}
+.panel-header .panel-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--foreground);
+  font-weight: 500;
+}
+.panel-header .panel-title .marker {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--signal);
+  box-shadow: 0 0 6px var(--signal);
+}
+.panel-body {
+  height: calc(100% - 26px);
+  overflow: auto;
+  background: var(--card);
+}
+
+/* ── KPI TILE ─────────────────────────────────────────────────── */
+.kpi {
+  display: flex;
+  flex-direction: column;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  position: relative;
+  overflow: hidden;
+}
+.kpi::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg,
+    color-mix(in oklab, var(--signal) 4%, transparent) 0%,
+    transparent 60%);
+  pointer-events: none;
+}
+.kpi-label {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted-foreground);
+}
+.kpi-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  margin-top: 4px;
+  color: var(--foreground);
+}
+.kpi-delta {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  margin-top: 2px;
+  font-weight: 500;
+}
+.kpi-delta.up   { color: var(--ok); }
+.kpi-delta.down { color: var(--err); }
+
+/* ── CODEMIRROR ───────────────────────────────────────────────── */
+.cm-editor {
+  background: transparent !important;
+  font-family: var(--font-mono) !important;
+  font-size: 12.5px !important;
+}
+.cm-editor.cm-focused { outline: none !important; }
+.cm-gutters {
+  background: var(--card) !important;
+  border-right: 1px solid var(--border) !important;
+  color: var(--muted-foreground) !important;
+}
+.cm-content { caret-color: var(--signal) !important; }
+.cm-line { padding: 0 8px !important; }
+
+/* ── MARKDOWN PROSE (per-example docs) ───────────────────────── */
+.cq-prose {
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.65;
+  letter-spacing: -0.005em;
+  max-width: 72ch;
+}
+.cq-prose h1 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 0;
+  margin-bottom: 0.6em;
+  letter-spacing: -0.02em;
+  padding-bottom: 0.4em;
+  border-bottom: 1px solid var(--border);
+}
+.cq-prose h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 1.7em;
+  margin-bottom: 0.5em;
+  letter-spacing: -0.018em;
+}
+.cq-prose h3 {
+  font-size: 13.5px;
+  font-weight: 600;
+  margin-top: 1.3em;
+  margin-bottom: 0.3em;
+}
+.cq-prose p { margin: 0.6em 0; }
+.cq-prose a {
+  color: var(--primary);
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+}
+.cq-prose a:hover { border-bottom-color: var(--primary); }
+.cq-prose ul, .cq-prose ol { margin: 0.6em 0; padding-left: 1.4em; }
+.cq-prose li { margin: 0.2em 0; }
+.cq-prose hr { border: 0; border-top: 1px solid var(--border); margin: 2em 0; }
+.cq-prose strong { font-weight: 600; }
+.cq-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--muted);
+  color: var(--foreground);
+  padding: 0.08em 0.35em;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+.cq-prose pre {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  background: var(--muted);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.85em 1em;
+  overflow-x: auto;
+  margin: 0.8em 0;
+}
+.cq-prose pre > code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+.cq-prose blockquote {
+  margin: 0.8em 0;
+  padding: 0.4em 1em;
+  border-left: 3px solid var(--signal);
+  background: var(--signal-muted);
+  color: var(--foreground);
+}
+.cq-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  font-size: 12px;
+}
+.cq-prose th {
+  text-align: left;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 10px;
+  color: var(--muted-foreground);
+  padding: 0.5em 0.7em;
+  border-bottom: 1px solid var(--border);
+}
+.cq-prose td {
+  padding: 0.4em 0.7em;
+  border-bottom: 1px solid var(--data-grid-line);
+}
+
+/* ── HAIRLINE DIVIDER (used everywhere) ──────────────────────── */
+.hairline {
+  height: 1px;
+  background: var(--border);
+}
+.hairline-vert {
+  width: 1px;
+  background: var(--border);
+}
+
+/* ── SMALL UTILITY: tracked uppercase label ──────────────────── */
+.tracked {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+.tracked-tight {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  font-weight: 500;
+}

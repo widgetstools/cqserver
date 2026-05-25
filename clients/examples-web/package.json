@@ -1,0 +1,48 @@
+{
+  "name": "@cqserver/examples-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "cqserver Atlas — a field guide of dock-managed examples demonstrating joins, views, filters, aggregations, pivots and ticking heatmaps over realistic 200+ column financial data",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@codemirror/lang-sql": "^6.7.1",
+    "@codemirror/state": "^6.4.1",
+    "@codemirror/view": "^6.32.0",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@fontsource/inter": "^5.2.8",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-scroll-area": "^1.2.10",
+    "@radix-ui/react-separator": "^1.1.7",
+    "@radix-ui/react-slot": "^1.2.3",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@tailwindcss/vite": "^4.2.1",
+    "@uiw/react-codemirror": "^4.23.7",
+    "ag-grid-community": "^35.1.0",
+    "ag-grid-react": "^35.1.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "dockview-react": "^4.6.0",
+    "lucide-react": "^0.577.0",
+    "marked": "^18.0.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "recharts": "^3.8.0",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.1"
+  }
+}
