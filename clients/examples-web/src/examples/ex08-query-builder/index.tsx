@@ -348,8 +348,9 @@ export function QueryBuilderCanvas() {
     },
     {
       id: 'notes',
-      title: 'Notes · ex08.md',
-      render: () => <MarkdownPanel title="Notes · ex08.md" filename="ex08.md" source={DOCS_BY_ID['query-builder']} />,
+      title: 'Help · ex08.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex08.md" filename="ex08.md" source={DOCS_BY_ID['query-builder']} />,
     },
   ];
 

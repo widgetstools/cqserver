@@ -181,8 +181,9 @@ export function LivePnlCanvas() {
     },
     {
       id: 'notes',
-      title: 'Notes · ex01.md',
-      render: () => <MarkdownPanel title="Notes · ex01.md" filename="ex01.md" source={DOCS_BY_ID['live-pnl']} />,
+      title: 'Help · ex01.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex01.md" filename="ex01.md" source={DOCS_BY_ID['live-pnl']} />,
     },
   ];
 

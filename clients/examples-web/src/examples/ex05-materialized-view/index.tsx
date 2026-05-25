@@ -164,8 +164,9 @@ export function MaterializedViewCanvas() {
     },
     {
       id: 'notes',
-      title: 'Notes · ex05.md',
-      render: () => <MarkdownPanel title="Notes · ex05.md" filename="ex05.md" source={DOCS_BY_ID['materialized-view']} />,
+      title: 'Help · ex05.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex05.md" filename="ex05.md" source={DOCS_BY_ID['materialized-view']} />,
     },
   ];
 

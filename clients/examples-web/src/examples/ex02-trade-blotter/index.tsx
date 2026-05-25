@@ -164,8 +164,9 @@ LIMIT 500;`;
     },
     {
       id: 'notes',
-      title: 'Notes · ex02.md',
-      render: () => <MarkdownPanel title="Notes · ex02.md" filename="ex02.md" source={DOCS_BY_ID['trade-blotter']} />,
+      title: 'Help · ex02.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex02.md" filename="ex02.md" source={DOCS_BY_ID['trade-blotter']} />,
     },
   ];
 

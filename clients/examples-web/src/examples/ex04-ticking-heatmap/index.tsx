@@ -125,8 +125,9 @@ export function TickingHeatmapCanvas() {
     },
     {
       id: 'notes',
-      title: 'Notes · ex04.md',
-      render: () => <MarkdownPanel title="Notes · ex04.md" filename="ex04.md" source={DOCS_BY_ID['ticking-heatmap']} />,
+      title: 'Help · ex04.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex04.md" filename="ex04.md" source={DOCS_BY_ID['ticking-heatmap']} />,
     },
   ];
 

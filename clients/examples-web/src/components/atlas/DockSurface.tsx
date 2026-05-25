@@ -7,6 +7,8 @@ import {
   createDefaultState,
   type DockviewApi,
   type DockPosition,
+  type DockEdge,
+  type Placement,
 } from '@widgetstools/dock-manager-core';
 import { useTheme } from '@/components/theme/ThemeProvider';
 
@@ -43,6 +45,16 @@ export interface DockPanelSpec {
   id: string;
   title: string;
   render: () => ReactNode;
+  /**
+   * When set, the panel is unpinned (auto-hidden) on the given edge
+   * after the layout is built. The package renders a 28px-wide tab
+   * strip on that edge; hovering / clicking the tab expands a flyout
+   * with the panel content. Used for help / notes panels so the main
+   * canvas stays uncluttered.
+   */
+  pin?: DockEdge;
+  /** Optional width/height (px) for the flyout when unpinned. */
+  pinSize?: number;
 }
 
 export interface DockLayoutStep {
@@ -121,9 +133,37 @@ export function DockSurface({ panels, layout, onReady }: DockSurfaceProps) {
         });
       }
 
+      // Pin/unpin pass: any panel with `pin: <edge>` is moved from its
+      // docked position into the edge auto-hide strip. The package's
+      // `unpinPanel` auto-detects the edge from the panel's current
+      // layout position; if that detection disagrees with what we
+      // requested, we patch the placement via `loadState`.
+      const pinSpecs = panels.filter((p) => p.pin);
+      for (const spec of pinSpecs) {
+        api.unpinPanel(spec.id);
+      }
+      if (pinSpecs.length) {
+        const state = api.state;
+        let changed = false;
+        const placements = new Map<string, Placement>(state.placements);
+        for (const spec of pinSpecs) {
+          const pl = placements.get(spec.id);
+          if (!pl || pl.type !== 'unpinned') continue;
+          const wantEdge = spec.pin!;
+          const wantSize = spec.pinSize ?? 360;
+          if (pl.edge !== wantEdge || pl.size !== wantSize) {
+            placements.set(spec.id, { ...pl, edge: wantEdge, size: wantSize });
+            changed = true;
+          }
+        }
+        if (changed) {
+          api.loadState({ ...state, placements });
+        }
+      }
+
       onReady?.(api);
     },
-    [layout, byId, onReady],
+    [layout, byId, panels, onReady],
   );
 
   return (

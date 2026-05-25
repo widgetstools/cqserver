@@ -239,8 +239,9 @@ PIVOT (currency);`;
     },
     {
       id: 'notes',
-      title: 'Notes · ex03.md',
-      render: () => <MarkdownPanel title="Notes · ex03.md" filename="ex03.md" source={DOCS_BY_ID['cross-asset-pivot']} />,
+      title: 'Help · ex03.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex03.md" filename="ex03.md" source={DOCS_BY_ID['cross-asset-pivot']} />,
     },
   ];
 

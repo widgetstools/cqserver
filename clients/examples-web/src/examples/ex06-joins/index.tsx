@@ -203,8 +203,9 @@ export function JoinsCanvas() {
     },
     {
       id: 'notes',
-      title: 'Notes · ex06.md',
-      render: () => <MarkdownPanel title="Notes · ex06.md" filename="ex06.md" source={DOCS_BY_ID['joins']} />,
+      title: 'Help · ex06.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex06.md" filename="ex06.md" source={DOCS_BY_ID['joins']} />,
     },
   ];
 

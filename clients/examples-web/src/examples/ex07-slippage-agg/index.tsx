@@ -153,8 +153,9 @@ export function SlippageCanvas() {
     },
     {
       id: 'notes',
-      title: 'Notes · ex07.md',
-      render: () => <MarkdownPanel title="Notes · ex07.md" filename="ex07.md" source={DOCS_BY_ID['slippage-agg']} />,
+      title: 'Help · ex07.md',
+      pin: 'right',
+      render: () => <MarkdownPanel title="Help · ex07.md" filename="ex07.md" source={DOCS_BY_ID['slippage-agg']} />,
     },
   ];
 
