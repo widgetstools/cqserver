@@ -974,13 +974,24 @@ fn handle_sow_and_subscribe(
     // + metric if any soft threshold crossed. Bookmark replays skip
     // this — their cost model is "txlog entries since bookmark," not
     // SOW row count, so the SOW-shaped estimate doesn't apply.
+    //
+    // G5: when the authenticated user has a per-user query budget
+    // override, merge it OVER the server-wide limits (tighter side
+    // wins per field) and check against that effective limit.
     if msg.bookmark.is_none() && msg.since_timestamp_ms.is_none() && !msg.most_recent {
         if let Some(topic) = topics.get(&topic_name) {
+            let effective_limits = match session.username.as_deref() {
+                Some(u) => match ctx.auth.query_budget_for(u) {
+                    Some(budget) => budget.merge_with(&ctx.query_limits),
+                    None => ctx.query_limits,
+                },
+                None => ctx.query_limits,
+            };
             match topic.estimate_cost(&sql) {
                 Ok(est) => {
                     let outcome = cq_core::query::check_estimate_against_limits(
                         &est,
-                        &ctx.query_limits,
+                        &effective_limits,
                     );
                     if outcome.rejected {
                         metrics::counter!(
@@ -1171,8 +1182,16 @@ fn handle_sow_and_subscribe(
                 let batch_size = ctx.sow_batch_size;
                 let topic_for_task = topic.clone();
                 let sql_for_task = snapshot_sql.clone();
-                let hard_max_rows = ctx.query_limits.hard_max_sow_result_rows;
-                let hard_max_bytes = ctx.query_limits.hard_max_sow_result_bytes;
+                // G5: apply the user-tightened runtime caps too.
+                let effective = match session.username.as_deref() {
+                    Some(u) => match ctx.auth.query_budget_for(u) {
+                        Some(budget) => budget.merge_with(&ctx.query_limits),
+                        None => ctx.query_limits,
+                    },
+                    None => ctx.query_limits,
+                };
+                let hard_max_rows = effective.hard_max_sow_result_rows;
+                let hard_max_bytes = effective.hard_max_sow_result_bytes;
                 tokio::spawn(async move {
                     // ack_cmd_id = None: the ack was sent
                     // synchronously above.

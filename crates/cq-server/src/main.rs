@@ -376,11 +376,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build auth store from config.
     let mut auth_users = Vec::with_capacity(server_config.auth.users.len());
     for u in &server_config.auth.users {
-        match User::from_parts_with_row_filter(
+        let budget = u.query_budget.map(|b| b.to_runtime());
+        match User::from_parts_full(
             u.username.clone(),
             u.password_hash.clone(),
             &u.entitlements,
             u.row_filter.clone(),
+            budget,
         ) {
             Some(user) => auth_users.push(user),
             None => {

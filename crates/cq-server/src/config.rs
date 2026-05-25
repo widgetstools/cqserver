@@ -409,6 +409,45 @@ pub struct UserConfig {
     /// Example: `row_filter = "desk = 'RATES'"`.
     #[serde(default)]
     pub row_filter: Option<String>,
+    /// G5: optional per-user query budget. Each field tightens the
+    /// corresponding `[query_limits]` server default for this user
+    /// only. A user can only be more restricted than the global
+    /// setting; the merge picks the smaller (tighter) of server +
+    /// user when both are non-zero.
+    #[serde(default)]
+    pub query_budget: Option<QueryBudgetConfig>,
+}
+
+/// TOML shape for a per-user query budget. All fields optional so an
+/// admin can tighten one dimension without restating the rest. Maps
+/// to `cq_transport::auth::QueryBudget` via `to_runtime()`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct QueryBudgetConfig {
+    #[serde(default)]
+    pub max_sow_estimated_rows: Option<u64>,
+    #[serde(default)]
+    pub max_sow_estimated_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_join_estimated_fanout: Option<u64>,
+    #[serde(default)]
+    pub max_group_estimated_cardinality: Option<u64>,
+    #[serde(default)]
+    pub hard_max_sow_result_rows: Option<u64>,
+    #[serde(default)]
+    pub hard_max_sow_result_bytes: Option<u64>,
+}
+
+impl QueryBudgetConfig {
+    pub fn to_runtime(self) -> cq_transport::auth::QueryBudget {
+        cq_transport::auth::QueryBudget {
+            max_sow_estimated_rows: self.max_sow_estimated_rows,
+            max_sow_estimated_bytes: self.max_sow_estimated_bytes,
+            max_join_estimated_fanout: self.max_join_estimated_fanout,
+            max_group_estimated_cardinality: self.max_group_estimated_cardinality,
+            hard_max_sow_result_rows: self.hard_max_sow_result_rows,
+            hard_max_sow_result_bytes: self.hard_max_sow_result_bytes,
+        }
+    }
 }
 
 fn default_admin_addr() -> String {

@@ -86,6 +86,77 @@ pub struct User {
     /// "alice can only see desk='RATES' rows" without trusting the
     /// client to filter correctly.
     pub row_filter: Option<String>,
+    /// Query Guardrails G5: per-user override of the server-wide
+    /// query limits. `None` means "use the server's
+    /// [query_limits] defaults." `Some(_)` tightens specific fields
+    /// — `merge_with(server_limits)` takes the **tighter** value
+    /// per field, so an override can only be more restrictive than
+    /// the global setting (never more permissive).
+    pub query_budget: Option<QueryBudget>,
+}
+
+/// Query Guardrails G5: per-user query-cost override. All fields are
+/// optional so an admin can tighten a single dimension without
+/// having to restate the entire QueryLimits. `merge_with` produces
+/// the effective limits for one subscribe by picking the tighter
+/// (smaller) value when both are set.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryBudget {
+    pub max_sow_estimated_rows: Option<u64>,
+    pub max_sow_estimated_bytes: Option<u64>,
+    pub max_join_estimated_fanout: Option<u64>,
+    pub max_group_estimated_cardinality: Option<u64>,
+    pub hard_max_sow_result_rows: Option<u64>,
+    pub hard_max_sow_result_bytes: Option<u64>,
+}
+
+impl QueryBudget {
+    /// Merge this budget over `server_limits`, returning a new
+    /// QueryLimits with each tunable field set to whichever side is
+    /// tighter (smaller non-zero, treating 0 as "disabled / no cap").
+    /// Structural fields (PIVOT IN-list cap, view chain depth, etc.)
+    /// stay at the server default — per-user overrides only cover
+    /// quantitative caps where "tighter" is unambiguous.
+    pub fn merge_with(
+        &self,
+        server: &cq_core::query::QueryLimits,
+    ) -> cq_core::query::QueryLimits {
+        fn tighter(server_val: u64, user_val: Option<u64>) -> u64 {
+            match user_val {
+                None => server_val,
+                Some(0) => server_val, // user explicitly disabled — ignore
+                Some(u) if server_val == 0 => u, // server disabled, user tightens
+                Some(u) => server_val.min(u),
+            }
+        }
+        cq_core::query::QueryLimits {
+            max_sow_estimated_rows: tighter(
+                server.max_sow_estimated_rows,
+                self.max_sow_estimated_rows,
+            ),
+            max_sow_estimated_bytes: tighter(
+                server.max_sow_estimated_bytes,
+                self.max_sow_estimated_bytes,
+            ),
+            max_join_estimated_fanout: tighter(
+                server.max_join_estimated_fanout,
+                self.max_join_estimated_fanout,
+            ),
+            max_group_estimated_cardinality: tighter(
+                server.max_group_estimated_cardinality,
+                self.max_group_estimated_cardinality,
+            ),
+            hard_max_sow_result_rows: tighter(
+                server.hard_max_sow_result_rows,
+                self.hard_max_sow_result_rows,
+            ),
+            hard_max_sow_result_bytes: tighter(
+                server.hard_max_sow_result_bytes,
+                self.hard_max_sow_result_bytes,
+            ),
+            ..*server
+        }
+    }
 }
 
 impl User {
@@ -107,6 +178,20 @@ impl User {
         entitlements: &[String],
         row_filter: Option<String>,
     ) -> Option<Self> {
+        Self::from_parts_full(username, password_hash, entitlements, row_filter, None)
+    }
+
+    /// G5 variant that also accepts a per-user query budget. `None`
+    /// keeps the server-wide [query_limits] in force; `Some(_)` can
+    /// only TIGHTEN limits (the merge picks the smaller of server +
+    /// user per field).
+    pub fn from_parts_full(
+        username: String,
+        password_hash: String,
+        entitlements: &[String],
+        row_filter: Option<String>,
+        query_budget: Option<QueryBudget>,
+    ) -> Option<Self> {
         let mut parsed = Vec::with_capacity(entitlements.len());
         for e in entitlements {
             parsed.push(Entitlement::parse(e)?);
@@ -116,6 +201,7 @@ impl User {
             password_hash,
             entitlements: parsed,
             row_filter,
+            query_budget,
         })
     }
 
@@ -225,6 +311,10 @@ impl JwtValidator {
             password_hash: String::new(), // unused for JWT-authenticated sessions
             entitlements: parsed,
             row_filter: None,
+            // JWT-authenticated users don't carry per-user budgets in
+            // the token today; ops can add a `budget` claim and
+            // populate this from it in a follow-up.
+            query_budget: None,
         })
     }
 }
@@ -279,6 +369,14 @@ impl AuthStore {
     /// users with no row_filter configured.
     pub fn row_filter_for(&self, username: &str) -> Option<String> {
         self.users.get(username).and_then(|u| u.row_filter.clone())
+    }
+
+    /// G5: look up the per-user query budget for `username`. Returns
+    /// `None` for unauthenticated sessions, unknown users, or users
+    /// without an override (in which case the server's
+    /// `[query_limits]` defaults apply unchanged).
+    pub fn query_budget_for(&self, username: &str) -> Option<QueryBudget> {
+        self.users.get(username).and_then(|u| u.query_budget)
     }
 
     /// Verify `(username, password)`. Returns the matching user on
@@ -470,5 +568,89 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    // ─── Query Guardrails G5 — per-user budget merge ───────────────
+
+    #[test]
+    fn g5_budget_none_returns_server_limits_unchanged() {
+        let server = cq_core::query::QueryLimits::default();
+        let budget = QueryBudget::default(); // all None
+        let effective = budget.merge_with(&server);
+        assert_eq!(effective.max_sow_estimated_rows, server.max_sow_estimated_rows);
+        assert_eq!(effective.hard_max_sow_result_rows, server.hard_max_sow_result_rows);
+    }
+
+    #[test]
+    fn g5_user_can_tighten_but_not_loosen() {
+        let server = cq_core::query::QueryLimits {
+            max_sow_estimated_rows: 1_000_000,
+            ..cq_core::query::QueryLimits::default()
+        };
+        let budget = QueryBudget {
+            max_sow_estimated_rows: Some(10_000), // tighter
+            ..QueryBudget::default()
+        };
+        let effective = budget.merge_with(&server);
+        assert_eq!(effective.max_sow_estimated_rows, 10_000);
+
+        let budget_loose = QueryBudget {
+            max_sow_estimated_rows: Some(10_000_000), // user tries to loosen
+            ..QueryBudget::default()
+        };
+        let effective = budget_loose.merge_with(&server);
+        // Tighter (server) wins.
+        assert_eq!(effective.max_sow_estimated_rows, 1_000_000);
+    }
+
+    #[test]
+    fn g5_user_zero_is_treated_as_disabled_not_unlimited() {
+        // Operator intent: user wrote `max_sow_estimated_rows = 0`
+        // meaning "I don't want a per-user override on this field."
+        // Server limit must remain in force.
+        let server = cq_core::query::QueryLimits {
+            max_sow_estimated_rows: 500,
+            ..cq_core::query::QueryLimits::default()
+        };
+        let budget = QueryBudget {
+            max_sow_estimated_rows: Some(0),
+            ..QueryBudget::default()
+        };
+        assert_eq!(budget.merge_with(&server).max_sow_estimated_rows, 500);
+    }
+
+    #[test]
+    fn g5_user_tightens_when_server_disabled() {
+        // Server has the cap turned off (0); user wants to enforce
+        // one for themselves. Per-user cap should win.
+        let server = cq_core::query::QueryLimits {
+            max_sow_estimated_rows: 0, // server disabled
+            ..cq_core::query::QueryLimits::default()
+        };
+        let budget = QueryBudget {
+            max_sow_estimated_rows: Some(10_000),
+            ..QueryBudget::default()
+        };
+        assert_eq!(budget.merge_with(&server).max_sow_estimated_rows, 10_000);
+    }
+
+    #[test]
+    fn g5_user_budget_round_trips_through_user_struct() {
+        let budget = QueryBudget {
+            max_sow_estimated_rows: Some(5_000),
+            ..QueryBudget::default()
+        };
+        let u = User::from_parts_full(
+            "viewer-bob".into(),
+            "pw".into(),
+            &["subscribe:*".into()],
+            None,
+            Some(budget),
+        )
+        .unwrap();
+        assert_eq!(
+            u.query_budget.and_then(|b| b.max_sow_estimated_rows),
+            Some(5_000)
+        );
     }
 }
