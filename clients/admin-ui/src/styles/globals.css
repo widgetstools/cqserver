@@ -252,3 +252,160 @@ h1, h2, h3, h4, h5, h6 {
 .dark .sparkline-path {
   filter: drop-shadow(0 0 1px rgba(59,130,246,0.5));
 }
+
+/* ──────────────────────────────────────────────────────────────
+   cq-prose: styles for the rendered USER_GUIDE.md inside the
+   UserGuidePage React component. Designed to match the operator-
+   console aesthetic (Inter body, JetBrains Mono code, hairline
+   borders, no shadows) while staying readable for long-form text.
+   ─────────────────────────────────────────────────────────────── */
+
+.cq-prose {
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.65;
+  letter-spacing: -0.005em;
+  max-width: 70ch;            /* readability cap */
+}
+
+.cq-prose h1 {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 0;
+  margin-bottom: 0.6em;
+  letter-spacing: -0.02em;
+  padding-bottom: 0.4em;
+  border-bottom: 1px solid var(--border);
+}
+.cq-prose h2 {
+  font-size: 17px;
+  font-weight: 600;
+  margin-top: 1.8em;
+  margin-bottom: 0.5em;
+  letter-spacing: -0.018em;
+  scroll-margin-top: 1.5rem;
+}
+.cq-prose h3 {
+  font-size: 14.5px;
+  font-weight: 600;
+  margin-top: 1.4em;
+  margin-bottom: 0.3em;
+  scroll-margin-top: 1.5rem;
+  color: var(--foreground);
+}
+.cq-prose h4, .cq-prose h5, .cq-prose h6 {
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 1.2em;
+  margin-bottom: 0.3em;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.cq-prose p { margin: 0.6em 0; }
+
+.cq-prose a {
+  color: var(--primary);
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 80ms;
+}
+.cq-prose a:hover { border-bottom-color: var(--primary); }
+
+.cq-prose ul, .cq-prose ol {
+  margin: 0.6em 0;
+  padding-left: 1.4em;
+}
+.cq-prose li { margin: 0.2em 0; }
+.cq-prose li > ul, .cq-prose li > ol { margin: 0.2em 0; }
+
+.cq-prose hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+
+.cq-prose strong { font-weight: 600; color: var(--foreground); }
+.cq-prose em { font-style: italic; }
+
+/* Inline code: small mono badge */
+.cq-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--muted);
+  color: var(--foreground);
+  padding: 0.08em 0.35em;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+/* Block code: full-width, scrollable, no inline border on the
+   inner <code> (gets eaten by the <pre>) */
+.cq-prose pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--muted);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.85em 1em;
+  overflow-x: auto;
+  margin: 0.8em 0;
+}
+.cq-prose pre > code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+/* Blockquote */
+.cq-prose blockquote {
+  margin: 0.8em 0;
+  padding: 0.4em 1em;
+  border-left: 3px solid var(--primary);
+  background: var(--info-muted);
+  color: var(--foreground);
+  font-style: normal;
+}
+
+/* Tables — denser than browser default, hairline borders */
+.cq-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  font-size: 12.5px;
+}
+.cq-prose thead { background: var(--muted); }
+.cq-prose th {
+  text-align: left;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 10.5px;
+  color: var(--muted-foreground);
+  padding: 0.5em 0.7em;
+  border-bottom: 1px solid var(--border);
+}
+.cq-prose td {
+  padding: 0.4em 0.7em;
+  border-bottom: 1px solid var(--data-grid-line);
+  vertical-align: top;
+}
+.cq-prose tr:last-child td { border-bottom: 0; }
+.cq-prose td code { font-size: 0.85em; }
+
+/* Heading anchor "permalink" affordance — show a # on hover */
+.cq-prose h2, .cq-prose h3 { position: relative; }
+.cq-prose h2:hover::before,
+.cq-prose h3:hover::before {
+  content: '#';
+  position: absolute;
+  left: -1em;
+  color: var(--muted-foreground);
+  opacity: 0.5;
+}

@@ -19,6 +19,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import {
   Activity,
   Beaker,
+  BookOpen,
   ChevronRight,
   Database,
   Eye,
@@ -54,6 +55,7 @@ const ROUTE_CMDS: Array<Omit<Cmd, 'run'> & { to: string }> = [
   { id: 'nav-metrics', label: 'Metrics', hint: 'Prometheus browser', group: 'Navigate', icon: Sigma, to: '/metrics' },
   { id: 'nav-explain', label: 'Explain', hint: 'Estimate query cost', group: 'Navigate', icon: Beaker, to: '/explain' },
   { id: 'nav-config', label: 'Config', hint: 'Live cqserver.toml', group: 'Navigate', icon: FileText, to: '/config' },
+  { id: 'nav-guide', label: 'User Guide', hint: 'Operator + developer reference', group: 'Navigate', icon: BookOpen, to: '/guide' },
 ];
 
 interface CommandPaletteProps {

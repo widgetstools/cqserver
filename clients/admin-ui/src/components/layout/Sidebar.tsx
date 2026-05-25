@@ -1,6 +1,7 @@
 import { NavLink, useNavigate } from 'react-router-dom';
 import {
   Activity,
+  BookOpen,
   Database,
   Eye,
   GitBranch,
@@ -18,7 +19,7 @@ interface NavItem {
   to: string;
   label: string;
   icon: React.ComponentType<{ size?: number; className?: string }>;
-  group: 'live' | 'data' | 'system';
+  group: 'live' | 'data' | 'system' | 'reference';
 }
 
 const NAV: NavItem[] = [
@@ -33,12 +34,15 @@ const NAV: NavItem[] = [
   { to: '/metrics', label: 'Metrics', icon: Sigma, group: 'system' },
   { to: '/explain', label: 'Explain', icon: Beaker, group: 'system' },
   { to: '/config', label: 'Config', icon: ScrollText, group: 'system' },
+
+  { to: '/guide', label: 'User Guide', icon: BookOpen, group: 'reference' },
 ];
 
 const GROUP_LABEL: Record<NavItem['group'], string> = {
   live: 'Live',
   data: 'Data',
   system: 'System',
+  reference: 'Reference',
 };
 
 /** Returns the flat index (1-based) of an item in NAV. Used for the
@@ -82,7 +86,7 @@ export function Sidebar() {
       </div>
 
       <nav className="flex-1 overflow-y-auto py-2">
-        {(['live', 'data', 'system'] as const).map((group) => (
+        {(['live', 'data', 'system', 'reference'] as const).map((group) => (
           <div key={group} className="mb-3">
             <div className="px-4 pb-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground/70 font-medium">
               {GROUP_LABEL[group]}

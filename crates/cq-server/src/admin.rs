@@ -117,6 +117,25 @@ pub async fn start_admin_server(
         );
     }
 
+    // Serve the docs/ directory under /docs so the admin UI's
+    // Help page can fetch USER_GUIDE.md (and any other markdown
+    // assets) from the same origin. Resolved via CQSERVER_DOCS_DIR
+    // env var, defaulting to ./docs relative to the process CWD.
+    // Missing dir → log + skip; the rest of the admin port is fine.
+    let docs_dir = std::env::var("CQSERVER_DOCS_DIR")
+        .unwrap_or_else(|_| "docs".to_string());
+    if std::path::Path::new(&docs_dir).is_dir() {
+        let serve_docs = tower_http::services::ServeDir::new(&docs_dir);
+        app = app.nest_service("/docs", serve_docs);
+        info!(dir = %docs_dir, "Documentation mounted at /docs");
+    } else {
+        info!(
+            dir = %docs_dir,
+            "Docs dir not found; /docs will 404. \
+             Set CQSERVER_DOCS_DIR to override."
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!(addr = %addr, "Admin HTTP server listening");
     axum::serve(listener, app).await?;

@@ -85,6 +85,7 @@ served from `/ui/*` it talks to the same origin's root (`/stats`,
 | `/metrics`      | **Metrics** — Prometheus series browser. Pin series to a sparkline grid that persists across reloads. |
 | `/explain`      | **Explain** — Topic + SQL → `POST /admin/explain` → rows / bytes / confidence / used indexes / assumptions. |
 | `/config`       | **Config** — Line-numbered, syntax-highlighted view of the running `cqserver.toml` with find-in-file + copy-to-clipboard. |
+| `/guide`        | **User Guide** — Renders [`docs/USER_GUIDE.md`](USER_GUIDE.md) live from the cqserver process. Sticky TOC + in-page anchor links + find-in-TOC. Served by mounting `docs/` under `/docs/*` via `CQSERVER_DOCS_DIR` (default `./docs`). |
 
 Every screen polls live; the connection-status pill in the header
 shows green when `/healthz` is reachable and red when it isn't.

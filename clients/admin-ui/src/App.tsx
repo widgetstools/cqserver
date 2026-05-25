@@ -41,6 +41,9 @@ const MetricsPage = lazy(() =>
 const ExplainPage = lazy(() =>
   import('@/pages/ExplainPage').then((m) => ({ default: m.ExplainPage })),
 );
+const UserGuidePage = lazy(() =>
+  import('@/pages/UserGuidePage').then((m) => ({ default: m.UserGuidePage })),
+);
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -150,6 +153,14 @@ export function App() {
                     element={
                       <Suspense fallback={<PageFallback />}>
                         <ConfigPage />
+                      </Suspense>
+                    }
+                  />
+                  <Route
+                    path="/guide"
+                    element={
+                      <Suspense fallback={<PageFallback />}>
+                        <UserGuidePage />
                       </Suspense>
                     }
                   />
