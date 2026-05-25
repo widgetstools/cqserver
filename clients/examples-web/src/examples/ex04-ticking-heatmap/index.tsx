@@ -120,7 +120,8 @@ export function TickingHeatmapCanvas() {
     },
     {
       id: 'sql',
-      title: 'View definition',
+      title: 'SQL · view',
+      pin: 'right',
       render: () => <SqlPanel title="View definition" value={viewSql} readOnly planSummary="PIVOT · weighted-avg · CDC-refreshed" />,
     },
     {

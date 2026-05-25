@@ -143,12 +143,14 @@ export function SlippageCanvas() {
     },
     {
       id: 'sql-agg',
-      title: 'Aggregation SQL',
+      title: 'SQL · aggregation',
+      pin: 'right',
       render: () => <SqlPanel title="Aggregation SQL" value={sqlAgg} readOnly planSummary="GROUP BY · PERCENTILE_CONT · STDDEV" />,
     },
     {
       id: 'sql-win',
-      title: 'Rolling Window SQL',
+      title: 'SQL · window',
+      pin: 'right',
       render: () => <SqlPanel title="Rolling Window SQL" value={sqlWin} readOnly planSummary="WINDOW · ROWS BETWEEN 49 PRECEDING · PARTITION BY algo" />,
     },
     {

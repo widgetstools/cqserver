@@ -108,7 +108,8 @@ export function JoinsCanvas() {
   const panels: DockPanelSpec[] = [
     {
       id: 'sql',
-      title: 'Join SQL',
+      title: 'SQL · join',
+      pin: 'right',
       render: () => (
         <PanelChrome
           title={`Join SQL · ${JOIN_LABEL[kind]}`}

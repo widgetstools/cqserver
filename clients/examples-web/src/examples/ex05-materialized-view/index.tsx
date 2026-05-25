@@ -98,7 +98,8 @@ export function MaterializedViewCanvas() {
   const panels: DockPanelSpec[] = [
     {
       id: 'definition',
-      title: 'View Definition · net_exposure',
+      title: 'SQL · view',
+      pin: 'right',
       render: () => <SqlPanel title="View Definition · net_exposure" value={viewSql} readOnly planSummary="MATERIALIZED · incremental · 6 measures · 4 keys" />,
     },
     {

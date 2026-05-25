@@ -234,7 +234,8 @@ PIVOT (currency);`;
     },
     {
       id: 'sql',
-      title: 'Pivot SQL',
+      title: 'SQL · pivot',
+      pin: 'right',
       render: () => <SqlPanel title="Pivot SQL" value={pivotSql} readOnly planSummary={`PIVOT · ${pivot.rows.length} × ${pivot.cols.length} = ${pivot.cells.size} cells`} />,
     },
     {

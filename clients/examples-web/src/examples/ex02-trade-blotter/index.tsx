@@ -159,7 +159,8 @@ LIMIT 500;`;
     },
     {
       id: 'sql',
-      title: 'Generated SQL',
+      title: 'SQL · generated',
+      pin: 'right',
       render: () => <SqlPanel title="Generated SQL" value={filterSql} readOnly planSummary={`${filtered.length} rows · ${active.size + (search ? 1 : 0)} predicates`} />,
     },
     {

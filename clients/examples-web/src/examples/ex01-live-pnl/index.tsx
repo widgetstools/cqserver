@@ -169,7 +169,8 @@ export function LivePnlCanvas() {
     },
     {
       id: 'sql',
-      title: 'View definition · live_pnl',
+      title: 'SQL · live_pnl',
+      pin: 'right',
       render: () => (
         <SqlPanel
           title="View definition · live_pnl"
