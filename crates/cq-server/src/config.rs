@@ -660,7 +660,21 @@ impl Default for ServerConfig {
 /// is the directory the TOML file lives in (or the current dir when
 /// using defaults), so per-topic `schema_file` paths can be resolved
 /// relative to the config.
+#[allow(dead_code)]
 pub fn load_config() -> Result<(ServerConfig, std::path::PathBuf), Box<dyn std::error::Error>> {
+    let (cfg, dir, _raw) = load_config_with_raw()?;
+    Ok((cfg, dir))
+}
+
+/// Like `load_config` but also returns the *expanded* TOML text (after
+/// env-var substitution). The admin UI's Config screen renders this
+/// verbatim so operators can see exactly what the running process
+/// believes its config to be — which can differ from the on-disk file
+/// if any `${VAR:-default}` substitutions happened.
+pub fn load_config_with_raw() -> Result<
+    (ServerConfig, std::path::PathBuf, String),
+    Box<dyn std::error::Error>,
+> {
     let config_path = std::path::Path::new("config/cqserver.toml");
     if config_path.exists() {
         let raw = std::fs::read_to_string(config_path)?;
@@ -670,10 +684,14 @@ pub fn load_config() -> Result<(ServerConfig, std::path::PathBuf), Box<dyn std::
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        Ok((config, dir))
+        Ok((config, dir, content))
     } else {
         tracing::info!("No config file found, using defaults");
-        Ok((ServerConfig::default(), std::path::PathBuf::from(".")))
+        Ok((
+            ServerConfig::default(),
+            std::path::PathBuf::from("."),
+            "# no config/cqserver.toml found; running with defaults\n".to_string(),
+        ))
     }
 }
 

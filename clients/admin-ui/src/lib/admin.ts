@@ -92,14 +92,20 @@ export interface QueueInfo {
 
 export interface ReplicationStatus {
   role: 'standalone' | 'primary' | 'standby';
-  peer?: string;
-  listen?: string;
+  peer?: string | null;
+  listen?: string | null;
   topics?: Array<{
     topic: string;
-    shippedMaxSequence?: number;
-    appliedMaxSequence?: number;
-    ackedMaxSequence?: number;
+    current_sequence?: number;
   }>;
+}
+
+export interface ViewInfo {
+  name: string;
+  source: string;
+  sql: string;
+  initial_capacity: number;
+  tap_capacity: number;
 }
 
 export interface ShardForResponse {
@@ -117,6 +123,8 @@ export const adminApi = {
   topics: () => get<TopicInfo[]>('/topics'),
   subscriptions: () => get<SubscriptionInfo[]>('/subscriptions'),
   queues: () => get<QueueInfo[]>('/queues'),
+  views: () => get<ViewInfo[]>('/admin/views'),
+  configToml: () => getText('/admin/config'),
   metricsText: () => getText('/metrics'),
   replication: () => get<ReplicationStatus>('/admin/replication'),
   shardFor: (topic: string) =>

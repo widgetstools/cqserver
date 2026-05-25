@@ -44,6 +44,24 @@ pub struct AdminState {
     /// matches. Allows clients to confirm "yes this node owns it"
     /// without a separate request.
     pub self_url: Arc<String>,
+    /// U5: view definitions from the config. Surfaced via
+    /// `/admin/views` so the admin UI can show name/source/SQL.
+    pub views: Arc<Vec<crate::config::ViewEntry>>,
+    /// U5: replication role + peer/listen — captured at startup so
+    /// `/admin/replication` can show the topology without re-reading
+    /// the config file.
+    pub replication: Arc<ReplicationView>,
+    /// U5: rendered config TOML (post env-var substitution). Served
+    /// verbatim by `/admin/config` for the Config screen.
+    pub raw_config_toml: Arc<String>,
+}
+
+/// Captured replication topology for `/admin/replication`.
+#[derive(Debug, Clone)]
+pub struct ReplicationView {
+    pub role: String, // "standalone" | "primary" | "standby"
+    pub peer: Option<String>,
+    pub listen: Option<String>,
 }
 
 pub async fn start_admin_server(
@@ -66,6 +84,8 @@ pub async fn start_admin_server(
         .route("/admin/shard-for/:topic", get(shard_for))
         .route("/admin/explain", post(explain_query))
         .route("/queues", get(get_queues))
+        .route("/admin/views", get(get_views))
+        .route("/admin/config", get(get_config_toml))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -283,8 +303,44 @@ async fn replication_status(State(s): State<AdminState>) -> impl IntoResponse {
         })
         .collect();
     Json(serde_json::json!({
+        "role": s.replication.role,
+        "peer": s.replication.peer,
+        "listen": s.replication.listen,
         "topics": topics,
     }))
+}
+
+/// U5: `GET /admin/views` — list every materialized view declared in
+/// `[[views]]`, with its source topic + SQL body + capacity. The
+/// admin UI's Views screen consumes this and shows the SQL on a
+/// detail tab.
+async fn get_views(State(s): State<AdminState>) -> impl IntoResponse {
+    let arr: Vec<serde_json::Value> = s
+        .views
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "name": v.name,
+                "source": v.source,
+                "sql": v.sql,
+                "initial_capacity": v.initial_capacity,
+                "tap_capacity": v.tap_capacity,
+            })
+        })
+        .collect();
+    Json(serde_json::Value::Array(arr))
+}
+
+/// U5: `GET /admin/config` — the running config's TOML text (with
+/// any `${VAR:-default}` substitutions already applied), so the admin
+/// UI's Config screen mirrors what the process actually loaded
+/// rather than the on-disk file.
+async fn get_config_toml(State(s): State<AdminState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        s.raw_config_toml.as_str().to_owned(),
+    )
 }
 
 /// H6: `GET /admin/shard-for/{topic}` — answer "which instance
@@ -445,6 +501,13 @@ mod tests {
             prom,
             shards: Arc::new(Vec::new()),
             self_url: Arc::new("ws://127.0.0.1:9000/cqp".to_string()),
+            views: Arc::new(Vec::new()),
+            replication: Arc::new(ReplicationView {
+                role: "standalone".into(),
+                peer: None,
+                listen: None,
+            }),
+            raw_config_toml: Arc::new(String::new()),
         };
         Router::new()
             .route("/healthz", get(healthz))
@@ -505,6 +568,13 @@ mod tests {
             prom,
             shards: Arc::new(shards),
             self_url: Arc::new(self_url.to_string()),
+            views: Arc::new(Vec::new()),
+            replication: Arc::new(ReplicationView {
+                role: "standalone".into(),
+                peer: None,
+                listen: None,
+            }),
+            raw_config_toml: Arc::new(String::new()),
         };
         Router::new()
             .route("/admin/shard-for/:topic", get(shard_for))

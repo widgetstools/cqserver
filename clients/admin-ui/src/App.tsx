@@ -7,6 +7,9 @@ import { OverviewPage } from '@/pages/OverviewPage';
 import { TopicsPage } from '@/pages/TopicsPage';
 import { SubscriptionsPage } from '@/pages/SubscriptionsPage';
 import { QueuesPage } from '@/pages/QueuesPage';
+import { ViewsPage } from '@/pages/ViewsPage';
+import { ReplicationPage } from '@/pages/ReplicationPage';
+import { ConfigPage } from '@/pages/ConfigPage';
 import { PlaceholderPage } from '@/pages/PlaceholderPage';
 
 const queryClient = new QueryClient({
@@ -33,26 +36,8 @@ export function App() {
                 <Route index element={<OverviewPage />} />
                 <Route path="/topics" element={<TopicsPage />} />
                 <Route path="/subscriptions" element={<SubscriptionsPage />} />
-                <Route
-                  path="/replication"
-                  element={
-                    <PlaceholderPage
-                      title="Replication"
-                      description="Leader / follower lag, replication topology, filters + transforms."
-                      worklogRef="U5"
-                    />
-                  }
-                />
-                <Route
-                  path="/views"
-                  element={
-                    <PlaceholderPage
-                      title="Views"
-                      description="Materialized continuous queries with source linkage."
-                      worklogRef="U5"
-                    />
-                  }
-                />
+                <Route path="/replication" element={<ReplicationPage />} />
+                <Route path="/views" element={<ViewsPage />} />
                 <Route path="/queues" element={<QueuesPage />} />
                 <Route
                   path="/metrics"
@@ -74,16 +59,7 @@ export function App() {
                     />
                   }
                 />
-                <Route
-                  path="/config"
-                  element={
-                    <PlaceholderPage
-                      title="Config"
-                      description="Read-only view of the running cqserver.toml."
-                      worklogRef="U5"
-                    />
-                  }
-                />
+                <Route path="/config" element={<ConfigPage />} />
                 <Route path="*" element={<Navigate to="/" replace />} />
               </Route>
             </Routes>

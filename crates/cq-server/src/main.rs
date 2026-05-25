@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sink installation. Bootstrapping issue: before logging is up,
     // we can't surface errors via tracing — `load_config` returns
     // them straight to stderr via the `?` operator instead.
-    let (server_config, config_dir) = config::load_config()?;
+    let (server_config, config_dir, raw_config_toml) = config::load_config_with_raw()?;
 
     // Install tracing sinks from `[logging]`. Errors opening
     // individual sink files are returned so we can warn about them
@@ -279,6 +279,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         prom: prom_handle,
         shards: Arc::new(server_config.shards.clone()),
         self_url: Arc::new(self_url),
+        views: Arc::new(server_config.views.clone()),
+        replication: Arc::new(admin::ReplicationView {
+            role: match server_config.replication.role {
+                ReplicationRole::Standalone => "standalone".into(),
+                ReplicationRole::Primary => "primary".into(),
+                ReplicationRole::Standby => "standby".into(),
+            },
+            peer: server_config.replication.peer.clone(),
+            listen: server_config.replication.listen.clone(),
+        }),
+        raw_config_toml: Arc::new(raw_config_toml),
     };
     let admin_addr = server_config.admin_addr.clone();
 
