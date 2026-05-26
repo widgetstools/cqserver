@@ -237,9 +237,14 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 - E2E `crates/cq-e2e-tests/tests/parser_window_fns.rs` runs ROW_NUMBER + LAG(px,1) + LEAD(px,1) in one wire SOW, asserts ranks + prev/next values for both AAPL (3 rows) and MSFT (2 rows) partitions; edge rows surface `null` for the missing lag/lead.
 **Out of scope:** continuous-window subscriptions (window values update as the source SOW changes) — single SELECT-time evaluation only. Windowed aggregates (`SUM(x) OVER (...)`, `COUNT(*) OVER (...)`) — folds into a future session.
 
-## Q8 — CTEs (WITH x AS …) *(§1.8 row 4)*
-**Status:** ⏳
-**Scope:** Non-recursive CTEs only. Parser collects the named subqueries and inlines each reference at compile time (effectively a macro expansion); recursive CTEs are out of scope.
+## Q8 — CTEs (WITH x AS …) — alias-substitution MVP *(§1.8 row 4)*
+**Status:** ✅ done (MVP — simple SELECT * CTEs; complex CTEs need Q9)
+**Scope:** Non-recursive CTEs whose body is `SELECT * FROM topic [WHERE filter]`. The alias substitutes to the real topic name in the main FROM; the CTE's WHERE filter is AND'd into the main WHERE. Multiple CTEs allowed. RECURSIVE rejected at parse time.
+**Implementation:** New `inline_ctes()` helper runs before the P1 alias-rewrite pass. Walks `query.with.cte_tables`, validates each CTE matches the simple shape, builds a `cte_name → (source_topic, optional_filter)` map, then rewrites every FROM/JOIN reference in the main SELECT.
+**Tests landed:**
+- 3 unit tests in `query::tests::{parses_simple_cte_alias, cte_with_filter_pushes_into_main_where, recursive_cte_is_rejected}`.
+- E2E `crates/cq-e2e-tests/tests/parser_cte.rs` — `WITH rates_trades AS (SELECT * FROM t WHERE desk = 'RATES') SELECT … FROM rates_trades WHERE price > 200` over the wire.
+**Out of scope (rejected with a clear error):** CTEs with projection, GROUP BY, JOIN, ORDER BY, LIMIT, or nested CTEs — those need real sub-query materialisation, which is the Q9 follow-up. The current message tells callers to write the query directly until Q9 lands.
 
 ## Q9 — Subqueries: WHERE col IN (SELECT …), EXISTS, scalar subqueries *(§1.8 rows 1–3)*
 **Status:** ⏳

@@ -576,20 +576,140 @@ pub fn parse_query(sql: &str, schema: &Schema) -> Result<ParsedQuery, QueryError
     let statement = &ast[0];
     match statement {
         Statement::Query(query) => {
-            // P1 — alias-rewrite pass. We clone the AST so we can
-            // mutate `Expr::CompoundIdentifier([alias_or_topic, col])`
-            // → `Expr::Identifier(col)` for every alias/topic ref we
-            // saw in the FROM clause. Downstream code (predicate
-            // compile, projection lookup, ORDER BY, GROUP BY) then
-            // sees unqualified column refs and resolves them against
-            // the (already-combined-for-JOIN) `schema`.
+            // Q8 — non-recursive CTE inlining. Collect named
+            // subqueries from `WITH x AS (...), y AS (...)`, then
+            // inline references in the main FROM. RECURSIVE is
+            // rejected up-front.
             let mut q = (**query).clone();
+            if let Some(with) = q.with.take() {
+                if with.recursive {
+                    return Err(QueryError::ParseError(
+                        "RECURSIVE CTEs are not supported".into(),
+                    ));
+                }
+                inline_ctes(&mut q, &with.cte_tables)?;
+            }
+            // P1 — alias-rewrite pass.
             let refs = collect_table_refs(&q);
             rewrite_qualified_refs_in_query(&mut q, &refs);
             parse_select(&q, schema)
         }
         _ => Err(QueryError::ParseError("Only SELECT statements supported".into())),
     }
+}
+
+/// Q8 — inline each CTE reference in the main query. The MVP
+/// supports the common case where each CTE is
+/// `SELECT * FROM topic [WHERE filter]`. The CTE's source topic
+/// replaces references to its alias, and the CTE's WHERE filter
+/// is AND'd into the main WHERE.
+///
+/// Rejects CTEs with their own projections, GROUP BY, JOIN,
+/// ORDER BY, etc. — those would need full sub-query materialisation
+/// which is the Q9 follow-up. The reject message points the user
+/// at writing the query directly until that lands.
+fn inline_ctes(
+    main: &mut sqlparser::ast::Query,
+    ctes: &[sqlparser::ast::Cte],
+) -> Result<(), QueryError> {
+    use sqlparser::ast::{Expr, SetExpr, TableFactor};
+    let mut cte_map: HashMap<String, (String, Option<Expr>)> = HashMap::new();
+    for cte in ctes {
+        let alias = cte.alias.name.value.clone();
+        let inner = cte.query.body.as_ref();
+        let inner_select = match inner {
+            SetExpr::Select(s) => s,
+            _ => {
+                return Err(QueryError::ParseError(format!(
+                    "CTE `{alias}` body must be a SELECT (set ops + VALUES not supported)"
+                )));
+            }
+        };
+        // The CTE's inner SELECT must be a simple SELECT * FROM topic
+        // [WHERE …]; no projection, no GROUP BY, no JOIN, no nested
+        // FROM, no ORDER BY, no LIMIT.
+        let inner_select_items_ok = inner_select.projection.len() == 1
+            && matches!(
+                &inner_select.projection[0],
+                sqlparser::ast::SelectItem::Wildcard(_)
+            );
+        if !inner_select_items_ok
+            || !matches!(&inner_select.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty())
+            || inner_select.having.is_some()
+            || inner_select.from.len() != 1
+            || !inner_select.from[0].joins.is_empty()
+            || cte.query.order_by.is_some()
+            || cte.query.limit_clause.is_some()
+        {
+            return Err(QueryError::ParseError(format!(
+                "CTE `{alias}` must be a simple `SELECT * FROM topic [WHERE ...]`; \
+                 complex CTEs not supported (write the query directly)"
+            )));
+        }
+        let inner_topic = match &inner_select.from[0].relation {
+            TableFactor::Table { name, .. } => strip_identifier_quotes(&name.to_string()),
+            _ => {
+                return Err(QueryError::ParseError(format!(
+                    "CTE `{alias}` FROM must be a plain topic name"
+                )))
+            }
+        };
+        let inner_where = inner_select.selection.clone();
+        cte_map.insert(alias, (inner_topic, inner_where));
+    }
+    // Now rewrite the main query: any FROM table whose name is a
+    // CTE key becomes the CTE's source; the CTE's WHERE gets AND'd
+    // into the main WHERE.
+    if let SetExpr::Select(select) = main.body.as_mut() {
+        let mut extra_filters: Vec<Expr> = Vec::new();
+        for from in &mut select.from {
+            if let TableFactor::Table { name, .. } = &mut from.relation {
+                let plain = strip_identifier_quotes(&name.to_string());
+                if let Some((source, filter)) = cte_map.get(&plain) {
+                    *name = sqlparser::ast::ObjectName::from(vec![
+                        sqlparser::ast::Ident::new(source.clone()),
+                    ]);
+                    if let Some(f) = filter.clone() {
+                        extra_filters.push(f);
+                    }
+                }
+            }
+            // JOIN right-side may also be a CTE.
+            for join in &mut from.joins {
+                if let TableFactor::Table { name, .. } = &mut join.relation {
+                    let plain = strip_identifier_quotes(&name.to_string());
+                    if let Some((source, filter)) = cte_map.get(&plain) {
+                        *name = sqlparser::ast::ObjectName::from(vec![
+                            sqlparser::ast::Ident::new(source.clone()),
+                        ]);
+                        if let Some(f) = filter.clone() {
+                            extra_filters.push(f);
+                        }
+                    }
+                }
+            }
+        }
+        // Fold the collected CTE WHEREs into the main WHERE.
+        if !extra_filters.is_empty() {
+            let combined = extra_filters
+                .into_iter()
+                .reduce(|acc, e| Expr::BinaryOp {
+                    left: Box::new(acc),
+                    op: sqlparser::ast::BinaryOperator::And,
+                    right: Box::new(e),
+                })
+                .unwrap();
+            select.selection = match select.selection.take() {
+                Some(existing) => Some(Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: sqlparser::ast::BinaryOperator::And,
+                    right: Box::new(combined),
+                }),
+                None => Some(combined),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// P1 — collect every name that can legally appear as the left side
@@ -3954,6 +4074,56 @@ mod tests {
 
     // (Was `parse_join_rejects_left_outer_for_now` — superseded by
     // P12 which accepts LEFT OUTER JOIN. See the P12 tests below.)
+
+    // ───── Q8 — CTEs (WITH x AS …) ───────────────────────────────────
+
+    #[test]
+    fn parses_simple_cte_alias() {
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "WITH p AS (SELECT * FROM trades) \
+             SELECT symbol FROM p WHERE price > 200",
+            &schema,
+        )
+        .expect("CTE alias must parse");
+        // The CTE alias `p` should resolve to `trades` semantically;
+        // execution against the trades store must return the same
+        // rows as the un-CTE'd query.
+        let r = execute_query(&q, &store);
+        let plain = parse_query(
+            "SELECT symbol FROM trades WHERE price > 200",
+            &schema,
+        )
+        .unwrap();
+        let p = execute_query(&plain, &store);
+        assert_eq!(r.rows.len(), p.rows.len());
+    }
+
+    #[test]
+    fn cte_with_filter_pushes_into_main_where() {
+        let (schema, store) = make_store();
+        // RATES desk has AAPL (150) and GOOGL (2800). Main filter
+        // `price > 200` keeps GOOGL only.
+        let q = parse_query(
+            "WITH rates_trades AS (SELECT * FROM trades WHERE desk = 'RATES') \
+             SELECT symbol FROM rates_trades WHERE price > 200",
+            &schema,
+        )
+        .expect("CTE+filter must parse");
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "GOOGL");
+    }
+
+    #[test]
+    fn recursive_cte_is_rejected() {
+        let (schema, _) = make_store();
+        let r = parse_query(
+            "WITH RECURSIVE r AS (SELECT * FROM trades) SELECT * FROM r",
+            &schema,
+        );
+        assert!(r.is_err(), "RECURSIVE CTEs must be rejected");
+    }
 
     // ───── Q7 — window functions ─────────────────────────────────────
 
