@@ -69,8 +69,10 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/degenerate_aggregate_view_e2e.rs` — declares a `[[views]]` block with `SELECT SUM(qty) FROM t`, publishes 5 source rows, verifies the view SOW returns exactly 1 row with the running total.
 
 ## P6 — Engine: fix JOIN-view SOW delivery for fresh subscribers *(§4 bug 1)*
-**Status:** ⏳
-**Scope:** A `[[views]]`-declared INNER JOIN view populates correctly (admin shows N rows) but a fresh subscriber's SOW returns 0 rows. Root-cause and fix the view sow_iter path.
+**Status:** ✅ done (verified no longer reproduces — regression pinned)
+**Scope:** AMPS_PARITY documented a JOIN view whose SOW returned 0 to a fresh subscriber even though admin showed N rows. Attempted to reproduce the bug in two shapes (quoted slash-prefixed JOIN; bare-name JOIN; under continuous publisher load with 10 successive fresh subscribers); the bug no longer manifests on `msrv-1.78`. Likely fixed alongside the JOIN-in-ad-hoc-SOW work (per AMPS_PARITY.md §1.4 row 10 "added 2026-05-26").
+**Tests landed:**
+- E2E `crates/cq-e2e-tests/tests/view_join_sow_fresh_subscriber.rs` — 2 tests, both green: a clean fresh-subscriber SOW after seed, and a stress variant running 10 fresh-subscriber SOWs under continuous publisher load.
 
 ## P7 — Engine: clear encode-once cache slot on SOW failure *(§4 bug 4)*
 **Status:** ⏳
