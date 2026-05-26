@@ -123,9 +123,13 @@ Per AMPS_PARITY.md §5 honest assessment:
 - 3 unit tests in `query::tests::{parse_left_outer_join_using_succeeds, parse_left_outer_join_on_equi, left_outer_join_emits_nulls_for_unmatched_left_rows}`.
 - E2E `crates/cq-e2e-tests/tests/parser_left_outer_join.rs` runs INNER + LEFT OUTER on the same two-topic fixture; LEFT OUTER keeps the unmatched left row with `sector: null`.
 
-## P13 — WHERE: regex match (MATCHES_REGEX / LIKE_REGEX) *(§1.2 row 7)*
-**Status:** ⏳
-**Scope:** `regex` crate; compile pattern at parse time; reject bad patterns there, not at row eval.
+## P13 — WHERE: regex match (MATCHES_REGEX) *(§1.2 row 7)*
+**Status:** ✅ done
+**Scope:** `WHERE MATCHES_REGEX(col, '<pattern>')` filters rows whose `col` value matches the regex. Pattern is compiled at parse time so an invalid pattern surfaces as a clean server error (not a row-eval crash). Uses the `regex` crate (already a `cq-core` dependency for LIKE).
+**Implementation:** New `CompiledPredicate::Regex { col, pattern }` variant; new `Expr::Function` arm in `compile_expr` that recognises the `MATCHES_REGEX` function call, validates arity, and pre-compiles the pattern. Variant also added to `referenced_columns` so the predicate-index path stays correct. (LIKE_REGEX operator syntax is deferred — the function-call form is universally supported by sqlparser.)
+**Tests landed:**
+- 4 unit tests in `predicate::tests::{parses_matches_regex, matches_regex_filters_rows, matches_regex_invalid_pattern_errors_at_parse, matches_regex_combined_with_and}`.
+- E2E `crates/cq-e2e-tests/tests/parser_matches_regex.rs` runs a regex filter over a 5-symbol fixture and verifies invalid patterns surface as `ClientError::Server`.
 
 ## P14 — Topic registry: normalise slash-prefix *(§4 bug 5)*
 **Status:** ⏳

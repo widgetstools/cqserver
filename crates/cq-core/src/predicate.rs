@@ -100,7 +100,38 @@ pub enum CompiledPredicate {
         col: usize,
         values: std::collections::HashSet<u64>,
     },
+    /// `flag IN (true, false)` — Bool columns. With only two non-null
+    /// values, the set is at most {true, false}, but we keep it as a
+    /// HashSet so the matcher stays uniform with the other `In*` arms.
+    InBool {
+        col: usize,
+        values: HashSet<bool>,
+    },
+    /// `flag = true` — exact boolean equality.
+    EqBool { col: usize, value: bool },
+    /// `flag != true` — boolean inequality. SQL three-valued logic:
+    /// NULL booleans never match either side.
+    NeqBool { col: usize, value: bool },
+
+    /// Timestamp ops. `value` is i64 microseconds since UNIX epoch —
+    /// the wire form (RFC 3339 string) is parsed at compile time.
+    /// Null timestamps (= i64::MIN) never compare equal/less/greater.
+    EqTimestamp { col: usize, value: i64 },
+    NeqTimestamp { col: usize, value: i64 },
+    LtTimestamp { col: usize, value: i64 },
+    LeTimestamp { col: usize, value: i64 },
+    GtTimestamp { col: usize, value: i64 },
+    GeTimestamp { col: usize, value: i64 },
+    BetweenTimestamp { col: usize, low: i64, high: i64 },
+    InTimestamp { col: usize, values: HashSet<i64> },
     Like {
+        col: usize,
+        pattern: regex::Regex,
+    },
+    /// P13 — `MATCHES_REGEX(col, '<pattern>')`. The pattern is
+    /// compiled at parse time so an invalid pattern is rejected as
+    /// a `PredicateError::InvalidPattern` before any row is read.
+    Regex {
         col: usize,
         pattern: regex::Regex,
     },
@@ -211,7 +242,19 @@ impl CompiledPredicate {
             | InString { col, .. }
             | InLong { col, .. }
             | InDouble { col, .. }
+            | InBool { col, .. }
+            | EqBool { col, .. }
+            | NeqBool { col, .. }
+            | EqTimestamp { col, .. }
+            | NeqTimestamp { col, .. }
+            | LtTimestamp { col, .. }
+            | LeTimestamp { col, .. }
+            | GtTimestamp { col, .. }
+            | GeTimestamp { col, .. }
+            | BetweenTimestamp { col, .. }
+            | InTimestamp { col, .. }
             | Like { col, .. }
+            | Regex { col, .. }
             | EqStringFn { col, .. }
             | NeqStringFn { col, .. }
             | LikeStringFn { col, .. }
@@ -445,7 +488,60 @@ impl CompiledPredicate {
                 }
                 values.contains(&v.to_bits())
             }
+            CompiledPredicate::InBool { col, values } => {
+                match store.get_bool(*col, row) {
+                    Some(b) => values.contains(&b),
+                    None => false, // NULL bool — SQL IN returns UNKNOWN.
+                }
+            }
+            CompiledPredicate::EqBool { col, value } => {
+                store.get_bool(*col, row).map_or(false, |b| b == *value)
+            }
+            CompiledPredicate::NeqBool { col, value } => {
+                // SQL three-valued logic: NULL != anything is UNKNOWN.
+                store.get_bool(*col, row).map_or(false, |b| b != *value)
+            }
+            CompiledPredicate::EqTimestamp { col, value } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v == *value
+            }
+            CompiledPredicate::NeqTimestamp { col, value } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v != *value
+            }
+            CompiledPredicate::LtTimestamp { col, value } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v < *value
+            }
+            CompiledPredicate::LeTimestamp { col, value } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v <= *value
+            }
+            CompiledPredicate::GtTimestamp { col, value } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v > *value
+            }
+            CompiledPredicate::GeTimestamp { col, value } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v >= *value
+            }
+            CompiledPredicate::BetweenTimestamp { col, low, high } => {
+                let v = store.get_timestamp(*col, row);
+                v != crate::store::NULL_TIMESTAMP && v >= *low && v <= *high
+            }
+            CompiledPredicate::InTimestamp { col, values } => {
+                let v = store.get_timestamp(*col, row);
+                if v == crate::store::NULL_TIMESTAMP {
+                    return false;
+                }
+                values.contains(&v)
+            }
             CompiledPredicate::Like { col, pattern } => {
+                store.get_string(*col, row).map_or(false, |s| pattern.is_match(s))
+            }
+            CompiledPredicate::Regex { col, pattern } => {
+                // P13 — MATCHES_REGEX uses the regex directly (no
+                // LIKE-style `%` / `_` mapping).
                 store.get_string(*col, row).map_or(false, |s| pattern.is_match(s))
             }
 
@@ -491,6 +587,10 @@ impl CompiledPredicate {
                     ColumnType::Long => store.get_long(*col, row) == NULL_LONG,
                     ColumnType::Int => store.get_int(*col, row) == NULL_INT,
                     ColumnType::String => store.get_string(*col, row).is_none(),
+                    ColumnType::Bool => store.get_bool(*col, row).is_none(),
+                    ColumnType::Timestamp => {
+                        store.get_timestamp(*col, row) == crate::store::NULL_TIMESTAMP
+                    }
                 }
             }
             CompiledPredicate::IsNotNull { col } => {
@@ -500,6 +600,10 @@ impl CompiledPredicate {
                     ColumnType::Long => store.get_long(*col, row) != NULL_LONG,
                     ColumnType::Int => store.get_int(*col, row) != NULL_INT,
                     ColumnType::String => store.get_string(*col, row).is_some(),
+                    ColumnType::Bool => store.get_bool(*col, row).is_some(),
+                    ColumnType::Timestamp => {
+                        store.get_timestamp(*col, row) != crate::store::NULL_TIMESTAMP
+                    }
                 }
             }
 
@@ -738,6 +842,22 @@ pub fn compile_expr(
                         .collect::<Result<_, _>>()?;
                     CompiledPredicate::InDouble { col, values }
                 }
+                ColumnType::Bool => {
+                    // Convert each literal to a bool so `flag IN (true, false)`
+                    // works without surfacing string-vs-bool type mismatch.
+                    let values: HashSet<bool> = list
+                        .iter()
+                        .map(extract_bool)
+                        .collect::<Result<_, _>>()?;
+                    CompiledPredicate::InBool { col, values }
+                }
+                ColumnType::Timestamp => {
+                    let values: HashSet<i64> = list
+                        .iter()
+                        .map(extract_timestamp)
+                        .collect::<Result<_, _>>()?;
+                    CompiledPredicate::InTimestamp { col, values }
+                }
             };
             if *negated {
                 Ok(CompiledPredicate::Not(Box::new(pred)))
@@ -765,6 +885,11 @@ pub fn compile_expr(
                     low: extract_i64(low)?,
                     high: extract_i64(high)?,
                 },
+                ColumnType::Timestamp => CompiledPredicate::BetweenTimestamp {
+                    col,
+                    low: extract_timestamp(low)?,
+                    high: extract_timestamp(high)?,
+                },
                 _ => return Err(PredicateError::TypeMismatch("BETWEEN on string column".into())),
             };
             if *negated {
@@ -775,6 +900,52 @@ pub fn compile_expr(
         }
 
         Expr::Nested(inner) => compile_expr(inner, schema),
+
+        // P13 — MATCHES_REGEX(col, '<pattern>').
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_uppercase();
+            if name != "MATCHES_REGEX" {
+                return Err(PredicateError::UnsupportedExpression(format!(
+                    "function in WHERE position: {name}"
+                )));
+            }
+            let arg_list = match &f.args {
+                sqlparser::ast::FunctionArguments::List(l) => l,
+                _ => {
+                    return Err(PredicateError::UnsupportedExpression(
+                        "MATCHES_REGEX requires (col, pattern) arguments".into(),
+                    ))
+                }
+            };
+            if arg_list.args.len() != 2 {
+                return Err(PredicateError::UnsupportedExpression(format!(
+                    "MATCHES_REGEX expects 2 arguments (col, pattern), got {}",
+                    arg_list.args.len()
+                )));
+            }
+            use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+            let col_expr = match &arg_list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                other => {
+                    return Err(PredicateError::UnsupportedExpression(format!(
+                        "MATCHES_REGEX: first arg must be a column ref, got {other:?}"
+                    )))
+                }
+            };
+            let pat_expr = match &arg_list.args[1] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                other => {
+                    return Err(PredicateError::UnsupportedExpression(format!(
+                        "MATCHES_REGEX: second arg must be a string literal, got {other:?}"
+                    )))
+                }
+            };
+            let col = resolve_column(col_expr, schema)?;
+            let pat_str = extract_string_value(pat_expr)?;
+            let pattern = regex::Regex::new(&pat_str)
+                .map_err(|e| PredicateError::InvalidPattern(e.to_string()))?;
+            Ok(CompiledPredicate::Regex { col, pattern })
+        }
 
         _ => Err(PredicateError::UnsupportedExpression(format!("{:?}", expr))),
     }
@@ -914,6 +1085,28 @@ fn compile_comparison(
                 _ => return Err(PredicateError::TypeMismatch(
                     format!("{:?} not supported on string columns", op),
                 )),
+            })
+        }
+        ColumnType::Bool => {
+            let value = extract_bool(right)?;
+            Ok(match op {
+                BinaryOperator::Eq => CompiledPredicate::EqBool { col, value },
+                BinaryOperator::NotEq => CompiledPredicate::NeqBool { col, value },
+                _ => return Err(PredicateError::TypeMismatch(
+                    format!("{:?} not supported on bool columns", op),
+                )),
+            })
+        }
+        ColumnType::Timestamp => {
+            let value = extract_timestamp(right)?;
+            Ok(match op {
+                BinaryOperator::Eq => CompiledPredicate::EqTimestamp { col, value },
+                BinaryOperator::NotEq => CompiledPredicate::NeqTimestamp { col, value },
+                BinaryOperator::Lt => CompiledPredicate::LtTimestamp { col, value },
+                BinaryOperator::LtEq => CompiledPredicate::LeTimestamp { col, value },
+                BinaryOperator::Gt => CompiledPredicate::GtTimestamp { col, value },
+                BinaryOperator::GtEq => CompiledPredicate::GeTimestamp { col, value },
+                _ => unreachable!(),
             })
         }
     }
@@ -1210,6 +1403,55 @@ pub(crate) fn extract_i64(expr: &sqlparser::ast::Expr) -> Result<i64, PredicateE
         .map_err(|_| PredicateError::InvalidLiteral(format!("Cannot parse '{}' as i64", s)))
 }
 
+/// Extract a Timestamp literal (i64 microseconds since UNIX epoch)
+/// from a SQL expression. Accepts:
+///   * Numeric literals — passed through `parse_timestamp_json` so
+///     epoch seconds / ms / μs all work by magnitude detection.
+///   * String literals — parsed as RFC 3339 / ISO 8601 with optional
+///     timezone, naive datetimes (treated UTC), or date-only.
+/// Returns `InvalidLiteral` on a parse failure.
+pub(crate) fn extract_timestamp(expr: &sqlparser::ast::Expr) -> Result<i64, PredicateError> {
+    let s = extract_string_value(expr)?;
+    let json = serde_json::Value::String(s.clone());
+    let v = crate::store::parse_timestamp_json(&json);
+    if v == crate::store::NULL_TIMESTAMP {
+        // Try treating the literal as a number (epoch).
+        if let Ok(n) = s.parse::<i64>() {
+            let nj = serde_json::Value::from(n);
+            let parsed = crate::store::parse_timestamp_json(&nj);
+            if parsed != crate::store::NULL_TIMESTAMP {
+                return Ok(parsed);
+            }
+        }
+        return Err(PredicateError::InvalidLiteral(format!(
+            "Cannot parse '{}' as timestamp",
+            s
+        )));
+    }
+    Ok(v)
+}
+
+/// Extract a bool from a SQL literal. Accepts the native `Boolean`
+/// AST node as well as the canonical truthy/falsy strings + 0/1
+/// numbers — keeps filter writers from having to fight the parser
+/// when they say `mifid_flag = 'true'` instead of `mifid_flag = true`.
+pub(crate) fn extract_bool(expr: &sqlparser::ast::Expr) -> Result<bool, PredicateError> {
+    if let sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan { value, .. }) = expr {
+        if let sqlparser::ast::Value::Boolean(b) = value {
+            return Ok(*b);
+        }
+    }
+    let s = extract_string_value(expr)?;
+    match s.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" => Ok(true),
+        "false" | "0" | "no" | "n" => Ok(false),
+        _ => Err(PredicateError::InvalidLiteral(format!(
+            "Cannot parse '{}' as bool",
+            s
+        ))),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PredicateError {
     #[error("Unknown column: {0}")]
@@ -1231,8 +1473,72 @@ pub enum PredicateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::parse_query;
     use crate::store::Value;
     use std::sync::Arc;
+
+    // ───── P13 — MATCHES_REGEX ───────────────────────────────────────
+
+    #[test]
+    fn parses_matches_regex() {
+        let (schema, _) = make_store();
+        let q = parse_query(
+            "SELECT symbol FROM trades WHERE MATCHES_REGEX(symbol, '^A.*')",
+            &schema,
+        )
+        .expect("MATCHES_REGEX must parse");
+        assert!(matches!(
+            q.predicate,
+            CompiledPredicate::Regex { .. }
+        ));
+    }
+
+    #[test]
+    fn matches_regex_filters_rows() {
+        // Fixture: AAPL, MSFT, GOOGL.
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT symbol FROM trades WHERE MATCHES_REGEX(symbol, '^[AM].*')",
+            &schema,
+        )
+        .unwrap();
+        let r = crate::query::execute_query(&q, &store);
+        let syms: std::collections::HashSet<String> = r
+            .rows
+            .iter()
+            .map(|row| row.get("symbol").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert!(syms.contains("AAPL"));
+        assert!(syms.contains("MSFT"));
+        assert!(!syms.contains("GOOGL"));
+    }
+
+    #[test]
+    fn matches_regex_invalid_pattern_errors_at_parse() {
+        let (schema, _) = make_store();
+        // Unclosed character class.
+        let r = parse_query(
+            "SELECT symbol FROM trades WHERE MATCHES_REGEX(symbol, '[unclosed')",
+            &schema,
+        );
+        assert!(r.is_err(), "invalid regex must error at parse time");
+    }
+
+    #[test]
+    fn matches_regex_combined_with_and() {
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT symbol FROM trades \
+             WHERE MATCHES_REGEX(symbol, '^A.*') AND desk = 'RATES'",
+            &schema,
+        )
+        .unwrap();
+        let r = crate::query::execute_query(&q, &store);
+        // AAPL has desk RATES; no other A-prefixed symbols → only AAPL.
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "AAPL");
+    }
+
 
     fn make_store() -> (Arc<Schema>, ColumnStore) {
         let schema = Arc::new(Schema::from_strs(
