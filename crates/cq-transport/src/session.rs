@@ -691,6 +691,10 @@ pub struct Session {
     /// separate task and doesn't own the Session) can read the
     /// current setting without taking a lock.
     pub compression: Arc<std::sync::atomic::AtomicU8>,
+    /// Q4 — client-supplied connection name from logon. Echoed in
+    /// audit logs and surfaced via `/admin/clients`. Distinct from
+    /// `username` (auth identity) and `id` (per-connection auto-id).
+    pub client_name: Option<String>,
 }
 
 impl Session {
@@ -711,6 +715,7 @@ impl Session {
             compression: Arc::new(std::sync::atomic::AtomicU8::new(
                 compression_to_u8(cq_protocol::compression::DEFAULT_LEGACY_COMPRESSION),
             )),
+            client_name: None,
         }
     }
 

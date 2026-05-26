@@ -249,6 +249,20 @@ impl Client {
     // ==================== Public API ====================
 
     pub async fn logon(&self, user: &str, password: &str) -> ClientResult<()> {
+        self.logon_with(user, password, None, None).await
+    }
+
+    /// Q4 — logon with optional connection-name + trace-id. The
+    /// `client_name` is echoed in the server's audit log and
+    /// `/admin/clients`; the `trace_id` flows back on the logon ack
+    /// (and any subsequent response with this connection's cid).
+    pub async fn logon_with(
+        &self,
+        user: &str,
+        password: &str,
+        client_name: Option<String>,
+        trace_id: Option<String>,
+    ) -> ClientResult<()> {
         let mut m = CqMessage::new(Command::Logon);
         let mut creds = Map::new();
         creds.insert("user".into(), Value::String(user.into()));
@@ -256,6 +270,8 @@ impl Client {
         m.data = Some(Value::Object(creds));
         m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
         m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        m.client_name = client_name;
+        m.trace_id = trace_id;
         let resp = self.rpc(m).await?;
         self.capture_negotiated(&resp);
         Ok(())

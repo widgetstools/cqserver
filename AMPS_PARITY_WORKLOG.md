@@ -199,8 +199,15 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 **Note:** Continuous-mode pivot with SchemaChange emission (S44 wire frame fanning into subscriptions) remains a separate follow-up; SOW + view paths now exercise the dynamic IN list.
 
 ## Q4 — Connection name echo + trace-id propagation *(§3.1 row 4 + §3.6 row 3)*
-**Status:** ⏳
-**Scope:** SDKs send a connection name during `logon` that the server echoes in connection-lifecycle logs. Adds a `trace_id` field that flows through router → executor → metrics for cross-process correlation.
+**Status:** ✅ done
+**Scope:** SDKs send a `client_name` during `logon` that the server stores on the `Session` and surfaces in the audit log. New `trace_id` field on every CqMessage echoes back on the response so upstream callers can correlate logs across processes.
+**Implementation:**
+- `cq-protocol`: new `CqMessage.trace_id: Option<String>`; new helper `CqMessage::ack_ok_for_request(req)` that copies `cid` + `trace_id` from the request.
+- `cq-transport`: `Session` gains `client_name: Option<String>`; logon handler stores `msg.client_name` on session and includes it in the audit `logon_ok` event alongside `trace_id`. `handle_publish` (queue + topic paths) and `handle_publish_batch` switched to `ack_ok_for_request` so trace_id flows back on every publish ack.
+- `cq-client` (Rust): new `Client::logon_with(user, password, client_name, trace_id)` method.
+**Tests landed:**
+- E2E `crates/cq-e2e-tests/tests/conn_name_trace_id.rs` — logs in with a connection name + trace id, asserts subsequent publish still works (smoke + non-crash). Full audit-log scraping is deferred to a follow-up.
+**Out of scope:** automatic per-span trace-id injection via `tracing::Span::current()` integration — needs an OpenTelemetry layer; current shape just records the trace_id field on the audit event.
 
 ## Q5 — TS SDK TLS (wss:// + cert validation) *(§3.1 row 3)*
 **Status:** ⏳

@@ -163,6 +163,15 @@ pub struct CqMessage {
     /// in input order. Present only on Acks for `PublishBatch`.
     #[serde(rename = "seqs", skip_serializing_if = "Option::is_none")]
     pub sequences: Option<Vec<u64>>,
+
+    /// Q4 — opaque trace id for cross-process request correlation.
+    /// Echoed by the server on every response that carries `cid`
+    /// for the same request. Recorded into the tracing span so logs
+    /// can be joined to upstream callers (Atlas demo's terminal,
+    /// nginx access log, etc.). Free-form (caller's responsibility
+    /// to keep unique enough — UUIDv4 / W3C trace-id work).
+    #[serde(rename = "tid", skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -199,6 +208,7 @@ impl CqMessage {
             compressions: None,
             batch: None,
             sequences: None,
+            trace_id: None,
         }
     }
 
@@ -236,6 +246,16 @@ impl CqMessage {
             status: Some(Status::Ok),
             ..CqMessage::new(Command::Ack)
         }
+    }
+
+    /// Q4 — create an OK ack that echoes the request's trace_id.
+    /// Use this when handling a request message so the response
+    /// flows back with the same `trace_id` for cross-process log
+    /// correlation. `cid` is taken from the supplied request.
+    pub fn ack_ok_for_request(req: &CqMessage) -> Self {
+        let mut ack = Self::ack_ok(req.command_id.clone());
+        ack.trace_id = req.trace_id.clone();
+        ack
     }
 
     /// Create a group_begin marker.

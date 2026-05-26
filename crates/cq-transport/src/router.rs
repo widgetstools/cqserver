@@ -719,12 +719,21 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
             // tracing-subscriber Registry can route it to the
             // dedicated audit sink (e.g., audit.log) while the same
             // session keeps its other events on the operational sink.
+            // Q4 — connection-name echo: store the client-supplied
+            // name on the session and surface it in the audit log
+            // so operators can correlate logs to publisher / consumer
+            // processes without grepping by IP.
+            if let Some(name) = msg.client_name.clone() {
+                session.client_name = Some(name);
+            }
             tracing::info!(
                 target: "cq_audit",
                 session = %session.id,
                 user = %matched.username,
+                client_name = ?session.client_name,
                 entitlements = matched.entitlements.len(),
                 protocol_version = negotiated,
+                trace_id = ?msg.trace_id,
                 event = "logon_ok",
                 "Logon ok"
             );
@@ -732,6 +741,7 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
             let mut ack = CqMessage::ack_ok(msg.command_id);
             ack.protocol_versions = Some(vec![negotiated]);
             ack.compressions = Some(vec![compression]);
+            ack.trace_id = msg.trace_id; // Q4 — echo trace-id back to caller
             let _ = session.send_message(&ack);
         }
         None => {
@@ -844,7 +854,7 @@ fn handle_publish_batch(session: &mut Session, msg: CqMessage, ctx: &RouterConte
         .increment(n);
     metrics::histogram!("cq_publish_batch_latency_us", "topic" => topic_name.clone())
         .record(elapsed_us);
-    let mut ack = CqMessage::ack_ok(msg.command_id);
+    let mut ack = CqMessage::ack_ok_for_request(&msg);
     ack.sequences = Some(seqs);
     let _ = session.send_message(&ack);
 }
@@ -907,7 +917,7 @@ fn handle_publish_inner(
         let elapsed_us = started.elapsed().as_micros() as f64;
         metrics::histogram!("cq_publish_latency_us", "topic" => topic_name.clone())
             .record(elapsed_us);
-        let mut ack = CqMessage::ack_ok(msg.command_id);
+        let mut ack = CqMessage::ack_ok_for_request(&msg);
         ack.sequence = Some(seq);
         let _ = session.send_message(&ack);
         return;
@@ -937,7 +947,7 @@ fn handle_publish_inner(
                 metrics::counter!(counter, "topic" => topic_name.clone()).increment(1);
                 metrics::histogram!("cq_publish_latency_us", "topic" => topic_name.clone())
                     .record(elapsed_us);
-                let mut ack = CqMessage::ack_ok(msg.command_id);
+                let mut ack = CqMessage::ack_ok_for_request(&msg);
                 ack.sequence = Some(seq);
                 let _ = session.send_message(&ack);
             }
