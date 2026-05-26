@@ -634,6 +634,67 @@ impl SubscriptionStats {
     }
 }
 
+/// Q6 — per-client stats aggregated across every subscription
+/// belonging to that session. Surfaces what `/admin/clients` needs
+/// without adding new counters to the hot path — every field comes
+/// from already-tracked atomics on `DeliveryRoute`.
+#[derive(Debug, Clone)]
+pub struct ClientStats {
+    pub session_id: String,
+    /// Logon-supplied connection name (Q4). `None` for anonymous
+    /// sessions or pre-logon connections.
+    pub client_name: Option<String>,
+    /// Number of active subscriptions for this session.
+    pub subscriptions: usize,
+    /// Sum of `dropped` counters across this session's subscriptions
+    /// (frames dropped due to slow-consumer back-pressure).
+    pub dropped_total: u64,
+    /// Highest delivered sequence across all this session's subs.
+    pub max_last_seq: u64,
+    /// Oldest subscription age in ms (proxy for connection age).
+    pub oldest_sub_age_ms: u64,
+    /// Sum of outbound queue depths — useful for spotting saturated
+    /// subscribers.
+    pub total_queue_depth: usize,
+}
+
+/// Q6 — produce one `ClientStats` per distinct session, by
+/// aggregating its subscription routes.
+pub fn collect_client_stats(registry: &SessionRegistry) -> Vec<ClientStats> {
+    use std::collections::HashMap;
+    let mut by_session: HashMap<String, ClientStats> = HashMap::new();
+    for entry in registry.iter() {
+        let r = entry.value();
+        let key = r.session_id.clone();
+        let e = by_session.entry(key.clone()).or_insert_with(|| ClientStats {
+            session_id: key,
+            client_name: r.client_name.clone(),
+            subscriptions: 0,
+            dropped_total: 0,
+            max_last_seq: 0,
+            oldest_sub_age_ms: 0,
+            total_queue_depth: 0,
+        });
+        if e.client_name.is_none() {
+            e.client_name = r.client_name.clone();
+        }
+        e.subscriptions += 1;
+        e.dropped_total += r.dropped_count();
+        let ls = r.last_seq.load(std::sync::atomic::Ordering::Relaxed);
+        if ls > e.max_last_seq {
+            e.max_last_seq = ls;
+        }
+        let age = r.age_ms();
+        if age > e.oldest_sub_age_ms {
+            e.oldest_sub_age_ms = age;
+        }
+        e.total_queue_depth += r.queue_depth();
+    }
+    let mut out: Vec<ClientStats> = by_session.into_values().collect();
+    out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    out
+}
+
 /// Iterate every active route and produce a snapshot of its stats.
 /// Cheap — just reads atomics and the mpsc capacity counters.
 pub fn collect_subscription_stats(registry: &SessionRegistry) -> Vec<SubscriptionStats> {

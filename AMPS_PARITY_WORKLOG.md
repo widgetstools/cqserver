@@ -219,8 +219,14 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 - 2 new Vitest tests in `test/client.test.ts`: `tls://` to the non-TLS port rejects at handshake (proves scheme wiring); malformed `tls://` URLs reject with a clear error.
 
 ## Q6 — Per-client metrics surface *(§3.6 row 1 — finish the "partial")*
-**Status:** ⏳
-**Scope:** Per-`session_id` (or `client_name` if set) counters for `frames_sent`, `frames_recv`, `publish_count`, `subscribe_count`, `bytes_out`, `bytes_in`. Exposed via `/admin/clients` and the existing Prometheus surface.
+**Status:** ✅ done
+**Scope:** New `/admin/clients` endpoint surfaces per-session stats aggregated across each session's `DeliveryRoute`s — no new hot-path counters; reuses the existing per-route atomics (`dropped`, `last_seq`, `queue_depth`, age). Each entry carries the logon-supplied `client_name` (Q4).
+**Implementation:**
+- `cq-transport`: new `ClientStats { session_id, client_name, subscriptions, dropped_total, max_last_seq, oldest_sub_age_ms, total_queue_depth }` + `collect_client_stats(registry)` aggregator. Subscribe handlers fall through `msg.client_name → session.client_name → session.username` so the route picks up the logon-time name even when the subscribe message doesn't carry it.
+- `cq-server`: new `/admin/clients` route returning JSON array of per-session stats.
+- Fixed an issue where `handle_logon`'s no-credentials (anonymous) branch silently dropped `msg.client_name` — captured early now so JWT / password / anonymous all populate `session.client_name`.
+**Tests landed:**
+- E2E `crates/cq-e2e-tests/tests/admin_clients.rs` — two clients (publisher + subscriber) each call `logon_with` carrying a `client_name`; `/admin/clients` returns an array with at least the subscriber's `clientName=subscriber-b` entry showing `subscriptions ≥ 1`.
 
 ## Q7 — Window functions: ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD *(§1.7)*
 **Status:** ⏳

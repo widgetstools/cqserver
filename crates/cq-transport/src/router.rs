@@ -587,6 +587,15 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
     };
     session.protocol_version = negotiated;
 
+    // Q4/Q6 — capture client_name early, regardless of which logon
+    // branch (anonymous / password / JWT) we end up taking. /admin/
+    // clients aggregates by session_id, so the name needs to land on
+    // the Session before the FIRST subscribe-induced DeliveryRoute
+    // copies it.
+    if let Some(name) = msg.client_name.clone() {
+        session.client_name = Some(name);
+    }
+
     // S27 — compression negotiation, same handshake shape. An empty
     // client list (or pre-S27 client) implies Compression::None,
     // preserving wire compatibility for older clients.
@@ -696,13 +705,18 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
             ));
             return;
         }
-        let mut ack = CqMessage::ack_ok(msg.command_id);
+        // Q4 — capture client_name + trace_id even when no auth is
+        // required, so anonymous-but-named clients still show up in
+        // /admin/clients.
+        let mut ack = CqMessage::ack_ok_for_request(&msg);
         ack.protocol_versions = Some(vec![negotiated]);
         ack.compressions = Some(vec![compression]);
         tracing::info!(
             session = %session.id,
+            client_name = ?session.client_name,
             protocol_version = negotiated,
             compression = ?compression,
+            trace_id = ?msg.trace_id,
             "Logon ok (no credentials, auth not required)"
         );
         metrics::counter!("cq_logon_total", "result" => "ok").increment(1);
@@ -719,13 +733,9 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
             // tracing-subscriber Registry can route it to the
             // dedicated audit sink (e.g., audit.log) while the same
             // session keeps its other events on the operational sink.
-            // Q4 — connection-name echo: store the client-supplied
-            // name on the session and surface it in the audit log
-            // so operators can correlate logs to publisher / consumer
-            // processes without grepping by IP.
-            if let Some(name) = msg.client_name.clone() {
-                session.client_name = Some(name);
-            }
+            // Q4 — client_name was already captured early in
+            // handle_logon (above the credentials branch); just
+            // surface it on the audit log.
             tracing::info!(
                 target: "cq_audit",
                 session = %session.id,
@@ -1235,7 +1245,9 @@ fn handle_sow_and_subscribe(
     // Bookmark path: replay txlog from `bookmark+1`, then go live. No
     // snapshot — the client is reconstructing from the delta stream.
     if let Some(bookmark) = resolved_bookmark {
-        let cname = msg.client_name.clone().or_else(|| session.username.clone());
+        let cname = msg.client_name.clone()
+                            .or_else(|| session.client_name.clone())
+                            .or_else(|| session.username.clone());
         handle_bookmark_subscribe(
             session,
             msg.command_id,
@@ -1286,7 +1298,9 @@ fn handle_sow_and_subscribe(
                         conflation_ms,
                         session.codec(),
                         session.id.clone(),
-                        msg.client_name.clone().or_else(|| session.username.clone()),
+                        msg.client_name.clone()
+                            .or_else(|| session.client_name.clone())
+                            .or_else(|| session.username.clone()),
                         Some(ctx.bookmark_store.clone()),
                         ctx.spillover.as_ref(),
                     ),
@@ -1631,7 +1645,9 @@ fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) 
                         conflation_ms,
                         session.codec(),
                         session.id.clone(),
-                        msg.client_name.clone().or_else(|| session.username.clone()),
+                        msg.client_name.clone()
+                            .or_else(|| session.client_name.clone())
+                            .or_else(|| session.username.clone()),
                         Some(ctx.bookmark_store.clone()),
                         ctx.spillover.as_ref(),
                     ),

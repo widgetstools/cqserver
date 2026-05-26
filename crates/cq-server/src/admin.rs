@@ -91,6 +91,7 @@ pub async fn start_admin_server(
         .route("/queues", get(get_queues))
         .route("/admin/views", get(get_views))
         .route("/admin/config", get(get_config_toml))
+        .route("/admin/clients", get(get_clients))
         .with_state(state);
 
     // U7: serve the admin-ui static bundle under /ui. Resolved
@@ -185,6 +186,28 @@ async fn get_stats(State(s): State<AdminState>) -> impl IntoResponse {
 async fn get_topics(State(s): State<AdminState>) -> impl IntoResponse {
     let topics: Vec<_> = s.topics.iter().map(|e| e.value().stats()).collect();
     Json(serde_json::Value::Array(topics))
+}
+
+/// Q6 — per-client stats aggregated across each session's
+/// subscriptions. Useful for spotting which connection is sinking
+/// the most data or which is most behind. Cheap (atomic reads).
+async fn get_clients(State(s): State<AdminState>) -> impl IntoResponse {
+    let stats = cq_transport::session::collect_client_stats(&s.registry);
+    let arr: Vec<serde_json::Value> = stats
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "sessionId": c.session_id,
+                "clientName": c.client_name,
+                "subscriptions": c.subscriptions,
+                "droppedTotal": c.dropped_total,
+                "maxLastSeq": c.max_last_seq,
+                "oldestSubAgeMs": c.oldest_sub_age_ms,
+                "totalQueueDepth": c.total_queue_depth,
+            })
+        })
+        .collect();
+    Json(serde_json::Value::Array(arr))
 }
 
 async fn get_subscriptions(State(s): State<AdminState>) -> impl IntoResponse {
