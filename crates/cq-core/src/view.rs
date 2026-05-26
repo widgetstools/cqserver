@@ -126,6 +126,11 @@ impl View {
                 // No-column MIN/MAX is rejected at parse time; the
                 // SUM(None) branch is similarly defensive.
                 (AggFn::Min, None) | (AggFn::Max, None) | (AggFn::Sum, None) => ColumnType::Long,
+                // P8 — STDDEV / VARIANCE always return Double.
+                (AggFn::Stddev, _)
+                | (AggFn::StddevSamp, _)
+                | (AggFn::Variance, _)
+                | (AggFn::VarianceSamp, _) => ColumnType::Double,
             };
             types.push(ty);
         }

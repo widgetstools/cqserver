@@ -83,9 +83,13 @@ Per AMPS_PARITY.md §5 honest assessment:
 **Tests landed:**
 - E2E `crates/cq-e2e-tests/tests/snapshot_cache_no_wedge.rs` — sends a failing SOW (`SELECT bogus_col FROM t`), then the SAME failing SOW again, then a valid SOW; all three complete in well under a second (previously the first hung for the 30s ack_timeout).
 
-## P8 — Aggregates: STDDEV / STDDEV_SAMP / VARIANCE *(§1.3 row 3)*
-**Status:** ⏳
-**Scope:** Welford-online accumulator with merge support for the incremental aggregator.
+## P8 — Aggregates: STDDEV / STDDEV_SAMP / VARIANCE / VAR_SAMP *(§1.3 row 3)*
+**Status:** ✅ done
+**Scope:** Welford-online accumulator. Supports `STDDEV` / `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE` / `VAR_POP`, `VAR_SAMP`. Sample stats return NULL for `count < 2`; population stats are defined at `count == 1`.
+**Implementation:** New `AggFn::{Stddev, StddevSamp, Variance, VarianceSamp}` variants + `AggState::Welford { count, mean, m2, kind: WelfordKind }` in `crates/cq-core/src/query.rs`. View schema derivation maps all 4 to `Double`.
+**Tests landed:**
+- 6 unit tests in `query::tests::{parses_stddev_variance_aggregates, stddev_population_matches_known_value, stddev_samp_matches_known_value, variance_matches_known_value, stddev_with_group_by, stddev_empty_input_returns_null}` against Wikipedia's canonical {2,4,4,4,5,5,7,9} fixture.
+- E2E `crates/cq-e2e-tests/tests/parser_stddev.rs` runs all 4 functions in one SOW against the same fixture, asserts the expected numeric values.
 
 ## P9 — Aggregates: PERCENTILE_CONT / MEDIAN *(§1.3 row 4)*
 **Status:** ⏳

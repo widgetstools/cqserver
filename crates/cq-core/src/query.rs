@@ -432,6 +432,14 @@ pub enum AggFn {
     Avg,
     Min,
     Max,
+    /// P8 — population standard deviation (`STDDEV` / `STDDEV_POP`).
+    Stddev,
+    /// P8 — sample standard deviation (`STDDEV_SAMP`).
+    StddevSamp,
+    /// P8 — population variance (`VARIANCE` / `VAR_POP`).
+    Variance,
+    /// P8 — sample variance (`VAR_SAMP`).
+    VarianceSamp,
 }
 
 impl AggFn {
@@ -442,6 +450,10 @@ impl AggFn {
             AggFn::Avg => "AVG",
             AggFn::Min => "MIN",
             AggFn::Max => "MAX",
+            AggFn::Stddev => "STDDEV",
+            AggFn::StddevSamp => "STDDEV_SAMP",
+            AggFn::Variance => "VARIANCE",
+            AggFn::VarianceSamp => "VAR_SAMP",
         }
     }
 }
@@ -1348,7 +1360,20 @@ fn extract_expr(item: &SelectItem) -> Option<&Expr> {
 fn is_aggregate_function_call(expr: &Expr) -> bool {
     if let Expr::Function(f) = expr {
         let name = f.name.to_string().to_ascii_uppercase();
-        matches!(name.as_str(), "SUM" | "COUNT" | "AVG" | "MIN" | "MAX")
+        matches!(
+            name.as_str(),
+            "SUM"
+                | "COUNT"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "STDDEV"
+                | "STDDEV_POP"
+                | "STDDEV_SAMP"
+                | "VARIANCE"
+                | "VAR_POP"
+                | "VAR_SAMP"
+        )
     } else {
         false
     }
@@ -1370,6 +1395,10 @@ fn parse_aggregate_call(
         "AVG" => AggFn::Avg,
         "MIN" => AggFn::Min,
         "MAX" => AggFn::Max,
+        "STDDEV" | "STDDEV_POP" => AggFn::Stddev,
+        "STDDEV_SAMP" => AggFn::StddevSamp,
+        "VARIANCE" | "VAR_POP" => AggFn::Variance,
+        "VAR_SAMP" => AggFn::VarianceSamp,
         _ => return Ok(None),
     };
 
@@ -1949,6 +1978,27 @@ pub enum AggState {
     MaxF(f64, bool),
     MinS(CompactString, bool),
     MaxS(CompactString, bool),
+    /// P8 — Welford-online accumulator. `kind` distinguishes whether
+    /// `finalize` returns population vs sample, stddev vs variance.
+    Welford {
+        count: u64,
+        mean: f64,
+        m2: f64,
+        kind: WelfordKind,
+    },
+}
+
+/// Which moment to return from a Welford state's `finalize`.
+#[derive(Debug, Clone, Copy)]
+pub enum WelfordKind {
+    /// `STDDEV` / `STDDEV_POP` — `sqrt(M2 / N)`.
+    StddevPop,
+    /// `STDDEV_SAMP` — `sqrt(M2 / (N - 1))`.
+    StddevSamp,
+    /// `VARIANCE` / `VAR_POP` — `M2 / N`.
+    VarPop,
+    /// `VAR_SAMP` — `M2 / (N - 1)`.
+    VarSamp,
 }
 
 impl AggState {
@@ -1978,6 +2028,21 @@ impl AggState {
             (AggFn::Max, Some(ColumnType::String)) => {
                 AggState::MaxS(CompactString::new(""), false)
             }
+            // P8 — Welford for stddev/variance flavours. The col_type
+            // is unused (we coerce via Value::as_f64), but we still
+            // require a numeric input column for parser validity.
+            (AggFn::Stddev, _) => AggState::Welford {
+                count: 0, mean: 0.0, m2: 0.0, kind: WelfordKind::StddevPop,
+            },
+            (AggFn::StddevSamp, _) => AggState::Welford {
+                count: 0, mean: 0.0, m2: 0.0, kind: WelfordKind::StddevSamp,
+            },
+            (AggFn::Variance, _) => AggState::Welford {
+                count: 0, mean: 0.0, m2: 0.0, kind: WelfordKind::VarPop,
+            },
+            (AggFn::VarianceSamp, _) => AggState::Welford {
+                count: 0, mean: 0.0, m2: 0.0, kind: WelfordKind::VarSamp,
+            },
             // SUM/MIN/MAX on a string column without a type-specific
             // variant (e.g. SUM(name)) — fall through to a sentinel
             // that ignores input so the executor doesn't panic. The
@@ -2081,6 +2146,17 @@ impl AggState {
                     }
                 }
             }
+            AggState::Welford { count, mean, m2, .. } => {
+                if let Some(val) = v {
+                    if let Some(x) = val.as_f64() {
+                        *count += 1;
+                        let delta = x - *mean;
+                        *mean += delta / *count as f64;
+                        let delta2 = x - *mean;
+                        *m2 += delta * delta2;
+                    }
+                }
+            }
         }
     }
 
@@ -2135,6 +2211,27 @@ impl AggState {
                 } else {
                     serde_json::Value::from(s.as_str())
                 }
+            }
+            AggState::Welford { count, m2, kind, .. } => {
+                if *count == 0 {
+                    return serde_json::Value::Null;
+                }
+                // Sample stats require N >= 2; population stats are
+                // defined at N == 1 (variance/stddev = 0).
+                let n = *count as f64;
+                let v = match kind {
+                    WelfordKind::VarPop => *m2 / n,
+                    WelfordKind::StddevPop => (*m2 / n).sqrt(),
+                    WelfordKind::VarSamp => {
+                        if *count < 2 { return serde_json::Value::Null; }
+                        *m2 / (n - 1.0)
+                    }
+                    WelfordKind::StddevSamp => {
+                        if *count < 2 { return serde_json::Value::Null; }
+                        (*m2 / (n - 1.0)).sqrt()
+                    }
+                };
+                serde_json::Value::from(v)
             }
         }
     }
@@ -3411,6 +3508,86 @@ mod tests {
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "NVDA");
         assert_eq!(r.rows[1].get("symbol").unwrap().as_str().unwrap(), "AAPL");
+    }
+
+    // ───── P8 — STDDEV / STDDEV_SAMP / VARIANCE ──────────────────────
+
+    fn make_numeric_store() -> (Arc<Schema>, ColumnStore) {
+        let schema = Arc::new(Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let mut store = ColumnStore::new(schema.clone(), 16);
+        // 2, 4, 4, 4, 5, 5, 7, 9 — Wikipedia's stddev example.
+        // Population variance = 4, population stddev = 2.
+        // Sample variance ≈ 32/7 ≈ 4.571..., sample stddev ≈ 2.138...
+        for v in &[2.0_f64, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+            store.append_row(&[
+                Value::String(Some(CompactString::new("g"))),
+                Value::Double(*v),
+            ]);
+        }
+        (schema, store)
+    }
+
+    #[test]
+    fn parses_stddev_variance_aggregates() {
+        let (schema, _) = make_numeric_store();
+        for name in &["STDDEV", "STDDEV_SAMP", "VARIANCE", "VAR_SAMP"] {
+            let sql = format!("SELECT {name}(v) AS s FROM t");
+            let q = parse_query(&sql, &schema).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(q.aggregates.len(), 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn stddev_population_matches_known_value() {
+        let (schema, store) = make_numeric_store();
+        let q = parse_query("SELECT STDDEV(v) AS s FROM t", &schema).unwrap();
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 1);
+        let s = r.rows[0].get("s").and_then(|v| v.as_f64()).unwrap();
+        assert!((s - 2.0).abs() < 1e-9, "population stddev expected 2.0, got {s}");
+    }
+
+    #[test]
+    fn stddev_samp_matches_known_value() {
+        let (schema, store) = make_numeric_store();
+        let q = parse_query("SELECT STDDEV_SAMP(v) AS s FROM t", &schema).unwrap();
+        let r = execute_query(&q, &store);
+        let s = r.rows[0].get("s").and_then(|v| v.as_f64()).unwrap();
+        // sqrt(32/7) ≈ 2.1380899...
+        assert!((s - (32.0_f64 / 7.0).sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn variance_matches_known_value() {
+        let (schema, store) = make_numeric_store();
+        let q = parse_query("SELECT VARIANCE(v) AS v2 FROM t", &schema).unwrap();
+        let r = execute_query(&q, &store);
+        let v = r.rows[0].get("v2").and_then(|x| x.as_f64()).unwrap();
+        assert!((v - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stddev_with_group_by() {
+        let (schema, store) = make_numeric_store();
+        let q = parse_query("SELECT k, STDDEV(v) AS s FROM t GROUP BY k", &schema).unwrap();
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 1);
+        let s = r.rows[0].get("s").and_then(|x| x.as_f64()).unwrap();
+        assert!((s - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stddev_empty_input_returns_null() {
+        let s = Arc::new(Schema::from_strs(&["v"], &[ColumnType::Double]));
+        let store = ColumnStore::new(s.clone(), 8);
+        let q = parse_query("SELECT STDDEV(v) AS s FROM t", &s).unwrap();
+        let r = execute_query(&q, &store);
+        // ANSI: empty input → 1 row with NULL aggregate.
+        assert_eq!(r.rows.len(), 1);
+        assert!(r.rows[0].get("s").map(|v| v.is_null()).unwrap_or(false));
     }
 
     // ───── P3 — HAVING clause ───────────────────────────────────────
