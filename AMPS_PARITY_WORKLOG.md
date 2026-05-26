@@ -45,8 +45,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_select_arithmetic.rs` — `price * quantity AS notional` and `(price - quantity) / quantity AS pct_spread` against a running server.
 
 ## P3 — Parser: HAVING clause *(§1.3 row 7)*
-**Status:** ⏳
-**Scope:** `GROUP BY k HAVING SUM(v) > 100` — compile HAVING against `[group_cols, aggregate_aliases]` schema and evaluate after group finalise.
+**Status:** ✅ done
+**Scope:** `GROUP BY k HAVING SUM(v) > 100` — compile HAVING against `[group_cols, aggregate_aliases]` schema and evaluate after group finalise. Supports aggregate-function refs (`SUM(v)`), aggregate aliases (`total`), group-column refs (`desk`), boolean ops (`AND`/`OR`/`NOT`), and comparison ops.
+**Implementation:** `HavingExpr` enum + `compile_having` in `crates/cq-core/src/query.rs`. Reject HAVING when there is no GROUP BY / aggregate (matching AMPS). Executor evaluates after building each output row map and drops groups where it fails. The P1 alias-rewrite pass already strips qualified refs in HAVING.
+**Tests landed:**
+- 5 unit tests in `query::tests::{parses_having_*, having_*}` covering parse, alias vs function-call equivalence, AND-combined filter, group-column filter.
+- E2E `crates/cq-e2e-tests/tests/parser_having.rs` — `HAVING SUM(qty) > 50` against a real server, plus alias-form and AND-combined forms.
 
 ## P4 — Parser: OFFSET clause *(§1.5 row 6)*
 **Status:** ⏳

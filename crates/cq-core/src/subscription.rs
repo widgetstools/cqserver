@@ -1021,6 +1021,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         // Seed: row 0 is already in store and matches predicate.
         let sub = Subscription::new("s1".into(), query).into_sparse(vec![0]);
@@ -1061,6 +1062,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         engine.add(Subscription::new("s1".into(), query).into_sparse(vec![0]));
         engine.seed_active_set("s1", &store);
@@ -1102,6 +1104,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         engine.add(Subscription::new("s1".into(), query).into_sparse(vec![0]));
         engine.seed_active_set("s1", &store);
@@ -1140,6 +1143,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         engine.add(Subscription::new("s1".into(), query));
         engine.seed_active_set("s1", &store);
@@ -1180,6 +1184,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         let sub = Subscription::new("sub-1".into(), query);
         engine.add(sub);
@@ -1242,6 +1247,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         engine.add(Subscription::new("s".into(), query));
         engine.seed_active_set("s", &store);
@@ -1287,6 +1293,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         engine.add(Subscription::new("s".into(), query));
         engine.seed_active_set("s", &store);
@@ -1330,6 +1337,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         }
     }
 
@@ -1403,6 +1411,7 @@ mod tests {
             unpivot: None,
             join: None,
             computed: Vec::new(),
+            having: None,
         };
         engine.add(Subscription::new("s1".into(), query));
         engine.seed_active_set("s1", &store);

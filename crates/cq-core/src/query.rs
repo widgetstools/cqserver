@@ -66,6 +66,10 @@ pub struct ParsedQuery {
     /// with non-equi predicates, multi-table chained joins) are
     /// rejected at parse time and reserved for follow-ups.
     pub join: Option<JoinSpec>,
+    /// P3 — HAVING predicate evaluated after group-by finalise. None
+    /// for non-aggregate queries (HAVING without GROUP BY is rejected
+    /// at parse time, matching AMPS).
+    pub having: Option<HavingExpr>,
     /// P2 — scalar expressions in the SELECT list (`a + b AS sum`).
     /// Empty for queries that only project bare columns. Each entry
     /// is emitted as an extra `(alias, value)` pair appended to each
@@ -142,6 +146,194 @@ fn value_as_f64(v: &Value) -> Option<f64> {
     // Delegate to the store's null-aware coercion so NULL_LONG /
     // NULL_INT / NaN aren't silently treated as zero.
     v.as_f64()
+}
+
+/// P3 — compiled HAVING expression. Evaluated against a finalised
+/// aggregate row (the `serde_json::Map` the executor builds with one
+/// entry per group column + one per aggregate alias). Intentionally a
+/// tiny mirror of WHERE — comparison + logical ops + literal/ref —
+/// because HAVING by spec only sees post-aggregate scalar values.
+#[derive(Debug, Clone)]
+pub enum HavingExpr {
+    /// Look up a column in the output row map. The string is either a
+    /// group-column name or an aggregate alias (resolved at parse time).
+    Ref(String),
+    LitDouble(f64),
+    LitLong(i64),
+    LitString(String),
+    LitBool(bool),
+    Eq(Box<HavingExpr>, Box<HavingExpr>),
+    Ne(Box<HavingExpr>, Box<HavingExpr>),
+    Lt(Box<HavingExpr>, Box<HavingExpr>),
+    Le(Box<HavingExpr>, Box<HavingExpr>),
+    Gt(Box<HavingExpr>, Box<HavingExpr>),
+    Ge(Box<HavingExpr>, Box<HavingExpr>),
+    And(Box<HavingExpr>, Box<HavingExpr>),
+    Or(Box<HavingExpr>, Box<HavingExpr>),
+    Not(Box<HavingExpr>),
+}
+
+impl HavingExpr {
+    /// `true` if this row passes the HAVING predicate. Missing
+    /// references or type-mismatch comparisons → `false` (matches
+    /// AMPS's conservative semantics).
+    pub fn matches(&self, row: &serde_json::Map<String, serde_json::Value>) -> bool {
+        match self {
+            HavingExpr::Ref(_) | HavingExpr::LitDouble(_) | HavingExpr::LitLong(_)
+            | HavingExpr::LitString(_) | HavingExpr::LitBool(_) => {
+                // Standalone refs aren't predicates; treat as false
+                // (the user wrote something like `HAVING SUM(qty)` —
+                // there's no sensible bool interpretation).
+                false
+            }
+            HavingExpr::And(a, b) => a.matches(row) && b.matches(row),
+            HavingExpr::Or(a, b) => a.matches(row) || b.matches(row),
+            HavingExpr::Not(e) => !e.matches(row),
+            HavingExpr::Eq(a, b) => compare_having(a, b, row) == Some(Ordering::Equal),
+            HavingExpr::Ne(a, b) => match compare_having(a, b, row) {
+                Some(Ordering::Equal) => false,
+                Some(_) => true,
+                None => false,
+            },
+            HavingExpr::Lt(a, b) => compare_having(a, b, row) == Some(Ordering::Less),
+            HavingExpr::Le(a, b) => matches!(compare_having(a, b, row), Some(Ordering::Less) | Some(Ordering::Equal)),
+            HavingExpr::Gt(a, b) => compare_having(a, b, row) == Some(Ordering::Greater),
+            HavingExpr::Ge(a, b) => matches!(compare_having(a, b, row), Some(Ordering::Greater) | Some(Ordering::Equal)),
+        }
+    }
+}
+
+fn compare_having(
+    lhs: &HavingExpr,
+    rhs: &HavingExpr,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Ordering> {
+    let l = eval_having_to_json(lhs, row)?;
+    let r = eval_having_to_json(rhs, row)?;
+    // Numeric vs numeric — compare as f64.
+    if let (Some(lf), Some(rf)) = (l.as_f64(), r.as_f64()) {
+        return lf.partial_cmp(&rf);
+    }
+    // String vs string.
+    if let (Some(ls), Some(rs)) = (l.as_str(), r.as_str()) {
+        return Some(ls.cmp(rs));
+    }
+    // Bool vs bool.
+    if let (Some(lb), Some(rb)) = (l.as_bool(), r.as_bool()) {
+        return Some(lb.cmp(&rb));
+    }
+    None
+}
+
+fn eval_having_to_json(
+    e: &HavingExpr,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match e {
+        HavingExpr::Ref(name) => row.get(name).cloned(),
+        HavingExpr::LitDouble(d) => Some(serde_json::Value::from(*d)),
+        HavingExpr::LitLong(i) => Some(serde_json::Value::from(*i)),
+        HavingExpr::LitString(s) => Some(serde_json::Value::from(s.as_str())),
+        HavingExpr::LitBool(b) => Some(serde_json::Value::from(*b)),
+        // Composite exprs aren't valid operands of a comparison; the
+        // parser rejects this shape, but be defensive.
+        _ => None,
+    }
+}
+
+/// P3 — compile a HAVING `Expr` against the aggregate-row "schema":
+/// `group_names` (group-by column names, position-stable) +
+/// `aggregate_aliases` (the alias the executor will emit for each
+/// AggregateSpec). Function calls matching an existing aggregate are
+/// rewritten to the alias; bare identifiers must match either a group
+/// column or an alias. Anything else returns `Err`.
+fn compile_having(
+    expr: &Expr,
+    group_names: &[String],
+    aggregates: &[AggregateSpec],
+    schema: &Schema,
+) -> Result<HavingExpr, QueryError> {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator, Value as SqlValue, ValueWithSpan};
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            let l = Box::new(compile_having(left, group_names, aggregates, schema)?);
+            let r = Box::new(compile_having(right, group_names, aggregates, schema)?);
+            match op {
+                BinaryOperator::Eq => Ok(HavingExpr::Eq(l, r)),
+                BinaryOperator::NotEq => Ok(HavingExpr::Ne(l, r)),
+                BinaryOperator::Lt => Ok(HavingExpr::Lt(l, r)),
+                BinaryOperator::LtEq => Ok(HavingExpr::Le(l, r)),
+                BinaryOperator::Gt => Ok(HavingExpr::Gt(l, r)),
+                BinaryOperator::GtEq => Ok(HavingExpr::Ge(l, r)),
+                BinaryOperator::And => Ok(HavingExpr::And(l, r)),
+                BinaryOperator::Or => Ok(HavingExpr::Or(l, r)),
+                _ => Err(QueryError::ParseError(format!(
+                    "unsupported operator in HAVING: {op:?}"
+                ))),
+            }
+        }
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => Ok(HavingExpr::Not(Box::new(
+            compile_having(expr, group_names, aggregates, schema)?,
+        ))),
+        Expr::Nested(e) => compile_having(e, group_names, aggregates, schema),
+        Expr::Identifier(id) => {
+            // Group column name, or aggregate alias — both legal.
+            let name = id.value.clone();
+            if group_names.iter().any(|g| g == &name)
+                || aggregates.iter().any(|a| a.alias == name)
+            {
+                Ok(HavingExpr::Ref(name))
+            } else {
+                Err(QueryError::UnknownColumn(name))
+            }
+        }
+        Expr::Function(_) => {
+            // Re-parse the function as an aggregate spec; match against
+            // the SELECT's aggregates by (func, col). On match, refer
+            // to the existing alias so the executor's row map look-up
+            // hits the same key. The schema arg is unused by
+            // parse_aggregate_call's name/col extraction.
+            let candidate = parse_aggregate_call(expr, schema, None)?;
+            let candidate = match candidate {
+                Some(c) => c,
+                None => {
+                    return Err(QueryError::ParseError(format!(
+                        "unsupported function in HAVING: {expr:?}"
+                    )))
+                }
+            };
+            // Match by function + alias shape. The default-alias the
+            // parser builds for a bare `SUM(col)` is "SUM(col)" —
+            // which matches the SELECT-side aggregate's auto-alias
+            // when the user didn't supply one, or we need to compare
+            // against the user-supplied alias when they did.
+            for a in aggregates {
+                if a.func == candidate.func && a.col == candidate.col {
+                    return Ok(HavingExpr::Ref(a.alias.clone()));
+                }
+            }
+            Err(QueryError::ParseError(format!(
+                "HAVING references an aggregate not in SELECT: {expr}"
+            )))
+        }
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            SqlValue::Number(n, _) => {
+                if let Ok(i) = n.parse::<i64>() {
+                    Ok(HavingExpr::LitLong(i))
+                } else {
+                    Ok(HavingExpr::LitDouble(n.parse().unwrap_or(0.0)))
+                }
+            }
+            SqlValue::SingleQuotedString(s) => Ok(HavingExpr::LitString(s.clone())),
+            SqlValue::Boolean(b) => Ok(HavingExpr::LitBool(*b)),
+            other => Err(QueryError::ParseError(format!(
+                "unsupported literal in HAVING: {other:?}"
+            ))),
+        },
+        _ => Err(QueryError::ParseError(format!(
+            "unsupported expression in HAVING: {expr:?}"
+        ))),
+    }
 }
 
 /// Compiled `A JOIN B USING (col, ...)` spec. Schemas of both sides
@@ -661,6 +853,25 @@ fn parse_select(
     let (projection, aggregates, computed) =
         parse_projection_or_aggregates(&select.projection, schema, &group_by)?;
 
+    // --- HAVING (P3) — compile against [group_names ++ aggregate_aliases].
+    // Reject HAVING on non-aggregate queries; the spec requires GROUP BY
+    // or an aggregate in SELECT.
+    let having = match &select.having {
+        Some(h) => {
+            if aggregates.is_empty() && group_by.is_empty() {
+                return Err(QueryError::ParseError(
+                    "HAVING requires GROUP BY or an aggregate in SELECT".into(),
+                ));
+            }
+            let group_names: Vec<String> = group_by
+                .iter()
+                .map(|&c| schema.column_name(c).to_string())
+                .collect();
+            Some(compile_having(h, &group_names, &aggregates, schema)?)
+        }
+        None => None,
+    };
+
     // --- WHERE clause → predicate ---
     let predicate = if let Some(where_expr) = &select.selection {
         compile_expr(where_expr, schema).map_err(QueryError::PredicateError)?
@@ -698,6 +909,7 @@ fn parse_select(
         unpivot: None,
         join: join_spec,
         computed,
+        having,
     })
 }
 
@@ -903,6 +1115,7 @@ fn parse_pivot_query(
         unpivot: None,
         join: None,
         computed: Vec::new(),
+        having: None,
     })
 }
 
@@ -1015,6 +1228,7 @@ fn parse_unpivot_query(
         unpivot: Some(unpivot),
         join: None,
         computed: Vec::new(),
+        having: None,
     })
 }
 
@@ -1986,7 +2200,10 @@ fn execute_aggregate_query(
             let state = AggState::init(spec.func, agg_col_types[i]);
             row_map.insert(spec.alias.clone(), state.finalize());
         }
-        rows.push(row_map);
+        // P3 — HAVING also applies to the implicit-group row.
+        if query.having.as_ref().map(|h| h.matches(&row_map)).unwrap_or(true) {
+            rows.push(row_map);
+        }
     }
     for key in &group_order {
         let states = groups.get(key).expect("group must exist");
@@ -1996,6 +2213,12 @@ fn execute_aggregate_query(
         }
         for (i, spec) in query.aggregates.iter().enumerate() {
             row_map.insert(spec.alias.clone(), states[i].finalize());
+        }
+        // P3 — drop the group if HAVING evaluates to false.
+        if let Some(h) = query.having.as_ref() {
+            if !h.matches(&row_map) {
+                continue;
+            }
         }
         rows.push(row_map);
     }
@@ -3106,6 +3329,91 @@ mod tests {
         assert_eq!(join.right_topic, "securities");
         assert_eq!(join.using, vec!["cusip".to_string()]);
         assert_eq!(q.topic, "positions");
+    }
+
+    // ───── P3 — HAVING clause ───────────────────────────────────────
+
+    #[test]
+    fn parses_having_on_aggregate_alias() {
+        let (schema, _store) = make_store();
+        let q = parse_query(
+            "SELECT desk, SUM(quantity) AS total FROM trades \
+             GROUP BY desk HAVING SUM(quantity) > 50",
+            &schema,
+        )
+        .expect("HAVING must parse");
+        assert!(q.having.is_some(), "having must be Some");
+    }
+
+    #[test]
+    fn parses_having_on_group_column() {
+        let (schema, _store) = make_store();
+        let q = parse_query(
+            "SELECT desk, COUNT(*) AS n FROM trades \
+             GROUP BY desk HAVING desk = 'RATES'",
+            &schema,
+        )
+        .expect("HAVING on group col must parse");
+        assert!(q.having.is_some());
+    }
+
+    #[test]
+    fn having_filters_aggregate_rows() {
+        let (schema, store) = make_store();
+        // RATES total = 110, EQUITIES = 250, TECH = 5.
+        let q = parse_query(
+            "SELECT desk, SUM(quantity) AS total FROM trades \
+             GROUP BY desk HAVING SUM(quantity) > 100",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        // RATES (110) + EQUITIES (250) pass; TECH (5) is dropped.
+        assert_eq!(r.rows.len(), 2);
+        let desks: std::collections::HashSet<String> = r
+            .rows
+            .iter()
+            .map(|row| row.get("desk").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert!(desks.contains("RATES"));
+        assert!(desks.contains("EQUITIES"));
+        assert!(!desks.contains("TECH"));
+    }
+
+    #[test]
+    fn having_on_aggregate_alias_filters_same_way() {
+        // `HAVING total > 100` should behave identically to
+        // `HAVING SUM(quantity) > 100` when `total` is the alias.
+        let (schema, store) = make_store();
+        let q_alias = parse_query(
+            "SELECT desk, SUM(quantity) AS total FROM trades \
+             GROUP BY desk HAVING total > 100",
+            &schema,
+        )
+        .unwrap();
+        let q_fn = parse_query(
+            "SELECT desk, SUM(quantity) AS total FROM trades \
+             GROUP BY desk HAVING SUM(quantity) > 100",
+            &schema,
+        )
+        .unwrap();
+        let a = execute_query(&q_alias, &store);
+        let f = execute_query(&q_fn, &store);
+        assert_eq!(a.rows.len(), f.rows.len());
+    }
+
+    #[test]
+    fn having_combined_with_and() {
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT desk, SUM(quantity) AS total FROM trades \
+             GROUP BY desk HAVING SUM(quantity) > 50 AND desk <> 'TECH'",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        // RATES (110) + EQUITIES (250) pass; TECH (5, also excluded by name).
+        assert_eq!(r.rows.len(), 2);
     }
 
     // ───── P2 — scalar arithmetic in SELECT-list ────────────────────
