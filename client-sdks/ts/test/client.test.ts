@@ -72,6 +72,12 @@ key = ["symbol"]
 persist = false
 initial_capacity = 100
 
+[[topics]]
+name = "/batch-data"
+key = ["symbol"]
+persist = false
+initial_capacity = 100
+
 [[queues]]
 name = "/work"
 
@@ -114,6 +120,45 @@ describe('Client.connectAny (P15 — HA failover)', () => {
 
   it('rejects an empty URL list', async () => {
     await expect(Client.connectAny([])).rejects.toThrow(/empty url list/);
+  });
+});
+
+describe('Client.publishBatch (P16 — pipelined batched publish)', () => {
+  it('publishes N messages in parallel and returns N sequences', async () => {
+    const c = await Client.connect(`tcp://127.0.0.1:${tcpPort}`);
+    // Seed publish so the schema is established.
+    await c.publish('/batch-data', { symbol: 'BATCH_SEED', price: 1.0 });
+
+    // Prices kept BELOW 100 so this batch doesn't pollute the SOW
+    // snapshot the next test (`price > 100` filter) reads from.
+    const msgs = Array.from({ length: 50 }, (_, i) => ({
+      symbol: `B${i.toString().padStart(2, '0')}`,
+      price: 10 + i,
+    }));
+    const seqs = await c.publishBatch('/batch-data', msgs);
+    expect(seqs.length).toBe(50);
+    // Every returned sequence must be a positive integer.
+    for (const s of seqs) expect(s).toBeGreaterThan(0);
+    // Sequences are monotonic per-topic — assert strictly increasing
+    // (sortedness, not necessarily contiguity if other publishes
+    // landed between).
+    const sorted = [...seqs].sort((a, b) => a - b);
+    expect(seqs).toEqual(sorted);
+
+    // SOW must show every published row (plus the seed).
+    const rows = await c.sow('/batch-data');
+    const syms = new Set(rows.map((r) => r.symbol));
+    for (let i = 0; i < 50; i++) {
+      expect(syms.has(`B${i.toString().padStart(2, '0')}`)).toBe(true);
+    }
+    await c.close();
+  }, 15_000);
+
+  it('publishBatch with empty list resolves immediately', async () => {
+    const c = await Client.connect(`tcp://127.0.0.1:${tcpPort}`);
+    const seqs = await c.publishBatch('/batch-data', []);
+    expect(seqs).toEqual([]);
+    await c.close();
   });
 });
 

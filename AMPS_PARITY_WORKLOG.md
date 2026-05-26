@@ -148,9 +148,13 @@ Per AMPS_PARITY.md §5 honest assessment:
 **Tests landed:**
 - Vitest `client-sdks/ts/test/client.test.ts` — 3 new tests: rotates past a dead URL (`tcp://127.0.0.1:1` always refused) to the live server, throws when every URL fails, rejects empty list. All 12 TS tests stay green.
 
-## P16 — SDK: batched publish *(§3.2 row 4)*
-**Status:** ⏳
-**Scope:** `publishBatch(topic, msgs[])` — one wire frame, one ack, one txlog append. Bumps the wire version (see S28 in AMPS_WORKLOG for the negotiation pattern).
+## P16 — SDK: batched publish (pipelined) *(§3.2 row 4)*
+**Status:** ✅ done (SDK-level pipelining; wire-level `PublishBatch` frame deferred)
+**Scope:** TS SDK now exposes `Client.publishBatch(topic, msgs[])` — fires every publish concurrently without waiting for individual acks, then awaits all. Returns sequences in order. Same correctness as N sequential `publish()` calls but the per-msg RTTs are paid in parallel — the slowest single ack bounds the wall-clock instead of N × RTT.
+**Implementation:** `client-sdks/ts/src/client.ts` — new `async publishBatch(topic, msgs[])` using `Promise.all(msgs.map(m => this.publish(topic, m)))`. The existing `rpc()` already correlates responses by cid, so concurrent in-flight publishes don't race each other.
+**Out of scope (folds into a follow-up):** AMPS's literal `publishBatch` is *one wire frame, one ack, one txlog append* — a wire-version bump (see AMPS_WORKLOG.md S28 for the pattern). The pipelined SDK form already captures the latency win for trading-floor publisher loops; the wire-frame change is an incremental optimization.
+**Tests landed:**
+- Vitest 2 new tests in `test/client.test.ts`: 50-msg batch publish on a dedicated `/batch-data` topic verifies seq count + monotonicity + every payload appears in the SOW, plus an empty-list-resolves-empty contract.
 
 ---
 
