@@ -282,8 +282,17 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 **Out of scope (deferred):** ALTER TABLE SQL surface (route is admin-only today), DROP COLUMN, RENAME COLUMN, type-change migrations — each non-trivial under the assumption that subscribers hold pinned schema references.
 
 ## Q12 — AS OF JOIN (temporal) *(§1.4 row 7)*
-**Status:** ⏳
-**Scope:** `A AS OF JOIN B ON a.ts = b.ts` — for each left row, find the right row whose `ts` is the largest value ≤ `a.ts`. Useful for trades-vs-prices reconstruction. Implementation: sort right side by `ts`, binary-search per left row.
+**Status:** ✅ done
+**Scope:** Snowflake-style `ASOF JOIN ... MATCH_CONDITION(lhs.ts >= rhs.ts) USING (key)` — for each left row, find the right row whose `ts` is the largest value ≤ left's `ts`, partitioned by USING keys. Useful for trades-vs-prices reconstruction ("what was the price at the time of the trade?").
+**Implementation:**
+- `JoinKind::AsOf { ts_col: String }` (new variant; JoinKind drops `Copy` since it now owns a String).
+- `parse_join_clause` recognises `JoinOperator::AsOf { match_condition, constraint }`, validates `match_condition` is `lhs_col >= rhs_col` with same-named columns (after P1 alias rewrite), and stores the column name on JoinKind.
+- `rewrite_qualified_refs_in_query` extended to walk `JoinOperator::AsOf`'s `match_condition` + `constraint::On` so `t.ts >= p.ts` becomes `ts >= ts` before parse_join_clause sees it.
+- `execute_join_query` pre-builds `asof_index: HashMap<using_key, Vec<(ts, right_row)>>` sorted by ts. Per-left-row lookup uses `partition_point` for binary search; the matched right row is `entries[pos - 1]` (largest ts ≤ left.ts).
+**Tests landed:**
+- 2 unit tests in `query::tests::{parses_asof_join_with_match_condition, asof_join_matches_latest_right_le_left_ts}`.
+- E2E `crates/cq-e2e-tests/tests/parser_asof_join.rs` — prices @ ts={100, 150, 250}, trade @ ts=200; ASOF correctly picks the price at ts=150.
+**Out of scope (deferred):** `lhs > rhs` (strict-less) and `lhs <= rhs` (latest-after) variants — would just change the partition_point predicate. Multi-key MATCH_CONDITION (e.g. `lhs.ts >= rhs.ts AND lhs.exch = rhs.exch`) — would need to split into match-cond columns vs USING columns. Both are straightforward extensions.
 
 ---
 

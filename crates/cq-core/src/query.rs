@@ -391,7 +391,7 @@ pub struct JoinSpec {
     pub kind: JoinKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,
     LeftOuter,
@@ -401,6 +401,12 @@ pub enum JoinKind {
     /// columns NULL where there's no match. Equivalent to
     /// `LEFT OUTER UNION ALL right-only rows`.
     FullOuter,
+    /// Q12 — Snowflake-style temporal join. For each left row, the
+    /// matched right row is the one with the largest `ts_col` value
+    /// ≤ the left row's `ts_col`. Other USING columns (typically a
+    /// symbol / key) partition the search. Useful for "what was the
+    /// quote price at the time of the trade?".
+    AsOf { ts_col: String },
 }
 
 /// Compiled `PIVOT (...) FOR col IN (lit, lit, ...)` spec.
@@ -837,6 +843,27 @@ fn rewrite_qualified_refs_in_query(query: &mut sqlparser::ast::Query, refs: &Has
             }
         }
     }
+    // Q12 — rewrite AsOf join's MATCH_CONDITION + ON-clause
+    // constraint so both expressions see bare column names. The
+    // standard `Inner/Left/...` rewrite block above doesn't cover
+    // `JoinOperator::AsOf` because AsOf's constraint nests inside
+    // the AsOf variant rather than being a direct field.
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        for from in &mut select.from {
+            for join in &mut from.joins {
+                if let sqlparser::ast::JoinOperator::AsOf {
+                    match_condition,
+                    constraint,
+                } = &mut join.join_operator
+                {
+                    rewrite_expr(match_condition, refs);
+                    if let sqlparser::ast::JoinConstraint::On(e) = constraint {
+                        rewrite_expr(e, refs);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Recursively rewrite `CompoundIdentifier([t, col])` → `Identifier(col)`
@@ -1232,17 +1259,48 @@ fn parse_join_clause(
             ))
         }
     };
-    // P11/P12/Q1 — INNER, LEFT OUTER, RIGHT OUTER, FULL OUTER.
-    // CROSS JOIN and AS OF JOIN (Q12) are still rejected.
-    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    // P11/P12/Q1/Q12 — INNER, LEFT/RIGHT/FULL OUTER, plus Q12's
+    // Snowflake-style `ASOF JOIN ... MATCH_CONDITION(left.ts >=
+    // right.ts) ON ...`. CROSS JOIN is still rejected.
+    use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
     let (constraint, kind) = match &j.join_operator {
         JoinOperator::Inner(c) | JoinOperator::Join(c) => (c, JoinKind::Inner),
         JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (c, JoinKind::LeftOuter),
         JoinOperator::Right(c) | JoinOperator::RightOuter(c) => (c, JoinKind::RightOuter),
         JoinOperator::FullOuter(c) => (c, JoinKind::FullOuter),
+        JoinOperator::AsOf { match_condition, constraint } => {
+            // Q12 — MATCH_CONDITION must be `lhs_col >= rhs_col`
+            // (both bare identifiers after P1 alias-rewrite). The
+            // executor sorts the right side by `rhs_col` and binary-
+            // searches for the largest entry ≤ each left row's
+            // lhs_col value. Other shapes (>, <, <=) and non-bare
+            // ident args are deferred.
+            let asof_col = match match_condition {
+                Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::GtEq, right } => {
+                    let l = ident_name(left).ok_or_else(|| QueryError::ParseError(
+                        "AS OF JOIN: MATCH_CONDITION LHS must be a bare column".into(),
+                    ))?;
+                    let r = ident_name(right).ok_or_else(|| QueryError::ParseError(
+                        "AS OF JOIN: MATCH_CONDITION RHS must be a bare column".into(),
+                    ))?;
+                    if l != r {
+                        return Err(QueryError::ParseError(format!(
+                            "AS OF JOIN: MATCH_CONDITION columns must share a name ({l} vs {r}); rename or alias before JOIN"
+                        )));
+                    }
+                    l
+                }
+                other => {
+                    return Err(QueryError::ParseError(format!(
+                        "AS OF JOIN: MATCH_CONDITION must be `col >= col`, got {other:?}"
+                    )));
+                }
+            };
+            (constraint, JoinKind::AsOf { ts_col: asof_col })
+        }
         _ => {
             return Err(QueryError::ParseError(
-                "Only INNER, LEFT/RIGHT/FULL OUTER JOIN are supported today".into(),
+                "Only INNER, LEFT/RIGHT/FULL OUTER, and ASOF JOIN are supported today".into(),
             ))
         }
     };
@@ -3635,6 +3693,51 @@ pub fn execute_join_query(
     let mut row_buf: Vec<Value> = Vec::with_capacity(combined_sources.len());
     let keep_left_misses = matches!(join.kind, JoinKind::LeftOuter | JoinKind::FullOuter);
     let keep_right_misses = matches!(join.kind, JoinKind::RightOuter | JoinKind::FullOuter);
+    let is_asof = matches!(join.kind, JoinKind::AsOf { .. });
+
+    // Q12 — for AS OF JOIN, pre-build a per-USING-key sorted list of
+    // (ts_value, right_row) so we can binary-search for the largest
+    // ts ≤ left.ts at join time.
+    let asof_index: Option<HashMap<String, Vec<(i64, u32)>>> = if is_asof {
+        let ts_col_name = match &join.kind {
+            JoinKind::AsOf { ts_col } => ts_col.clone(),
+            _ => unreachable!(),
+        };
+        let right_ts_idx = right_schema.index_of(&ts_col_name).ok_or_else(|| {
+            QueryError::ParseError(format!(
+                "AS OF JOIN: ts column `{ts_col_name}` not found on right side"
+            ))
+        })?;
+        let mut idx: HashMap<String, Vec<(i64, u32)>> = HashMap::new();
+        for r in 0..right_row_count {
+            let key = match key_for(right_store, r, &right_using) {
+                Some(k) => k,
+                None => continue,
+            };
+            let ts = match right_store.get(right_ts_idx, r) {
+                Value::Timestamp(t) if t != crate::store::NULL_TIMESTAMP => t,
+                Value::Long(t) if t != crate::store::NULL_LONG => t,
+                _ => continue,
+            };
+            idx.entry(key).or_default().push((ts, r));
+        }
+        for v in idx.values_mut() {
+            v.sort_by_key(|(ts, _)| *ts);
+        }
+        Some(idx)
+    } else {
+        None
+    };
+    // Cache the left-side ts column index for the AsOf loop below.
+    let asof_left_ts_idx: Option<usize> = if let JoinKind::AsOf { ts_col } = &join.kind {
+        Some(left_schema.index_of(ts_col).ok_or_else(|| {
+            QueryError::ParseError(format!(
+                "AS OF JOIN: ts column `{ts_col}` not found on left side"
+            ))
+        })?)
+    } else {
+        None
+    };
     let mut right_matched: roaring::RoaringBitmap = roaring::RoaringBitmap::new();
     for lr in 0..left_row_count {
         let key = match key_for(left_store, lr, &left_using) {
@@ -3657,7 +3760,31 @@ pub fn execute_join_query(
                 continue;
             }
         };
-        match right_index.get(&key).copied() {
+        // Q12 — AS OF JOIN: find the largest right ts ≤ left.ts among
+        // entries with the matching USING key. Falls through to the
+        // normal `right_index` lookup for all other join kinds.
+        let resolved_rr: Option<u32> = if is_asof {
+            let left_ts = match left_store.get(asof_left_ts_idx.unwrap(), lr) {
+                Value::Timestamp(t) if t != crate::store::NULL_TIMESTAMP => t,
+                Value::Long(t) if t != crate::store::NULL_LONG => t,
+                _ => i64::MIN,
+            };
+            asof_index
+                .as_ref()
+                .and_then(|idx| idx.get(&key))
+                .and_then(|entries| {
+                    // Binary-search for largest entry with ts ≤ left_ts.
+                    let pos = entries.partition_point(|(ts, _)| *ts <= left_ts);
+                    if pos == 0 {
+                        None
+                    } else {
+                        Some(entries[pos - 1].1)
+                    }
+                })
+        } else {
+            right_index.get(&key).copied()
+        };
+        match resolved_rr {
             Some(rr) => {
                 right_matched.insert(rr);
                 row_buf.clear();
@@ -4092,6 +4219,84 @@ mod tests {
 
     // (Was `parse_join_rejects_left_outer_for_now` — superseded by
     // P12 which accepts LEFT OUTER JOIN. See the P12 tests below.)
+
+    // ───── Q12 — AS OF JOIN (temporal) ───────────────────────────────
+
+    #[test]
+    fn parses_asof_join_with_match_condition() {
+        // Combined schema must include both `ts` and `symbol`.
+        let combined = Schema::from_strs(
+            &["ts", "symbol", "px", "qty"],
+            &[
+                ColumnType::Timestamp,
+                ColumnType::String,
+                ColumnType::Double,
+                ColumnType::Long,
+            ],
+        );
+        let sql = "SELECT t.symbol, t.qty, p.px \
+                   FROM trades t ASOF JOIN prices p \
+                   MATCH_CONDITION(t.ts >= p.ts) \
+                   ON t.symbol = p.symbol";
+        let q = parse_query(sql, &combined).expect("ASOF JOIN must parse");
+        let j = q.join.expect("expected JoinSpec");
+        match &j.kind {
+            JoinKind::AsOf { ts_col } => assert_eq!(ts_col, "ts"),
+            other => panic!("expected JoinKind::AsOf, got {other:?}"),
+        }
+        assert_eq!(j.using, vec!["symbol".to_string()]);
+    }
+
+    #[test]
+    fn asof_join_matches_latest_right_le_left_ts() {
+        // left (trades): symbol=AAPL @ ts=200
+        // right (prices): symbol=AAPL @ ts={100, 150, 250}
+        //                 → ASOF match: ts=150 (largest ≤ 200)
+        // Both sides share a `ts` column (USING-style match_condition).
+        let left_schema = Arc::new(Schema::from_strs(
+            &["symbol", "ts", "qty"],
+            &[ColumnType::String, ColumnType::Long, ColumnType::Long],
+        ));
+        let right_schema = Arc::new(Schema::from_strs(
+            &["symbol", "ts", "px"],
+            &[ColumnType::String, ColumnType::Long, ColumnType::Double],
+        ));
+        let mut left = ColumnStore::new(left_schema.clone(), 8);
+        let mut right = ColumnStore::new(right_schema.clone(), 8);
+        left.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::Long(200),
+            Value::Long(10),
+        ]);
+        for (ts, px) in &[(100i64, 100.0_f64), (150, 150.0), (250, 200.0)] {
+            right.append_row(&[
+                Value::String(Some(CompactString::new("AAPL"))),
+                Value::Long(*ts),
+                Value::Double(*px),
+            ]);
+        }
+        // Combined schema: dedup symbol only (ts and qty / px are
+        // side-specific). The combined `ts` resolves to the LEFT's
+        // ts (first occurrence), which the test asserts below.
+        let combined = combined_join_schema(
+            &left_schema,
+            &right_schema,
+            &["symbol".to_string()],
+        );
+        let q = parse_query(
+            "SELECT symbol, qty, px FROM trades \
+             ASOF JOIN prices MATCH_CONDITION(ts >= ts) USING (symbol)",
+            &combined,
+        )
+        .unwrap();
+        let r = execute_join_query(&q, &left, &right).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        let row = &r.rows[0];
+        // qty from left, px from right's row whose ts (=150) was
+        // the largest ≤ left's ts (=200).
+        assert_eq!(row.get("qty").unwrap().as_i64().unwrap(), 10);
+        assert_eq!(row.get("px").unwrap().as_f64().unwrap(), 150.0);
+    }
 
     // ───── Q10 — Bytes column type ───────────────────────────────────
 
