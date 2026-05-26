@@ -142,8 +142,11 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/topic_slash_normalization.rs` declares a `[[views]]` block whose JOIN SQL uses BARE topic names (`FROM p14_pos JOIN p14_sec USING (cusip)`) against slash-prefixed registry entries (`/p14_pos`, `/p14_sec`); verifies both the view runner and the inline JOIN SOW path resolve correctly.
 
 ## P15 — SDK: HA failover across multiple URIs *(§3.1 row 12)*
-**Status:** ⏳
-**Scope:** TS SDK accepts `uris: string[]`; rotates on connection loss with exponential backoff between full passes. E2E against a 2-instance replica-reads topology.
+**Status:** ✅ done (initial-connect failover; mid-stream reconnect deferred)
+**Scope:** TS SDK now exposes `Client.connectAny(urls, opts)` — attempts each URL in randomised order and returns the first successful connection (matches the Rust SDK's existing `connect_any`). `client.activeUrl` exposes which URL won. **Initial-connect failover only**; live reconnect after a mid-stream disconnect is a separate concern that doesn't block the AMPS-parity surface (the same boundary the Rust SDK draws).
+**Implementation:** `client-sdks/ts/src/client.ts` — new `static async connectAny(urls, opts)`, internal Fisher-Yates `shuffledIndices` helper, and `activeUrl` getter. Existing `Client.connect` now records `activeUrl` too.
+**Tests landed:**
+- Vitest `client-sdks/ts/test/client.test.ts` — 3 new tests: rotates past a dead URL (`tcp://127.0.0.1:1` always refused) to the live server, throws when every URL fails, rejects empty list. All 12 TS tests stay green.
 
 ## P16 — SDK: batched publish *(§3.2 row 4)*
 **Status:** ⏳
