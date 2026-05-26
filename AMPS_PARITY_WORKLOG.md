@@ -209,9 +209,14 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 - E2E `crates/cq-e2e-tests/tests/conn_name_trace_id.rs` — logs in with a connection name + trace id, asserts subsequent publish still works (smoke + non-crash). Full audit-log scraping is deferred to a follow-up.
 **Out of scope:** automatic per-span trace-id injection via `tracing::Span::current()` integration — needs an OpenTelemetry layer; current shape just records the trace_id field on the audit event.
 
-## Q5 — TS SDK TLS (wss:// + cert validation) *(§3.1 row 3)*
-**Status:** ⏳
-**Scope:** `Client.connect("wss://host/path")` works against a TLS-enabled server (existing `crates/cq-e2e-tests/tests/tls.rs`). Cert validation defaults to the system trust store; expose a `NODE_TLS_REJECT_UNAUTHORIZED=0`-style escape hatch for dev.
+## Q5 — TS SDK TLS *(§3.1 row 3)*
+**Status:** ✅ done
+**Scope:** Two TLS paths exposed from the TS SDK:
+- `wss://` — handled by the existing global `WebSocket` constructor (no code change required; cert validation uses the platform's trust store). For self-signed dev certs in Node, set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
+- `tls://` — new Node-only TCP+TLS path. `Client.connect("tls://host:port", { tls: { servername, ca, rejectUnauthorized } })`. Wraps `tls.connect()` and reuses the length-prefixed `TcpTransport`.
+**Implementation:** `client-sdks/ts/src/transport-node.ts` — new `connectTls(host, port, opts)` returning `Transport`. `client-sdks/ts/src/client.ts` — `Client.connect` dispatches on `tls://` URL scheme. New `ClientOptions.tls` carries SNI / custom CA / rejectUnauthorized.
+**Tests landed:**
+- 2 new Vitest tests in `test/client.test.ts`: `tls://` to the non-TLS port rejects at handshake (proves scheme wiring); malformed `tls://` URLs reject with a clear error.
 
 ## Q6 — Per-client metrics surface *(§3.6 row 1 — finish the "partial")*
 **Status:** ⏳

@@ -31,6 +31,18 @@ export interface ClientOptions {
    * Default 25_000 (25s) — well inside the server window.
    */
   heartbeatIntervalMs?: number;
+  /**
+   * Q5 — TLS options for `tls://` URLs (Node-only). See
+   * `transport-node.ts`'s `TlsConnectOptions` for the field list:
+   * `servername` (SNI), `ca` (custom trust root), `rejectUnauthorized`
+   * (dev-only escape hatch). Ignored for `tcp://` / `ws://` /
+   * `wss://` URLs.
+   */
+  tls?: {
+    servername?: string;
+    ca?: string | Buffer | Array<string | Buffer>;
+    rejectUnauthorized?: boolean;
+  };
 }
 
 export class Subscription {
@@ -177,7 +189,26 @@ export class Client {
       c._activeUrl = url;
       return c;
     }
+    if (url.startsWith('tls://')) {
+      // Q5 — TLS-wrapped TCP. Node only (browsers can't open raw
+      // TLS sockets — use `wss://` there). Cert validation uses
+      // the system trust store by default; opts.tls.ca / .ca
+      // injects a custom root.
+      const rest = url.slice('tls://'.length);
+      const [host, portStr] = rest.split(':');
+      const port = parseInt(portStr, 10);
+      if (!host || !Number.isFinite(port)) throw new ClientError(`bad tls url: ${url}`);
+      const { connectTls } = await import('./transport-node.js');
+      const t = await connectTls(host, port, opts.tls);
+      const c = new Client(t, opts);
+      c._activeUrl = url;
+      return c;
+    }
     if (url.startsWith('ws://') || url.startsWith('wss://')) {
+      // `wss://` reuses the global WebSocket which natively does
+      // TLS — cert validation is on by default. For a self-signed
+      // dev cert in Node, set `NODE_TLS_REJECT_UNAUTHORIZED=0`
+      // before constructing the client.
       const t = await connectWs(url);
       const c = new Client(t, opts);
       c._activeUrl = url;

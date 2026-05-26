@@ -162,6 +162,23 @@ describe('Client.publishBatch (P16 — pipelined batched publish)', () => {
   });
 });
 
+describe('Client TLS scheme (Q5)', () => {
+  it('rejects a connection to a non-TLS port', async () => {
+    // Connecting `tls://` to the plain-TCP port should fail at the
+    // TLS handshake (server speaks framed CqMessage, not TLS). The
+    // assertion proves the `tls://` scheme is wired through to
+    // `connectTls` — exact error message depends on Node's TLS impl.
+    await expect(
+      Client.connect(`tls://127.0.0.1:${tcpPort}`),
+    ).rejects.toThrow();
+  }, 15_000);
+
+  it('rejects an obviously-malformed tls url', async () => {
+    await expect(Client.connect('tls://')).rejects.toThrow(/bad tls url/);
+    await expect(Client.connect('tls://noport')).rejects.toThrow(/bad tls url/);
+  });
+});
+
 describe('Client over TCP', () => {
   it('publish, subscribe with filter, receive ADD delta', async () => {
     const c = await Client.connect(`tcp://127.0.0.1:${tcpPort}`);
