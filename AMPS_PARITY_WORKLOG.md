@@ -188,9 +188,15 @@ independent commit.
 - Existing TS Vitest publishBatch tests now exercise the wire-level path; all 14 stay green.
 **Out of scope (still deferred):** truly atomic-across-failures batch (commit-or-nothing) would need a server-side transactional wrapper around the per-row upsert loop. Current shape matches AMPS's contract (per-row durability, batch is not all-or-nothing).
 
-## Q3 — PIVOT dynamic value list *(§1.6 row 3 — fold-in of AMPS_WORKLOG S45 follow-up)*
-**Status:** ⏳
-**Scope:** `PIVOT (...) FOR col IN (ANY)` — discover the value list from the source SOW at SOW time and (for views) at refresh time. Continuous-mode pivot already lives behind AMPS_WORKLOG S45; this fills in the dynamic IN list.
+## Q3 — PIVOT dynamic value list (`IN (ANY)`) over the wire *(§1.6 row 3)*
+**Status:** ✅ done
+**Scope:** Parser-level support for `PIVOT (...) FOR col IN (ANY)` was already present (S45). Q3 fixes two server bugs that made it return empty/raw rows over the wire:
+1. `query_streaming_json`'s `needs_full_buffer` check didn't include `is_pivot()` — pivot queries silently fell through to the columnar fast path which emits raw projected cells, bypassing `execute_pivot_query` entirely.
+2. The same path's tombstone filter required `source_rows` to be in lockstep with `rows`, but pivot's executor returns `source_rows: Vec::new()` (synth output). The zip-based filter dropped every row.
+Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundary list so the wire SQL rewrite preserves the PIVOT clause.
+**Tests landed:**
+- E2E `crates/cq-e2e-tests/tests/pivot_dynamic_in_any.rs` — `SELECT * FROM t PIVOT (SUM(qty) FOR desk IN (ANY))` over the wire against a 4-row fixture, asserts 4 anchor rows with 3 dynamically-discovered desk columns each.
+**Note:** Continuous-mode pivot with SchemaChange emission (S44 wire frame fanning into subscriptions) remains a separate follow-up; SOW + view paths now exercise the dynamic IN list.
 
 ## Q4 — Connection name echo + trace-id propagation *(§3.1 row 4 + §3.6 row 3)*
 **Status:** ⏳

@@ -1930,6 +1930,11 @@ fn rewrite_from_to_t(sql: &str) -> String {
         " RIGHT JOIN ",
         " FULL JOIN ",
         " CROSS JOIN ",
+        // Q3 — PIVOT/UNPIVOT are FROM-clause modifiers that must be
+        // preserved verbatim so the parser sees the full pivot spec
+        // (without these the rewrite eats `PIVOT (...) FOR ... IN ...`).
+        " PIVOT (",
+        " UNPIVOT (",
     ];
     let mut end = sql.len();
     for kw in clauses {

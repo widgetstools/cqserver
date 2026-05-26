@@ -1294,7 +1294,11 @@ impl Topic {
             // P2 — computed columns (`SELECT a + b AS sum FROM t`)
             // need the full executor's row-build path; the direct
             // columnar stream below only emits raw projected cells.
-            || !query.computed.is_empty();
+            || !query.computed.is_empty()
+            // Q3 — PIVOT/UNPIVOT queries also need the buffered
+            // path; the fast path emits raw projected cells and
+            // bypasses execute_pivot_query entirely.
+            || query.is_pivot();
         if needs_full_buffer {
             let mut result = crate::query::execute_query_with_index(
                 &query,
@@ -1401,7 +1405,11 @@ impl Topic {
             // P2 — computed columns (`SELECT a + b AS sum FROM t`)
             // need the full executor's row-build path; the direct
             // columnar stream below only emits raw projected cells.
-            || !query.computed.is_empty();
+            || !query.computed.is_empty()
+            // Q3 — PIVOT/UNPIVOT queries also need the buffered
+            // path; the fast path emits raw projected cells and
+            // bypasses execute_pivot_query entirely.
+            || query.is_pivot();
         if needs_full_buffer {
             // Same shape as query_streaming for the buffered path —
             // run the executor, drop tombstones, then serialize each
@@ -1413,8 +1421,15 @@ impl Topic {
                 &state.store,
                 Some(&state.secondary_index),
             );
-            let is_aggregate = query.is_aggregate() || !query.group_by.is_empty();
-            if !is_aggregate && !self.config.key_fields.is_empty() {
+            // Synth-output queries (aggregate / GROUP BY / PIVOT /
+            // UNPIVOT) emit rows that don't map 1:1 to source rows,
+            // so the tombstone filter doesn't apply — applying it
+            // would silently drop every output row because
+            // source_rows is empty for synth output.
+            let synth_output = query.is_aggregate()
+                || !query.group_by.is_empty()
+                || query.is_pivot();
+            if !synth_output && !self.config.key_fields.is_empty() {
                 let live_rows: std::collections::HashSet<u32> =
                     state.key_to_row.values().copied().collect();
                 let mut kept = Vec::with_capacity(result.rows.len());
