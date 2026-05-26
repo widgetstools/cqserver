@@ -61,8 +61,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_offset.rs` paginates 20 rows in chunks of 5 with `OFFSET 0/5/50`.
 
 ## P5 — Engine: fix degenerate-aggregate SOW *(§4 bug 3)*
-**Status:** ⏳
-**Scope:** `SELECT SUM(x) FROM t` (no GROUP BY) should upsert the single empty-key row, not grow by one per refresh.
+**Status:** ✅ done
+**Scope:** `SELECT SUM(x) FROM t` view (no GROUP BY) now stays single-row across refreshes. The fix changes keyless-topic upserts to overwrite row 0 instead of appending — matches AMPS semantics for a degenerate-aggregate view's keyless output topic.
+**Implementation:** `commit_values_locked` in `crates/cq-core/src/topic.rs` — when `key_col_indices.is_empty()` and the store already has a row, update row 0 in place. Topics that need append-only semantics must declare a key field.
+**Tests landed:**
+- Unit `topic::tests::keyless_topic_collapses_to_single_row` — 4 upserts, row_count() stays 1, row 0 holds latest value.
+- E2E `crates/cq-e2e-tests/tests/degenerate_aggregate_view_e2e.rs` — declares a `[[views]]` block with `SELECT SUM(qty) FROM t`, publishes 5 source rows, verifies the view SOW returns exactly 1 row with the running total.
 
 ## P6 — Engine: fix JOIN-view SOW delivery for fresh subscribers *(§4 bug 1)*
 **Status:** ⏳

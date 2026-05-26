@@ -633,10 +633,28 @@ impl Topic {
                 row
             }
         } else {
-            let row = state.store.append_row(values);
-            Self::index_new_row(state, row, values);
-            Self::push_last_touched(state, row, now);
-            row
+            // P5 — keyless topics behave as a single row. Without a
+            // key, every upsert collapses onto row 0 instead of
+            // appending. This is what AMPS does for a degenerate-
+            // aggregate view (`SELECT SUM(x) FROM t` with no GROUP
+            // BY) and matches the AMPS_PARITY §4 bug 3 fix: the
+            // view's SOW stays at exactly one row across refreshes.
+            // Topics that genuinely want append-only semantics must
+            // declare a key field.
+            if state.store.row_count() > 0 {
+                let row = 0u32;
+                Self::reindex_row(state, row, values);
+                state.store.update_row(row, values);
+                if let Some(slot) = state.last_touched.get_mut(row as usize) {
+                    *slot = now;
+                }
+                row
+            } else {
+                let row = state.store.append_row(values);
+                Self::index_new_row(state, row, values);
+                Self::push_last_touched(state, row, now);
+                row
+            }
         }
     }
 
@@ -1892,6 +1910,47 @@ mod tests {
     use crate::schema::ColumnType;
     use crate::subscription::DeltaType;
     use compact_str::CompactString;
+
+    // ───── P5 — keyless topics upsert into row 0 (no append) ────────
+
+    fn make_keyless_topic() -> Topic {
+        let schema = Arc::new(Schema::from_strs(
+            &["total"],
+            &[ColumnType::Double],
+        ));
+        let config = TopicConfig {
+            name: "/v_total".into(),
+            key_fields: Vec::new(),
+            persist: false,
+            conflation_ms: None,
+            index_columns: Vec::new(),
+            expire_seconds: None,
+        };
+        Topic::new(config, schema, 16)
+    }
+
+    #[test]
+    fn keyless_topic_collapses_to_single_row() {
+        // AMPS_PARITY §4 bug 3 — without a key, a degenerate-aggregate
+        // view used to grow by one row per refresh. After P5, upserts
+        // with no key overwrite row 0 so the view stays single-row.
+        let topic = make_keyless_topic();
+        for v in &[10.0_f64, 20.0, 30.0, 60.0] {
+            let mut m = serde_json::Map::new();
+            m.insert("total".into(), (*v).into());
+            topic.upsert_map(&m).expect("upsert");
+        }
+        assert_eq!(
+            topic.row_count(),
+            1,
+            "keyless topic must collapse to one row, got {}",
+            topic.row_count()
+        );
+        let snap = topic.query("SELECT total FROM t").expect("query");
+        assert_eq!(snap.rows.len(), 1);
+        let total = snap.rows[0].get("total").and_then(|v| v.as_f64()).unwrap();
+        assert!((total - 60.0).abs() < 1e-9, "row 0 must hold latest value");
+    }
 
     fn make_topic() -> Topic {
         let schema = Arc::new(Schema::from_strs(
