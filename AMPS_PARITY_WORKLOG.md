@@ -116,8 +116,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_join_on.rs` runs the same JOIN as both `JOIN ... ON a.cusip = b.cusip` and `JOIN ... USING (cusip)` and asserts identical per-sector exposure rollups.
 
 ## P12 — JOIN: LEFT OUTER JOIN *(§1.4 row 3)*
-**Status:** ⏳
-**Scope:** When no right-side match, emit the left row with right-side columns as NULL.
+**Status:** ✅ done
+**Scope:** `LEFT JOIN` / `LEFT OUTER JOIN` keeps every left row in the output; right-side columns are emitted as JSON `null` when no right-side match. Works with both `USING (col)` and `ON a.col = b.col` (the P11 translation).
+**Implementation:** `JoinSpec.kind: JoinKind { Inner, LeftOuter }` added. Parser accepts `JoinOperator::Left` + `JoinOperator::LeftOuter` and sets the kind. `execute_join_query` branches at row-build time: on no right match (or NULL left key), `Inner` skips, `LeftOuter` emits with `Value::Null` for every right-side column.
+**Tests landed:**
+- 3 unit tests in `query::tests::{parse_left_outer_join_using_succeeds, parse_left_outer_join_on_equi, left_outer_join_emits_nulls_for_unmatched_left_rows}`.
+- E2E `crates/cq-e2e-tests/tests/parser_left_outer_join.rs` runs INNER + LEFT OUTER on the same two-topic fixture; LEFT OUTER keeps the unmatched left row with `sector: null`.
 
 ## P13 — WHERE: regex match (MATCHES_REGEX / LIKE_REGEX) *(§1.2 row 7)*
 **Status:** ⏳

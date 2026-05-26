@@ -347,10 +347,20 @@ fn compile_having(
 pub struct JoinSpec {
     /// Topic name on the right side of the JOIN.
     pub right_topic: String,
-    /// USING column names (must exist on BOTH sides). Today only
-    /// INNER JOIN + USING is supported; LEFT OUTER + ON-with-Expr
-    /// are tracked as follow-ups.
+    /// USING column names (must exist on BOTH sides). Populated either
+    /// from a literal `USING (col, ...)` clause or translated from
+    /// `ON a.col = b.col` (P11).
     pub using: Vec<String>,
+    /// P12 — `Inner` (default) or `LeftOuter`. The executor swaps to
+    /// "emit left row with right cols as NULL when no match" for
+    /// `LeftOuter`.
+    pub kind: JoinKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
 }
 
 /// Compiled `PIVOT (...) FOR col IN (lit, lit, ...)` spec.
@@ -1061,13 +1071,15 @@ fn parse_join_clause(
             ))
         }
     };
-    // Accept `[INNER] JOIN ... USING (col, ...)` only.
+    // P11/P12 — accept INNER (`JOIN`, `INNER JOIN`) and LEFT OUTER
+    // (`LEFT JOIN`, `LEFT OUTER JOIN`). RIGHT/FULL OUTER are deferred.
     use sqlparser::ast::{JoinConstraint, JoinOperator};
-    let constraint = match &j.join_operator {
-        JoinOperator::Inner(c) | JoinOperator::Join(c) => c,
+    let (constraint, kind) = match &j.join_operator {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => (c, JoinKind::Inner),
+        JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (c, JoinKind::LeftOuter),
         _ => {
             return Err(QueryError::ParseError(
-                "Only INNER JOIN is supported today".into(),
+                "Only INNER JOIN and LEFT OUTER JOIN are supported today".into(),
             ))
         }
     };
@@ -1106,6 +1118,7 @@ fn parse_join_clause(
     Ok(Some(JoinSpec {
         right_topic,
         using,
+        kind,
     }))
 }
 
@@ -3206,29 +3219,63 @@ pub fn execute_join_query(
         }
     }
 
-    // Materialize the joined rows into a temp ColumnStore.
+    // Materialize the joined rows into a temp ColumnStore. For
+    // LEFT OUTER (P12), left rows with no matching right row are
+    // still emitted; the right-side columns are filled with
+    // `Value::Null`.
     let left_row_count = left_store.row_count();
     let mut combined =
         ColumnStore::new(combined_schema.clone(), left_row_count as usize + 16);
     let mut row_buf: Vec<Value> = Vec::with_capacity(combined_sources.len());
+    let is_left_outer = join.kind == JoinKind::LeftOuter;
     for lr in 0..left_row_count {
         let key = match key_for(left_store, lr, &left_using) {
             Some(k) => k,
-            None => continue, // left key NULL → inner join drops
+            None => {
+                // Left key NULL: INNER drops; LEFT OUTER keeps the row
+                // (right columns NULL).
+                if !is_left_outer {
+                    continue;
+                }
+                row_buf.clear();
+                for (side, src) in &combined_sources {
+                    let v = match side {
+                        Side::Left => left_store.get(*src, lr),
+                        Side::Right => Value::Null,
+                    };
+                    row_buf.push(v);
+                }
+                combined.append_row(&row_buf);
+                continue;
+            }
         };
-        let rr = match right_index.get(&key).copied() {
-            Some(rr) => rr,
-            None => continue, // no right match → inner join drops
-        };
-        row_buf.clear();
-        for (side, src) in &combined_sources {
-            let v = match side {
-                Side::Left => left_store.get(*src, lr),
-                Side::Right => right_store.get(*src, rr),
-            };
-            row_buf.push(v);
+        match right_index.get(&key).copied() {
+            Some(rr) => {
+                row_buf.clear();
+                for (side, src) in &combined_sources {
+                    let v = match side {
+                        Side::Left => left_store.get(*src, lr),
+                        Side::Right => right_store.get(*src, rr),
+                    };
+                    row_buf.push(v);
+                }
+                combined.append_row(&row_buf);
+            }
+            None => {
+                if !is_left_outer {
+                    continue;
+                }
+                row_buf.clear();
+                for (side, src) in &combined_sources {
+                    let v = match side {
+                        Side::Left => left_store.get(*src, lr),
+                        Side::Right => Value::Null,
+                    };
+                    row_buf.push(v);
+                }
+                combined.append_row(&row_buf);
+            }
         }
-        combined.append_row(&row_buf);
     }
 
     // Strip the join off the query for the downstream executor — it's
@@ -3597,18 +3644,101 @@ mod tests {
         assert_eq!(q.group_by.len(), 1);
     }
 
+    // (Was `parse_join_rejects_left_outer_for_now` — superseded by
+    // P12 which accepts LEFT OUTER JOIN. See the P12 tests below.)
+
+    // ───── P12 — LEFT OUTER JOIN ─────────────────────────────────────
+
     #[test]
-    fn parse_join_rejects_left_outer_for_now() {
+    fn parse_left_outer_join_using_succeeds() {
         let combined = Schema::from_strs(
             &["k", "v"],
             &[ColumnType::String, ColumnType::Long],
         );
-        let r = parse_query(
-            "SELECT v FROM a LEFT JOIN b USING (k)",
+        let q = parse_query("SELECT v FROM a LEFT JOIN b USING (k)", &combined)
+            .expect("LEFT JOIN USING must parse");
+        let j = q.join.expect("join");
+        assert_eq!(j.kind, JoinKind::LeftOuter);
+        let q2 = parse_query(
+            "SELECT v FROM a LEFT OUTER JOIN b USING (k)",
             &combined,
-        );
-        assert!(r.is_err(), "LEFT OUTER JOIN must be rejected today");
+        )
+        .expect("LEFT OUTER JOIN USING must parse");
+        assert_eq!(q2.join.unwrap().kind, JoinKind::LeftOuter);
     }
+
+    #[test]
+    fn parse_left_outer_join_on_equi() {
+        let combined = Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Long],
+        );
+        let q = parse_query(
+            "SELECT v FROM a LEFT JOIN b ON a.k = b.k",
+            &combined,
+        )
+        .expect("LEFT JOIN ON-equi must parse");
+        let j = q.join.unwrap();
+        assert_eq!(j.kind, JoinKind::LeftOuter);
+        assert_eq!(j.using, vec!["k".to_string()]);
+    }
+
+    #[test]
+    fn left_outer_join_emits_nulls_for_unmatched_left_rows() {
+        // left: cusip in {AAPL, MSFT}; right: cusip in {AAPL}.
+        // INNER JOIN drops MSFT; LEFT OUTER JOIN keeps MSFT with
+        // sector = NULL.
+        let left_schema = Arc::new(Schema::from_strs(
+            &["cusip", "qty"],
+            &[ColumnType::String, ColumnType::Long],
+        ));
+        let right_schema = Arc::new(Schema::from_strs(
+            &["cusip", "sector"],
+            &[ColumnType::String, ColumnType::String],
+        ));
+        let mut left = ColumnStore::new(left_schema.clone(), 8);
+        let mut right = ColumnStore::new(right_schema.clone(), 8);
+        left.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::Long(10),
+        ]);
+        left.append_row(&[
+            Value::String(Some(CompactString::new("MSFT"))),
+            Value::Long(20),
+        ]);
+        right.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::String(Some(CompactString::new("Tech"))),
+        ]);
+
+        let combined = combined_join_schema(&left_schema, &right_schema, &["cusip".to_string()]);
+        let q = parse_query(
+            "SELECT cusip, qty, sector FROM positions \
+             LEFT JOIN securities USING (cusip)",
+            &combined,
+        )
+        .unwrap();
+        let r = execute_join_query(&q, &left, &right).unwrap();
+        assert_eq!(r.rows.len(), 2, "LEFT OUTER keeps both left rows");
+        let by_cusip: std::collections::HashMap<String, serde_json::Value> = r
+            .rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get("cusip").unwrap().as_str().unwrap().to_string(),
+                    row.get("sector").cloned().unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
+        assert_eq!(by_cusip["AAPL"].as_str().unwrap(), "Tech");
+        assert!(
+            by_cusip["MSFT"].is_null(),
+            "unmatched left row's sector must be JSON null, got {:?}",
+            by_cusip["MSFT"]
+        );
+    }
+
+
 
     // (Was `parse_join_rejects_on_clause_for_now` — superseded by P11
     // which translates ON-equi-same-name to USING. See
