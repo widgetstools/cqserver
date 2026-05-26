@@ -41,6 +41,9 @@ pub struct ParsedQuery {
     pub order_by: Vec<(usize, bool)>,
     /// LIMIT clause.
     pub limit: Option<usize>,
+    /// P4 — OFFSET clause. Skips the first `offset` rows of the
+    /// (sorted) result before LIMIT applies.
+    pub offset: Option<usize>,
     /// Aggregate output specs. Non-empty iff this is an aggregate
     /// query. Order matches the order they appeared in the SELECT.
     pub aggregates: Vec<AggregateSpec>,
@@ -882,19 +885,17 @@ fn parse_select(
     // --- ORDER BY ---
     let order_by = parse_order_by(&query.order_by, schema)?;
 
-    // --- LIMIT ---
-    let limit = match query.limit_clause.as_ref() {
-        Some(sqlparser::ast::LimitClause::LimitOffset { limit: Some(l), .. }) => {
-            if let Expr::Value(sqlparser::ast::ValueWithSpan {
-                value: sqlparser::ast::Value::Number(n, _), ..
-            }) = l
-            {
-                n.parse::<usize>().ok()
-            } else {
-                None
-            }
+    // --- LIMIT + OFFSET (P4) ---
+    let (limit, offset) = match query.limit_clause.as_ref() {
+        Some(sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. }) => {
+            let lim = limit.as_ref().and_then(extract_usize_literal);
+            let off = offset.as_ref().and_then(|o| extract_usize_literal(&o.value));
+            (lim, off)
         }
-        _ => None,
+        Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+            (extract_usize_literal(limit), extract_usize_literal(offset))
+        }
+        None => (None, None),
     };
 
     Ok(ParsedQuery {
@@ -910,7 +911,22 @@ fn parse_select(
         join: join_spec,
         computed,
         having,
+        offset,
     })
+}
+
+/// P4 — extract a numeric literal as `usize`. Returns `None` for any
+/// non-literal or non-fitting value. Used by the LIMIT/OFFSET parser.
+fn extract_usize_literal(expr: &Expr) -> Option<usize> {
+    if let Expr::Value(sqlparser::ast::ValueWithSpan {
+        value: sqlparser::ast::Value::Number(n, _),
+        ..
+    }) = expr
+    {
+        n.parse::<usize>().ok()
+    } else {
+        None
+    }
 }
 
 /// Strip the surrounding sqlparser identifier quotes (`"`, `` ` ``, `[`/`]`)
@@ -1116,6 +1132,7 @@ fn parse_pivot_query(
         join: None,
         computed: Vec::new(),
         having: None,
+        offset: None,
     })
 }
 
@@ -1229,6 +1246,7 @@ fn parse_unpivot_query(
         join: None,
         computed: Vec::new(),
         having: None,
+        offset: None,
     })
 }
 
@@ -1811,7 +1829,16 @@ pub fn execute_query_with_index_filtered(
         });
     }
 
-    // Step 3: Limit
+    // Step 3a: OFFSET (P4) — applied AFTER ORDER BY, BEFORE LIMIT.
+    if let Some(off) = query.offset {
+        if off >= matching_rows.len() {
+            matching_rows.clear();
+        } else {
+            matching_rows.drain(..off);
+        }
+    }
+
+    // Step 3b: Limit
     if let Some(limit) = query.limit {
         matching_rows.truncate(limit);
     }
@@ -3329,6 +3356,51 @@ mod tests {
         assert_eq!(join.right_topic, "securities");
         assert_eq!(join.using, vec!["cusip".to_string()]);
         assert_eq!(q.topic, "positions");
+    }
+
+    // ───── P4 — OFFSET clause ───────────────────────────────────────
+
+    #[test]
+    fn parses_limit_offset() {
+        let (schema, _) = make_store();
+        let q = parse_query(
+            "SELECT symbol FROM trades ORDER BY price LIMIT 2 OFFSET 1",
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(q.limit, Some(2));
+        assert_eq!(q.offset, Some(1));
+    }
+
+    #[test]
+    fn offset_skips_first_n_rows() {
+        let (schema, store) = make_store();
+        // 5 rows by price desc: AMZN(3400), GOOGL(2800), MSFT(300),
+        // NVDA(250), AAPL(150). OFFSET 2 LIMIT 2 → MSFT, NVDA.
+        let q = parse_query(
+            "SELECT symbol FROM trades ORDER BY price DESC LIMIT 2 OFFSET 2",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "MSFT");
+        assert_eq!(r.rows[1].get("symbol").unwrap().as_str().unwrap(), "NVDA");
+    }
+
+    #[test]
+    fn offset_only_skips_without_limit() {
+        let (schema, store) = make_store();
+        // Same ORDER BY, skip 3, no LIMIT → NVDA, AAPL.
+        let q = parse_query(
+            "SELECT symbol FROM trades ORDER BY price DESC OFFSET 3",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "NVDA");
+        assert_eq!(r.rows[1].get("symbol").unwrap().as_str().unwrap(), "AAPL");
     }
 
     // ───── P3 — HAVING clause ───────────────────────────────────────

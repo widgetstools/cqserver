@@ -53,8 +53,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_having.rs` — `HAVING SUM(qty) > 50` against a real server, plus alias-form and AND-combined forms.
 
 ## P4 — Parser: OFFSET clause *(§1.5 row 6)*
-**Status:** ⏳
-**Scope:** `LIMIT n OFFSET m` skips the first `m` rows of the ordered result.
+**Status:** ✅ done
+**Scope:** `LIMIT n OFFSET m` (and MySQL-style `LIMIT m, n`) skips the first `m` rows of the (sorted) result before LIMIT applies.
+**Implementation:** `offset: Option<usize>` on `ParsedQuery`; parser extracts it via `extract_usize_literal` helper; non-aggregate executor drains the first `m` matching rows after ORDER BY, before LIMIT.
+**Tests landed:**
+- 3 unit tests in `query::tests::{parses_limit_offset, offset_skips_first_n_rows, offset_only_skips_without_limit}`.
+- E2E `crates/cq-e2e-tests/tests/parser_offset.rs` paginates 20 rows in chunks of 5 with `OFFSET 0/5/50`.
 
 ## P5 — Engine: fix degenerate-aggregate SOW *(§4 bug 3)*
 **Status:** ⏳
