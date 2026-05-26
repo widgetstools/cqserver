@@ -92,6 +92,7 @@ pub async fn start_admin_server(
         .route("/admin/views", get(get_views))
         .route("/admin/config", get(get_config_toml))
         .route("/admin/clients", get(get_clients))
+        .route("/admin/add-column/:topic", post(add_column_endpoint))
         .with_state(state);
 
     // U7: serve the admin-ui static bundle under /ui. Resolved
@@ -186,6 +187,64 @@ async fn get_stats(State(s): State<AdminState>) -> impl IntoResponse {
 async fn get_topics(State(s): State<AdminState>) -> impl IntoResponse {
     let topics: Vec<_> = s.topics.iter().map(|e| e.value().stats()).collect();
     Json(serde_json::Value::Array(topics))
+}
+
+/// Q11 — `POST /admin/add-column/{topic}?name=NAME&type=TYPE` —
+/// append a column to a topic's schema online. Existing rows get
+/// the new column set to the type's null sentinel. Returns
+/// `{topic, added: NAME, type: TYPE}` on success.
+async fn add_column_endpoint(
+    State(s): State<AdminState>,
+    Path(topic): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let name = match params.get("name") {
+        Some(n) if !n.is_empty() => n.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing required `name` query parameter",
+            )
+                .into_response();
+        }
+    };
+    let type_str = match params.get("type") {
+        Some(t) => t.to_ascii_lowercase(),
+        None => "string".into(),
+    };
+    let col_type = match type_str.as_str() {
+        "double" => cq_core::schema::ColumnType::Double,
+        "long" => cq_core::schema::ColumnType::Long,
+        "int" => cq_core::schema::ColumnType::Int,
+        "string" => cq_core::schema::ColumnType::String,
+        "bool" => cq_core::schema::ColumnType::Bool,
+        "timestamp" => cq_core::schema::ColumnType::Timestamp,
+        "bytes" => cq_core::schema::ColumnType::Bytes,
+        other => {
+            return (StatusCode::BAD_REQUEST, format!("unknown type `{other}`"))
+                .into_response();
+        }
+    };
+    let topic_arc = match s.topics.get(&topic) {
+        Some(t) => t.clone(),
+        None => return (StatusCode::NOT_FOUND, "no such topic").into_response(),
+    };
+    match topic_arc.add_column(&name, col_type) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "topic": topic,
+                "added": name,
+                "type": type_str,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            format!("add_column failed: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 /// Q6 — per-client stats aggregated across each session's

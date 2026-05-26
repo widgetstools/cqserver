@@ -271,8 +271,15 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 **Out of scope (still deferred):** `Array` and `Object` as first-class column types — would each need their own backing store, JSON parsing rules, and predicate semantics (`json_extract`, `array_length`, etc.). Nested JSON continues to flatten via dotted-paths into String columns (existing behaviour).
 
 ## Q11 — Schema evolution (online add column) *(§2 row 12)*
-**Status:** ⏳
-**Scope:** `ALTER TABLE t ADD COLUMN c <type> [NULL]` applied without dropping subscribers. Existing rows get the column with `NULL`; running queries that referenced the previous schema continue against their pinned `Arc<Schema>` until they re-parse.
+**Status:** ✅ done
+**Scope:** New `Topic::add_column(name, type)` + `POST /admin/add-column/{topic}?name=NAME&type=TYPE` endpoint. Atomically appends a column to the topic schema, preserves every existing row's column values, and initialises the new column to NULL for existing rows. New publishes can populate it immediately. Column INDICES are stable across the swap so existing parsed-query state stays valid (only the column count grows).
+**Implementation:**
+- `cq-core/topic.rs`: `Topic::add_column` takes `state.write()`, builds a new `Schema` with the appended column, allocates a new `ColumnStore`, replays every existing row through `commit_values_locked` (the new col defaults to `Value::Null`), and atomically swaps `state`.
+- `cq-server/admin.rs`: new `/admin/add-column/{topic}?name=&type=` route. Accepts all 7 column types (Double, Long, Int, String, Bool, Timestamp, Bytes).
+**Tests landed:**
+- 2 unit tests in `topic::tests::{add_column_appends_with_null_default_preserving_existing_rows, add_column_rejects_duplicate_name}`. Pre-evolution rows surface with the new column absent from the projected map (cqserver's sparse-null semantics); post-evolution publishes populate it.
+- E2E `crates/cq-e2e-tests/tests/admin_add_column.rs` — seed a row on the original schema, POST the admin endpoint, publish a new row with the new column populated, filter SOW by the new column.
+**Out of scope (deferred):** ALTER TABLE SQL surface (route is admin-only today), DROP COLUMN, RENAME COLUMN, type-change migrations — each non-trivial under the assumption that subscribers hold pinned schema references.
 
 ## Q12 — AS OF JOIN (temporal) *(§1.4 row 7)*
 **Status:** ⏳

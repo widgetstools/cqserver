@@ -585,6 +585,82 @@ impl Topic {
     /// subscribers, derive a real schema from the top-level keys of `map`
     /// and atomically replace the underlying store. Idempotent: a no-op
     /// once a real schema is installed or once data exists.
+    /// Q11 — online schema evolution: append a new column to this
+    /// topic. Every existing row gets the new column set to its
+    /// type's null sentinel; new publishes can populate it
+    /// immediately. Existing subscribers / parsed queries keep
+    /// working because column appending preserves every existing
+    /// column index — only the column count grows.
+    ///
+    /// Errors if the column name already exists. Other in-flight
+    /// publishes block on the state.write() lock for the duration
+    /// of the swap (typically O(rows) to copy column data into the
+    /// new store).
+    pub fn add_column(
+        &self,
+        name: &str,
+        col_type: ColumnType,
+    ) -> Result<(), TopicError> {
+        let mut state = self.state.write();
+        if state.schema.index_of(name).is_some() {
+            return Err(TopicError::Serialize(serde_json::Error::io(
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("column `{name}` already exists"),
+                ),
+            )));
+        }
+        // Build new schema = old cols ++ new col.
+        let mut new_names: Vec<CompactString> = state
+            .schema
+            .columns()
+            .iter()
+            .map(|c| CompactString::new(c.name()))
+            .collect();
+        let mut new_types: Vec<ColumnType> =
+            state.schema.columns().iter().map(|c| c.col_type()).collect();
+        new_names.push(CompactString::new(name));
+        new_types.push(col_type);
+        let new_schema = Arc::new(Schema::new(new_names, new_types));
+
+        let capacity = state.store.capacity();
+        let row_count = state.store.row_count();
+        let mut new_state = StoreState::build(
+            new_schema.clone(),
+            &self.config.key_fields,
+            &self.config.index_columns,
+            capacity,
+        );
+
+        // Copy every existing row into the new store. The new column
+        // gets the type's null sentinel automatically (ColumnStore::new
+        // initialises with nulls).
+        let old_col_count = state.schema.column_count();
+        for row in 0..row_count {
+            let mut values: Vec<Value> = Vec::with_capacity(old_col_count + 1);
+            for c in 0..old_col_count {
+                values.push(state.store.get(c, row));
+            }
+            // The new column starts NULL.
+            values.push(Value::Null);
+            Self::commit_values_locked(&mut new_state, &values);
+        }
+        // Preserve last_touched timestamps (best effort: copy what we
+        // have, default the rest to now).
+        let now = std::time::Instant::now();
+        for slot in &mut new_state.last_touched {
+            *slot = now;
+        }
+        *state = new_state;
+        tracing::info!(
+            topic = %self.config.name,
+            new_col = %name,
+            new_col_type = ?col_type,
+            "Schema evolved: column added"
+        );
+        Ok(())
+    }
+
     pub fn maybe_discover_schema(&self, map: &serde_json::Map<String, serde_json::Value>) {
         // Cheap pre-check without taking the write lock.
         {
@@ -1955,6 +2031,67 @@ mod tests {
     use crate::schema::ColumnType;
     use crate::subscription::DeltaType;
     use compact_str::CompactString;
+
+    // ───── Q11 — schema evolution: online add column ─────────────────
+
+    #[test]
+    fn add_column_appends_with_null_default_preserving_existing_rows() {
+        let topic = make_topic();
+        // Publish 2 rows on the original 3-col schema (symbol, price,
+        // quantity).
+        let mut r1 = serde_json::Map::new();
+        r1.insert("symbol".into(), "AAPL".into());
+        r1.insert("price".into(), 150.0.into());
+        r1.insert("quantity".into(), 100i64.into());
+        topic.upsert_map(&r1).unwrap();
+        let mut r2 = serde_json::Map::new();
+        r2.insert("symbol".into(), "MSFT".into());
+        r2.insert("price".into(), 300.0.into());
+        r2.insert("quantity".into(), 50i64.into());
+        topic.upsert_map(&r2).unwrap();
+        assert_eq!(topic.row_count(), 2);
+
+        // Add a `desk` column online.
+        topic
+            .add_column("desk", ColumnType::String)
+            .expect("add_column");
+        let schema = topic.schema();
+        assert_eq!(schema.column_count(), 4);
+        assert_eq!(schema.column_name(3), "desk");
+
+        // Existing rows still resolvable via the original key + cols.
+        // cqserver omits null fields from the projected map (sparse
+        // semantics), so `desk` is ABSENT on rows published before
+        // the column was added — equivalent to JSON null on the wire.
+        let rows = topic.query("SELECT symbol, price, desk FROM t").unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        for row in &rows.rows {
+            assert!(
+                !row.contains_key("desk"),
+                "desk should be absent (=null) for pre-evolution rows, got {row:?}"
+            );
+        }
+
+        // New publishes can populate the new column.
+        let mut r3 = serde_json::Map::new();
+        r3.insert("symbol".into(), "GOOGL".into());
+        r3.insert("price".into(), 2800.0.into());
+        r3.insert("quantity".into(), 10i64.into());
+        r3.insert("desk".into(), "RATES".into());
+        topic.upsert_map(&r3).unwrap();
+        let rows = topic
+            .query("SELECT symbol, desk FROM t WHERE desk = 'RATES'")
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].get("symbol").unwrap().as_str().unwrap(), "GOOGL");
+    }
+
+    #[test]
+    fn add_column_rejects_duplicate_name() {
+        let topic = make_topic();
+        let r = topic.add_column("symbol", ColumnType::String);
+        assert!(r.is_err(), "duplicate column name must error");
+    }
 
     // ───── P14 — canonicalize_topic ─────────────────────────────────
 
