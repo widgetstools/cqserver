@@ -1449,6 +1449,11 @@ fn parse_pivot_value_list(
                 crate::predicate::extract_timestamp(&it.expr)
                     .map_err(QueryError::PredicateError)?,
             ),
+            ColumnType::Bytes => {
+                return Err(QueryError::ParseError(
+                    "PIVOT on a bytes column is not supported".into(),
+                ));
+            }
         };
         out.push(lit);
     }
@@ -2544,6 +2549,16 @@ impl GroupKeyPart {
             Value::Bool(Some(b)) => GroupKeyPart::Bool(*b),
             Value::Timestamp(t) if *t == crate::store::NULL_TIMESTAMP => GroupKeyPart::Null,
             Value::Timestamp(t) => GroupKeyPart::Timestamp(*t),
+            // Q10 — Bytes group keys: treat null as Null, non-null
+            // as the base64-encoded form (lets GROUP BY bytes work
+            // even though the storage is a Vec<u8>).
+            Value::Bytes(None) => GroupKeyPart::Null,
+            Value::Bytes(Some(b)) => {
+                use base64::Engine;
+                GroupKeyPart::String(compact_str::CompactString::new(
+                    base64::engine::general_purpose::STANDARD.encode(b),
+                ))
+            }
         }
     }
 
@@ -3110,6 +3125,9 @@ fn compare_values(store: &ColumnStore, col: usize, row_a: u32, row_b: u32) -> Or
             let b = store.get_timestamp(col, row_b);
             a.cmp(&b)
         }
+        // Q10 — bytes columns aren't sortable in the AMPS sense.
+        // Treat all values as equal in ORDER BY (stable position).
+        ColumnType::Bytes => Ordering::Equal,
     }
 }
 
@@ -4074,6 +4092,60 @@ mod tests {
 
     // (Was `parse_join_rejects_left_outer_for_now` — superseded by
     // P12 which accepts LEFT OUTER JOIN. See the P12 tests below.)
+
+    // ───── Q10 — Bytes column type ───────────────────────────────────
+
+    #[test]
+    fn bytes_column_round_trips_via_value() {
+        let s = Arc::new(Schema::from_strs(
+            &["k", "blob"],
+            &[ColumnType::String, ColumnType::Bytes],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 8);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("a"))),
+            Value::Bytes(Some(vec![0x00, 0x01, 0x02, 0xff])),
+        ]);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("b"))),
+            Value::Bytes(None),
+        ]);
+        // Round-trip the bytes via get().
+        let row0 = store.get(1, 0);
+        assert_eq!(row0, Value::Bytes(Some(vec![0x00, 0x01, 0x02, 0xff])));
+        let row1 = store.get(1, 1);
+        assert!(row1.is_null());
+        // to_json emits base64.
+        let json = row0.to_json();
+        assert_eq!(json.as_str().unwrap(), "AAEC/w==");
+        // from_json reverses.
+        let parsed = Value::from_json(
+            &serde_json::Value::String("AAEC/w==".into()),
+            ColumnType::Bytes,
+        );
+        assert_eq!(parsed, Value::Bytes(Some(vec![0x00, 0x01, 0x02, 0xff])));
+    }
+
+    #[test]
+    fn bytes_filter_is_null_works() {
+        let s = Arc::new(Schema::from_strs(
+            &["k", "blob"],
+            &[ColumnType::String, ColumnType::Bytes],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 8);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("a"))),
+            Value::Bytes(Some(vec![0xde, 0xad])),
+        ]);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("b"))),
+            Value::Bytes(None),
+        ]);
+        let q = parse_query("SELECT k FROM t WHERE blob IS NULL", &s).unwrap();
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].get("k").unwrap().as_str().unwrap(), "b");
+    }
 
     // ───── Q9 — subqueries ───────────────────────────────────────────
 

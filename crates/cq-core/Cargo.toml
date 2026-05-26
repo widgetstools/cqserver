@@ -14,6 +14,7 @@ cq-txlog = { path = "../cq-txlog" }
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true
+base64.workspace = true
 roaring.workspace = true
 compact_str.workspace = true
 ahash.workspace = true
@@ -36,6 +37,12 @@ tokio = { workspace = true, features = ["sync"] }
 # is visible to the encoder code.
 itoa = "1"
 ryu = "1"
+
+# Used by `ColumnType::Timestamp` for RFC 3339 / ISO 8601 parsing on
+# ingest and rendering on output. The internal columnar representation
+# is i64 microseconds since UNIX epoch; chrono just covers the wire
+# format and `NOW()`-style helpers.
+chrono.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

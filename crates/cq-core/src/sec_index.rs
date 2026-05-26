@@ -37,6 +37,11 @@ pub enum IxKey {
     /// `from_value` constructor refuses NaN — they're treated as null).
     DoubleBits(u64),
     String(CompactString),
+    Bool(bool),
+    /// i64 microseconds since UNIX epoch — same representation as
+    /// `Long`, but a separate variant so equality with a `Long` key
+    /// at the same value doesn't accidentally collide.
+    Timestamp(i64),
 }
 
 impl IxKey {
@@ -54,6 +59,20 @@ impl IxKey {
             Value::Int(n) => Some(IxKey::Int(*n)),
             Value::Double(d) if d.is_nan() || *d == NULL_DOUBLE => None,
             Value::Double(d) => Some(IxKey::DoubleBits(d.to_bits())),
+            Value::Bool(None) => None,
+            Value::Bool(Some(b)) => Some(IxKey::Bool(*b)),
+            Value::Timestamp(t) if *t == crate::store::NULL_TIMESTAMP => None,
+            Value::Timestamp(t) => Some(IxKey::Timestamp(*t)),
+            // Q10 — bytes columns aren't indexable (no canonical
+            // ordering); skip nulls + index by base64 string so
+            // equality lookups still work.
+            Value::Bytes(None) => None,
+            Value::Bytes(Some(b)) => {
+                use base64::Engine;
+                Some(IxKey::String(compact_str::CompactString::new(
+                    base64::engine::general_purpose::STANDARD.encode(b),
+                )))
+            }
         }
     }
 }
@@ -72,6 +91,11 @@ pub enum RangeKey {
     /// matches the `f64` total order.
     DoubleOrdered(u64),
     String(CompactString),
+    /// Boolean keys order false < true (matches SQL semantics).
+    Bool(bool),
+    /// i64 microseconds since UNIX epoch — natural i64 ordering is
+    /// chronological.
+    Timestamp(i64),
 }
 
 /// Encode an `f64` into a `u64` whose `Ord` matches the `f64` total
@@ -104,6 +128,18 @@ impl RangeKey {
             Value::Int(n) => Some(RangeKey::Int(*n)),
             Value::Double(d) if d.is_nan() || *d == NULL_DOUBLE => None,
             Value::Double(d) => Some(RangeKey::DoubleOrdered(f64_to_ordered_bits(*d))),
+            Value::Bool(None) => None,
+            Value::Bool(Some(b)) => Some(RangeKey::Bool(*b)),
+            Value::Timestamp(t) if *t == crate::store::NULL_TIMESTAMP => None,
+            Value::Timestamp(t) => Some(RangeKey::Timestamp(*t)),
+            // Q10 — bytes: index by base64 string for equality lookup.
+            Value::Bytes(None) => None,
+            Value::Bytes(Some(b)) => {
+                use base64::Engine;
+                Some(RangeKey::String(compact_str::CompactString::new(
+                    base64::engine::general_purpose::STANDARD.encode(b),
+                )))
+            }
         }
     }
 

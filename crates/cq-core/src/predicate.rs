@@ -591,6 +591,8 @@ impl CompiledPredicate {
                     ColumnType::Timestamp => {
                         store.get_timestamp(*col, row) == crate::store::NULL_TIMESTAMP
                     }
+                    // Q10 — Bytes nullness via generic Value path.
+                    ColumnType::Bytes => store.get(*col, row).is_null(),
                 }
             }
             CompiledPredicate::IsNotNull { col } => {
@@ -604,6 +606,7 @@ impl CompiledPredicate {
                     ColumnType::Timestamp => {
                         store.get_timestamp(*col, row) != crate::store::NULL_TIMESTAMP
                     }
+                    ColumnType::Bytes => !store.get(*col, row).is_null(),
                 }
             }
 
@@ -858,6 +861,12 @@ pub fn compile_expr(
                         .collect::<Result<_, _>>()?;
                     CompiledPredicate::InTimestamp { col, values }
                 }
+                // Q10 — Bytes doesn't support IN; reject cleanly.
+                ColumnType::Bytes => {
+                    return Err(PredicateError::TypeMismatch(
+                        "IN list on bytes column not supported".into(),
+                    ));
+                }
             };
             if *negated {
                 Ok(CompiledPredicate::Not(Box::new(pred)))
@@ -1109,6 +1118,12 @@ fn compile_comparison(
                 _ => unreachable!(),
             })
         }
+        // Q10 — Bytes column: only `=`/`<>` against a string literal
+        // (the base64 form). Other comparisons (ordering) are rejected
+        // since bytes have no canonical order semantics.
+        ColumnType::Bytes => Err(PredicateError::TypeMismatch(
+            "comparisons on bytes columns are not yet supported".into(),
+        )),
     }
 }
 

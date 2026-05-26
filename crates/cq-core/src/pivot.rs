@@ -69,6 +69,14 @@ impl AnchorKeyPart {
             Value::Bool(Some(b)) => AnchorKeyPart::Bool(*b),
             Value::Timestamp(t) if *t == NULL_TIMESTAMP => AnchorKeyPart::Null,
             Value::Timestamp(t) => AnchorKeyPart::Timestamp(*t),
+            // Q10 — bytes anchor: base64 string.
+            Value::Bytes(None) => AnchorKeyPart::Null,
+            Value::Bytes(Some(b)) => {
+                use base64::Engine;
+                AnchorKeyPart::String(compact_str::CompactString::new(
+                    base64::engine::general_purpose::STANDARD.encode(b),
+                ))
+            }
         }
     }
 
@@ -149,6 +157,9 @@ fn discover_pivot_values(query: &ParsedQuery, store: &ColumnStore) -> Vec<PivotL
                     seen_timestamps.insert(t);
                 }
             }
+            // Q10 — pivoting on a bytes column isn't useful; treat
+            // as no distinct values discovered.
+            ColumnType::Bytes => {}
         }
     });
     match schema.column_type(pivot.pivot_col) {
@@ -157,9 +168,6 @@ fn discover_pivot_values(query: &ParsedQuery, store: &ColumnStore) -> Vec<PivotL
             seen_longs.into_iter().map(PivotLiteral::Long).collect()
         }
         ColumnType::Double => {
-            // Sort by the f64 value (BTreeSet sorts by bits which is
-            // wrong for negatives). Stable enough for tests; produces
-            // ascending ordering.
             let mut bits: Vec<u64> = seen_double_bits.into_iter().collect();
             bits.sort_by(|a, b| {
                 f64::from_bits(*a)
@@ -173,6 +181,7 @@ fn discover_pivot_values(query: &ParsedQuery, store: &ColumnStore) -> Vec<PivotL
             .into_iter()
             .map(PivotLiteral::Timestamp)
             .collect(),
+        ColumnType::Bytes => Vec::new(),
     }
 }
 
@@ -236,6 +245,8 @@ fn match_pivot_value(
                 _ => false,
             })
         }
+        // Q10 — pivot on bytes col yields no match.
+        ColumnType::Bytes => None,
     }
 }
 

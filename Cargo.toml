@@ -36,6 +36,10 @@ serde_json = "1"
 # SQL parsing
 sqlparser = "0.56"
 
+# Q10 — base64 encode/decode for the `bytes` column type's JSON
+# wire format.
+base64 = "0.22"
+
 # WebSocket
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Supported column types for the columnar store.
+///
+/// Mirrors the AMPS type lattice (Null, Bool, Int64, Float64, String,
+/// Timestamp) that the project spec calls for. The columnar store keeps
+/// one typed `Vec<T>` per primitive — adding a new variant means adding
+/// a parallel backing array in `ColumnStore` and a matching arm
+/// everywhere `ColumnType` is matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColumnType {
@@ -12,11 +18,23 @@ pub enum ColumnType {
     Long,
     Int,
     String,
+    Bool,
+    /// i64 microseconds since UNIX epoch. RFC 3339 / ISO 8601 strings
+    /// parse on ingest; output renders as `2026-05-25T22:48:43.201Z`.
+    Timestamp,
+    /// Q10 — opaque binary blob. JSON wire form is a base64-encoded
+    /// string (input + output). Supports equality (`= '<base64>'`)
+    /// and `IS NULL`; no arithmetic, no sort, no aggregation —
+    /// downstream consumers that need richer ops should decode
+    /// client-side. Backed by `Vec<Option<Vec<u8>>>` in the column
+    /// store.
+    Bytes,
 }
 
 impl ColumnType {
     /// Widen two types to the most permissive common type.
-    /// LONG + DOUBLE → DOUBLE, anything + STRING → STRING.
+    /// LONG + DOUBLE → DOUBLE, BOOL + anything-but-bool → STRING,
+    /// anything else mixed → STRING.
     pub fn widen(self, other: ColumnType) -> ColumnType {
         if self == other {
             return self;
@@ -31,6 +49,9 @@ impl ColumnType {
             (ColumnType::Int, ColumnType::Double) | (ColumnType::Double, ColumnType::Int) => {
                 ColumnType::Double
             }
+            // Bool only co-exists with itself; anything mixed in
+            // collapses to String (matches AMPS coercion rules — once a
+            // column has seen non-bool values it has to stringify).
             _ => ColumnType::String,
         }
     }
@@ -45,7 +66,7 @@ impl ColumnType {
                     ColumnType::Long
                 }
             }
-            serde_json::Value::Bool(_) => ColumnType::String,
+            serde_json::Value::Bool(_) => ColumnType::Bool,
             _ => ColumnType::String,
         }
     }
@@ -176,6 +197,9 @@ impl Schema {
         let mut long_count = 0usize;
         let mut int_count = 0usize;
         let mut string_count = 0usize;
+        let mut bool_count = 0usize;
+        let mut timestamp_count = 0usize;
+        let mut bytes_count = 0usize;
 
         self.columns
             .iter()
@@ -201,6 +225,21 @@ impl Schema {
                         string_count += 1;
                         idx
                     }
+                    ColumnType::Bool => {
+                        let idx = bool_count;
+                        bool_count += 1;
+                        idx
+                    }
+                    ColumnType::Timestamp => {
+                        let idx = timestamp_count;
+                        timestamp_count += 1;
+                        idx
+                    }
+                    ColumnType::Bytes => {
+                        let idx = bytes_count;
+                        bytes_count += 1;
+                        idx
+                    }
                 };
                 ColumnMapping {
                     kind: col.col_type,
@@ -210,22 +249,38 @@ impl Schema {
             .collect()
     }
 
-    /// Count columns of each type.
-    pub fn type_counts(&self) -> (usize, usize, usize, usize) {
-        let mut d = 0;
-        let mut l = 0;
-        let mut i = 0;
-        let mut s = 0;
+    /// Per-primitive column counts. Returned as a struct rather than a
+    /// tuple so adding a new variant doesn't break every caller's
+    /// destructuring at the call site.
+    pub fn type_counts(&self) -> TypeCounts {
+        let mut counts = TypeCounts::default();
         for col in &self.columns {
             match col.col_type {
-                ColumnType::Double => d += 1,
-                ColumnType::Long => l += 1,
-                ColumnType::Int => i += 1,
-                ColumnType::String => s += 1,
+                ColumnType::Double => counts.double += 1,
+                ColumnType::Long => counts.long += 1,
+                ColumnType::Int => counts.int += 1,
+                ColumnType::String => counts.string += 1,
+                ColumnType::Bool => counts.bool += 1,
+                ColumnType::Timestamp => counts.timestamp += 1,
+                ColumnType::Bytes => counts.bytes += 1,
             }
         }
-        (d, l, i, s)
+        counts
     }
+}
+
+/// Per-primitive column counts used by `ColumnStore::new` to size the
+/// backing arrays.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TypeCounts {
+    pub double: usize,
+    pub long: usize,
+    pub int: usize,
+    pub string: usize,
+    pub bool: usize,
+    pub timestamp: usize,
+    /// Q10 — Bytes column count.
+    pub bytes: usize,
 }
 
 #[cfg(test)]
@@ -277,5 +332,39 @@ mod tests {
         assert_eq!(mappings[2].array_index, 0); // c: Long[0]
         assert_eq!(mappings[3].array_index, 1); // d: Double[1]
         assert_eq!(mappings[4].array_index, 1); // e: String[1]
+    }
+
+    #[test]
+    fn test_bool_column_inference_widen_and_mapping() {
+        // Inference: native JSON booleans become Bool, not String.
+        assert_eq!(
+            ColumnType::from_json(&serde_json::Value::Bool(true)),
+            ColumnType::Bool
+        );
+
+        // Widening: Bool only co-exists with itself.
+        assert_eq!(ColumnType::Bool.widen(ColumnType::Bool), ColumnType::Bool);
+        assert_eq!(
+            ColumnType::Bool.widen(ColumnType::Long),
+            ColumnType::String
+        );
+
+        // Schema with a mix of types places Bool columns in their own arena.
+        let schema = Schema::from_strs(
+            &["a", "b", "c", "d"],
+            &[
+                ColumnType::Bool,
+                ColumnType::String,
+                ColumnType::Bool,
+                ColumnType::Long,
+            ],
+        );
+        let mappings = schema.compute_mappings();
+        assert_eq!(mappings[0].array_index, 0); // a: Bool[0]
+        assert_eq!(mappings[2].array_index, 1); // c: Bool[1]
+        let counts = schema.type_counts();
+        assert_eq!(counts.bool, 2);
+        assert_eq!(counts.string, 1);
+        assert_eq!(counts.long, 1);
     }
 }

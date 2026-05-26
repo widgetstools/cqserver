@@ -48,6 +48,10 @@ use std::sync::Arc;
 pub const NULL_DOUBLE: f64 = f64::NAN;
 pub const NULL_LONG: i64 = i64::MIN;
 pub const NULL_INT: i32 = i32::MIN;
+/// Null sentinel for `Timestamp` columns — uses the same i64::MIN
+/// pattern as `Long` since timestamps share its backing primitive
+/// shape (and `i64::MIN` μs is well outside any plausible date range).
+pub const NULL_TIMESTAMP: i64 = i64::MIN;
 
 /// A typed value that can be stored in or retrieved from a column.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +60,14 @@ pub enum Value {
     Long(i64),
     Int(i32),
     String(Option<CompactString>),
+    Bool(Option<bool>),
+    /// i64 microseconds since UNIX epoch. `NULL_TIMESTAMP` (= i64::MIN)
+    /// represents null — same convention as `Long`.
+    Timestamp(i64),
+    /// Q10 — opaque binary blob. `None` = null. JSON wire form is a
+    /// base64 string (input + output). Supports equality + IS NULL
+    /// only; no arithmetic, no sort, no aggregation.
+    Bytes(Option<Vec<u8>>),
     Null,
 }
 
@@ -84,12 +96,29 @@ impl Value {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(Some(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_timestamp_micros(&self) -> Option<i64> {
+        match self {
+            Value::Timestamp(v) if *v != NULL_TIMESTAMP => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
             || matches!(self, Value::Double(v) if v.is_nan())
             || matches!(self, Value::Long(v) if *v == NULL_LONG)
             || matches!(self, Value::Int(v) if *v == NULL_INT)
             || matches!(self, Value::String(None))
+            || matches!(self, Value::Bool(None))
+            || matches!(self, Value::Timestamp(v) if *v == NULL_TIMESTAMP)
+            || matches!(self, Value::Bytes(None))
     }
 
     /// Convert to a serde_json::Value for serialization.
@@ -99,6 +128,15 @@ impl Value {
             Value::Long(v) if *v != NULL_LONG => serde_json::Value::from(*v),
             Value::Int(v) if *v != NULL_INT => serde_json::Value::from(*v),
             Value::String(Some(s)) => serde_json::Value::from(s.as_str()),
+            Value::Bool(Some(b)) => serde_json::Value::from(*b),
+            Value::Timestamp(v) if *v != NULL_TIMESTAMP => {
+                serde_json::Value::from(format_timestamp_micros(*v))
+            }
+            // Q10 — Bytes JSON wire form is base64.
+            Value::Bytes(Some(b)) => {
+                use base64::Engine;
+                serde_json::Value::from(base64::engine::general_purpose::STANDARD.encode(b))
+            }
             _ => serde_json::Value::Null,
         }
     }
@@ -138,8 +176,122 @@ impl Value {
                 }
                 other => Value::String(Some(CompactString::new(other.to_string()))),
             },
+            ColumnType::Bool => match json {
+                serde_json::Value::Bool(b) => Value::Bool(Some(*b)),
+                // Accept canonical string forms so legacy producers
+                // that stringify booleans don't end up with all-null
+                // columns silently.
+                serde_json::Value::String(s) => {
+                    let lc = s.to_ascii_lowercase();
+                    match lc.as_str() {
+                        "true" | "1" | "yes" | "y" => Value::Bool(Some(true)),
+                        "false" | "0" | "no" | "n" => Value::Bool(Some(false)),
+                        _ => Value::Bool(None),
+                    }
+                }
+                serde_json::Value::Number(n) => match n.as_i64() {
+                    Some(0) => Value::Bool(Some(false)),
+                    Some(_) => Value::Bool(Some(true)),
+                    None => Value::Bool(None),
+                },
+                _ => Value::Bool(None),
+            },
+            ColumnType::Timestamp => Value::Timestamp(parse_timestamp_json(json)),
+            // Q10 — Bytes: input is a base64 string. Non-string /
+            // invalid-base64 input becomes null.
+            ColumnType::Bytes => match json {
+                serde_json::Value::String(s) => {
+                    use base64::Engine;
+                    match base64::engine::general_purpose::STANDARD.decode(s) {
+                        Ok(b) => Value::Bytes(Some(b)),
+                        Err(_) => Value::Bytes(None),
+                    }
+                }
+                serde_json::Value::Null => Value::Bytes(None),
+                _ => Value::Bytes(None),
+            },
         }
     }
+}
+
+/// Parse a JSON value into an `i64` microseconds-since-UNIX-epoch
+/// timestamp. Accepts:
+///   * RFC 3339 / ISO 8601 strings (`"2026-05-25T22:48:43.201Z"`,
+///     `"2026-05-25T22:48:43+05:30"`, naive `"2026-05-25T22:48:43"`)
+///   * Date-only strings (`"2026-05-25"`) — treated as UTC midnight
+///   * JSON numbers — interpreted by magnitude:
+///       < 1e11   → seconds since epoch
+///       < 1e14   → milliseconds
+///       < 1e17   → microseconds
+///       otherwise → nanoseconds (divided down)
+///     Lets producers emit Date.now() / Date.now()*1000 / time.time_ns()
+///     without manually choosing a unit. The boundary at 1e11 = ~3171
+///     years past epoch — well clear of practical clock values.
+///
+/// Returns `NULL_TIMESTAMP` on any parse failure rather than erroring;
+/// the store keeps the rest of the row writable and lets `IS NULL`
+/// surface the bad cell.
+pub fn parse_timestamp_json(json: &serde_json::Value) -> i64 {
+    match json {
+        serde_json::Value::Null => NULL_TIMESTAMP,
+        serde_json::Value::String(s) => parse_timestamp_str(s).unwrap_or(NULL_TIMESTAMP),
+        serde_json::Value::Number(n) => {
+            let raw = n.as_i64().unwrap_or(NULL_TIMESTAMP);
+            if raw == NULL_TIMESTAMP {
+                return NULL_TIMESTAMP;
+            }
+            let abs = raw.unsigned_abs();
+            if abs < 100_000_000_000 {
+                raw.saturating_mul(1_000_000) // seconds → μs
+            } else if abs < 100_000_000_000_000 {
+                raw.saturating_mul(1_000) // ms → μs
+            } else if abs < 100_000_000_000_000_000 {
+                raw // already μs
+            } else {
+                raw / 1_000 // ns → μs
+            }
+        }
+        _ => NULL_TIMESTAMP,
+    }
+}
+
+fn parse_timestamp_str(s: &str) -> Option<i64> {
+    // Try full RFC 3339 with timezone first — covers `Z`, `+HH:MM` etc.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.timestamp_micros().into();
+    }
+    // Naive datetime without zone: treat as UTC.
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return naive.and_utc().timestamp_micros().into();
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return naive.and_utc().timestamp_micros().into();
+    }
+    // Space-separated form (`2026-05-25 22:48:43`).
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return naive.and_utc().timestamp_micros().into();
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return naive.and_utc().timestamp_micros().into();
+    }
+    // Date-only: midnight UTC.
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return date
+            .and_hms_opt(0, 0, 0)
+            .and_then(|n| n.and_utc().timestamp_micros().into());
+    }
+    None
+}
+
+/// Render an i64 μs-since-epoch as a canonical RFC 3339 string
+/// (`2026-05-25T22:48:43.201234Z`). Used by `to_json` and the
+/// direct-streaming encoder.
+pub fn format_timestamp_micros(micros: i64) -> String {
+    let secs = micros.div_euclid(1_000_000);
+    let nanos = (micros.rem_euclid(1_000_000) as u32) * 1_000;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .unwrap_or_else(|| micros.to_string())
 }
 
 /// Columnar store for a single topic's SOW data.
@@ -152,6 +304,12 @@ pub struct ColumnStore {
     long_cols: Vec<Vec<i64>>,
     int_cols: Vec<Vec<i32>>,
     string_cols: Vec<Vec<Option<CompactString>>>,
+    bool_cols: Vec<Vec<Option<bool>>>,
+    timestamp_cols: Vec<Vec<i64>>,
+    /// Q10 — Bytes columns. `None` = null cell. Stored as
+    /// `Vec<u8>` per row; pay attention to memory: each populated
+    /// cell allocates.
+    bytes_cols: Vec<Vec<Option<Vec<u8>>>>,
 
     // Row metadata
     row_count: AtomicU32,
@@ -164,12 +322,17 @@ impl ColumnStore {
     /// Create a new column store with the given schema and pre-allocated capacity.
     pub fn new(schema: Arc<Schema>, capacity: usize) -> Self {
         let mappings = schema.compute_mappings();
-        let (d, l, i, s) = schema.type_counts();
+        let counts = schema.type_counts();
 
-        let double_cols = (0..d).map(|_| vec![NULL_DOUBLE; capacity]).collect();
-        let long_cols = (0..l).map(|_| vec![NULL_LONG; capacity]).collect();
-        let int_cols = (0..i).map(|_| vec![NULL_INT; capacity]).collect();
-        let string_cols = (0..s).map(|_| vec![None; capacity]).collect();
+        let double_cols = (0..counts.double).map(|_| vec![NULL_DOUBLE; capacity]).collect();
+        let long_cols = (0..counts.long).map(|_| vec![NULL_LONG; capacity]).collect();
+        let int_cols = (0..counts.int).map(|_| vec![NULL_INT; capacity]).collect();
+        let string_cols = (0..counts.string).map(|_| vec![None; capacity]).collect();
+        let bool_cols = (0..counts.bool).map(|_| vec![None; capacity]).collect();
+        let timestamp_cols = (0..counts.timestamp)
+            .map(|_| vec![NULL_TIMESTAMP; capacity])
+            .collect();
+        let bytes_cols = (0..counts.bytes).map(|_| vec![None; capacity]).collect();
 
         let row_versions = (0..capacity)
             .map(|_| AtomicU64::new(0))
@@ -182,6 +345,9 @@ impl ColumnStore {
             long_cols,
             int_cols,
             string_cols,
+            bool_cols,
+            timestamp_cols,
+            bytes_cols,
             row_count: AtomicU32::new(0),
             capacity,
             row_versions,
@@ -293,6 +459,23 @@ impl ColumnStore {
             .map(|s| s.as_str())
     }
 
+    #[inline]
+    pub fn get_bool(&self, col: usize, row: u32) -> Option<bool> {
+        let m = &self.mappings[col];
+        debug_assert_eq!(m.kind, ColumnType::Bool);
+        self.bool_cols[m.array_index][row as usize]
+    }
+
+    /// Get the raw μs-since-epoch i64 for a timestamp column. Returns
+    /// `NULL_TIMESTAMP` (= i64::MIN) for null cells — callers compare
+    /// to the sentinel, same convention as `get_long`.
+    #[inline]
+    pub fn get_timestamp(&self, col: usize, row: u32) -> i64 {
+        let m = &self.mappings[col];
+        debug_assert_eq!(m.kind, ColumnType::Timestamp);
+        self.timestamp_cols[m.array_index][row as usize]
+    }
+
     /// Get a value as a boxed `Value` enum (slower, for generic paths).
     pub fn get(&self, col: usize, row: u32) -> Value {
         let m = &self.mappings[col];
@@ -302,6 +485,13 @@ impl ColumnStore {
             ColumnType::Int => Value::Int(self.int_cols[m.array_index][row as usize]),
             ColumnType::String => {
                 Value::String(self.string_cols[m.array_index][row as usize].clone())
+            }
+            ColumnType::Bool => Value::Bool(self.bool_cols[m.array_index][row as usize]),
+            ColumnType::Timestamp => {
+                Value::Timestamp(self.timestamp_cols[m.array_index][row as usize])
+            }
+            ColumnType::Bytes => {
+                Value::Bytes(self.bytes_cols[m.array_index][row as usize].clone())
             }
         }
     }
@@ -332,6 +522,18 @@ impl ColumnStore {
         self.string_cols[m.array_index][row as usize] = value;
     }
 
+    #[inline]
+    pub fn set_bool(&mut self, col: usize, row: u32, value: Option<bool>) {
+        let m = &self.mappings[col];
+        self.bool_cols[m.array_index][row as usize] = value;
+    }
+
+    #[inline]
+    pub fn set_timestamp(&mut self, col: usize, row: u32, micros: i64) {
+        let m = &self.mappings[col];
+        self.timestamp_cols[m.array_index][row as usize] = micros;
+    }
+
     /// Set a value from a `Value` enum (generic path).
     pub fn set(&mut self, col: usize, row: u32, value: &Value) {
         let m = &self.mappings[col];
@@ -357,6 +559,19 @@ impl ColumnStore {
             (ColumnType::String, Value::String(v)) => {
                 self.string_cols[m.array_index][row as usize] = v.clone();
             }
+            (ColumnType::Bool, Value::Bool(v)) => {
+                self.bool_cols[m.array_index][row as usize] = *v;
+            }
+            (ColumnType::Timestamp, Value::Timestamp(v)) => {
+                self.timestamp_cols[m.array_index][row as usize] = *v;
+            }
+            // Q10 — Bytes set + null handling.
+            (ColumnType::Bytes, Value::Bytes(v)) => {
+                self.bytes_cols[m.array_index][row as usize] = v.clone();
+            }
+            (ColumnType::Bytes, Value::Null) => {
+                self.bytes_cols[m.array_index][row as usize] = None;
+            }
             // Null handling
             (ColumnType::Double, Value::Null) => {
                 self.double_cols[m.array_index][row as usize] = NULL_DOUBLE;
@@ -370,15 +585,54 @@ impl ColumnStore {
             (ColumnType::String, Value::Null) => {
                 self.string_cols[m.array_index][row as usize] = None;
             }
+            (ColumnType::Bool, Value::Null) => {
+                self.bool_cols[m.array_index][row as usize] = None;
+            }
+            (ColumnType::Timestamp, Value::Null) => {
+                self.timestamp_cols[m.array_index][row as usize] = NULL_TIMESTAMP;
+            }
             // Coerce string from other types
             (ColumnType::String, other) => {
                 let s = match other {
                     Value::Double(v) => Some(CompactString::new(v.to_string())),
                     Value::Long(v) => Some(CompactString::new(v.to_string())),
                     Value::Int(v) => Some(CompactString::new(v.to_string())),
+                    Value::Bool(Some(b)) => Some(CompactString::new(if *b {
+                        "true"
+                    } else {
+                        "false"
+                    })),
+                    Value::Timestamp(v) if *v != NULL_TIMESTAMP => {
+                        Some(CompactString::new(format_timestamp_micros(*v)))
+                    }
                     _ => None,
                 };
                 self.string_cols[m.array_index][row as usize] = s;
+            }
+            // Coerce a timestamp from string / long when feasible.
+            (ColumnType::Timestamp, other) => {
+                let micros = match other {
+                    Value::String(Some(s)) => parse_timestamp_str(s.as_str()).unwrap_or(NULL_TIMESTAMP),
+                    Value::Long(v) if *v != NULL_LONG => *v,
+                    Value::Int(v) if *v != NULL_INT => *v as i64,
+                    _ => NULL_TIMESTAMP,
+                };
+                self.timestamp_cols[m.array_index][row as usize] = micros;
+            }
+            // Coerce bool from other types when feasible (long/int/string).
+            (ColumnType::Bool, other) => {
+                let parsed: Option<bool> = match other {
+                    Value::Long(v) if *v != NULL_LONG => Some(*v != 0),
+                    Value::Int(v) if *v != NULL_INT => Some(*v != 0),
+                    Value::Double(v) if !v.is_nan() => Some(*v != 0.0),
+                    Value::String(Some(s)) => match s.to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" | "y" => Some(true),
+                        "false" | "0" | "no" | "n" => Some(false),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                self.bool_cols[m.array_index][row as usize] = parsed;
             }
             _ => {} // type mismatch — silently ignore (or could log warning)
         }
@@ -450,6 +704,9 @@ impl ColumnStore {
                 ColumnType::Long => self.long_cols[m.array_index][r] = NULL_LONG,
                 ColumnType::Int => self.int_cols[m.array_index][r] = NULL_INT,
                 ColumnType::String => self.string_cols[m.array_index][r] = None,
+                ColumnType::Bool => self.bool_cols[m.array_index][r] = None,
+                ColumnType::Timestamp => self.timestamp_cols[m.array_index][r] = NULL_TIMESTAMP,
+                ColumnType::Bytes => self.bytes_cols[m.array_index][r] = None,
             }
             let _ = col_idx;
         }
@@ -576,6 +833,30 @@ impl ColumnStore {
                         buf.extend_from_slice(rbuf.format(*d).as_bytes());
                     }
                 }
+                Value::Bool(Some(b)) => {
+                    buf.extend_from_slice(if *b { b"true" } else { b"false" });
+                }
+                Value::Bool(None) => {
+                    buf.extend_from_slice(b"null");
+                }
+                Value::Timestamp(v) if *v != NULL_TIMESTAMP => {
+                    buf.push(b'"');
+                    write_json_str(&format_timestamp_micros(*v), buf);
+                    buf.push(b'"');
+                }
+                Value::Timestamp(_) => {
+                    buf.extend_from_slice(b"null");
+                }
+                Value::Bytes(Some(b)) => {
+                    use base64::Engine;
+                    buf.push(b'"');
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(b);
+                    buf.extend_from_slice(encoded.as_bytes());
+                    buf.push(b'"');
+                }
+                Value::Bytes(None) => {
+                    buf.extend_from_slice(b"null");
+                }
             }
         }
         buf.push(b'}');
@@ -666,6 +947,15 @@ impl ColumnStore {
         for col in &mut self.string_cols {
             col.resize(new_cap, None);
         }
+        for col in &mut self.bool_cols {
+            col.resize(new_cap, None);
+        }
+        for col in &mut self.timestamp_cols {
+            col.resize(new_cap, NULL_TIMESTAMP);
+        }
+        for col in &mut self.bytes_cols {
+            col.resize(new_cap, None);
+        }
 
         self.row_versions
             .resize_with(new_cap, || AtomicU64::new(0));
@@ -740,6 +1030,132 @@ mod tests {
                 ColumnType::String,
             ],
         ))
+    }
+
+    /// End-to-end round-trip for `ColumnType::Timestamp`: insert via
+    /// RFC 3339 string, epoch ms number, and null; verify the typed
+    /// accessor returns μs; verify `get_row_map` re-serializes to a
+    /// canonical RFC 3339 string. Also confirm RFC 3339 → μs parsing
+    /// stays consistent through `from_json`.
+    #[test]
+    fn test_timestamp_column_round_trip() {
+        let schema = Arc::new(Schema::from_strs(
+            &["id", "ts"],
+            &[ColumnType::String, ColumnType::Timestamp],
+        ));
+        let mut store = ColumnStore::new(schema, 8);
+
+        // 2026-05-25 00:00:00 UTC = 1779408000000000 μs.
+        let micros_2026_05_25 = 1_779_667_200_000_000i64;
+        let r0 = store.append_row(&[
+            Value::String(Some(CompactString::new("a"))),
+            Value::Timestamp(micros_2026_05_25),
+        ]);
+
+        // From-JSON branch — RFC 3339 string and ms number both land
+        // on the same μs value.
+        let micros_str = match Value::from_json(
+            &serde_json::Value::String("2026-05-25T00:00:00Z".to_string()),
+            ColumnType::Timestamp,
+        ) {
+            Value::Timestamp(v) => v,
+            _ => panic!("expected Timestamp"),
+        };
+        assert_eq!(micros_str, micros_2026_05_25);
+
+        let micros_ms = match Value::from_json(
+            &serde_json::Value::from(1_779_667_200_000i64),
+            ColumnType::Timestamp,
+        ) {
+            Value::Timestamp(v) => v,
+            _ => panic!("expected Timestamp"),
+        };
+        assert_eq!(micros_ms, micros_2026_05_25);
+
+        let r1 = store.append_row(&[
+            Value::String(Some(CompactString::new("b"))),
+            Value::Timestamp(NULL_TIMESTAMP),
+        ]);
+
+        assert_eq!(store.get_timestamp(1, r0), micros_2026_05_25);
+        assert_eq!(store.get_timestamp(1, r1), NULL_TIMESTAMP);
+        assert_eq!(store.get(1, r0), Value::Timestamp(micros_2026_05_25));
+
+        let row0 = store.get_row_map(r0);
+        let serialized = row0.get("ts").expect("ts present");
+        // Round-trip JSON RFC 3339 → μs → RFC 3339 produces a string
+        // that parses back to the same μs.
+        let reparsed = parse_timestamp_json(serialized);
+        assert_eq!(reparsed, micros_2026_05_25);
+
+        // Null cell is omitted from the row map (matches numeric null behaviour).
+        let row1 = store.get_row_map(r1);
+        assert!(!row1.contains_key("ts"));
+    }
+
+    /// End-to-end round-trip for `ColumnType::Bool`: append, read via
+    /// `get`/`get_bool`, serialize via `to_json` + write_row_json_projected,
+    /// then re-parse and confirm equality. Covers true / false / null.
+    #[test]
+    fn test_bool_column_round_trip() {
+        let schema = Arc::new(Schema::from_strs(
+            &["id", "flag"],
+            &[ColumnType::String, ColumnType::Bool],
+        ));
+        let mut store = ColumnStore::new(schema, 8);
+
+        let r0 = store.append_row(&[
+            Value::String(Some(CompactString::new("a"))),
+            Value::Bool(Some(true)),
+        ]);
+        let r1 = store.append_row(&[
+            Value::String(Some(CompactString::new("b"))),
+            Value::Bool(Some(false)),
+        ]);
+        let r2 = store.append_row(&[
+            Value::String(Some(CompactString::new("c"))),
+            Value::Bool(None),
+        ]);
+
+        // Typed getter
+        assert_eq!(store.get_bool(1, r0), Some(true));
+        assert_eq!(store.get_bool(1, r1), Some(false));
+        assert_eq!(store.get_bool(1, r2), None);
+        // Generic getter routes through the same backing slot.
+        assert_eq!(store.get(1, r0), Value::Bool(Some(true)));
+        assert_eq!(store.get(1, r1), Value::Bool(Some(false)));
+        assert_eq!(store.get(1, r2), Value::Bool(None));
+
+        // JSON round-trip via `get_row_map`.
+        let row0 = store.get_row_map(r0);
+        assert_eq!(row0.get("flag"), Some(&serde_json::Value::Bool(true)));
+        let row1 = store.get_row_map(r1);
+        assert_eq!(row1.get("flag"), Some(&serde_json::Value::Bool(false)));
+        let row2 = store.get_row_map(r2);
+        // Null bool is omitted from the row map (matches numeric null
+        // behaviour: `is_null` returns true so the key is skipped).
+        assert!(!row2.contains_key("flag"));
+
+        // Reverse: from_json with the bool column type accepts native
+        // bool and the canonical string forms.
+        assert_eq!(
+            Value::from_json(&serde_json::Value::Bool(true), ColumnType::Bool),
+            Value::Bool(Some(true))
+        );
+        assert_eq!(
+            Value::from_json(
+                &serde_json::Value::String("true".to_string()),
+                ColumnType::Bool,
+            ),
+            Value::Bool(Some(true))
+        );
+        assert_eq!(
+            Value::from_json(
+                &serde_json::Value::Number(0.into()),
+                ColumnType::Bool,
+            ),
+            Value::Bool(Some(false))
+        );
     }
 
     /// `write_row_json_projected` must produce JSON whose parsed shape

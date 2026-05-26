@@ -255,9 +255,20 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 - E2E `crates/cq-e2e-tests/tests/parser_in_subquery.rs` — 2 tests: non-empty subquery (trades IN watchlist) and empty subquery (always-false substitution returns 0 rows).
 **Out of scope (deferred to future sessions):** `EXISTS`, scalar subqueries in SELECT, correlated subqueries, subqueries with JOIN/GROUP BY inside.
 
-## Q10 — Bytes / Array / Object as first-class column types *(§2 column-types row)*
-**Status:** ⏳
-**Scope:** Add `ColumnType::{Bytes, Array, Object}`; teach `Value` / `ColumnStore` / wire codecs about them. Dotted-path access for Object stays compatible.
+## Q10 — Bytes column type *(§2 column-types row — partial; Array/Object deferred)*
+**Status:** ✅ done (Bytes only; Array + Object deferred to follow-up)
+**Scope:** New `ColumnType::Bytes` variant with full `Value::Bytes(Option<Vec<u8>>)` integration. JSON wire form is base64 (input + output). Supports equality (via base64-string comparison in indexes), `IS NULL`, and GROUP BY (group keys hashed by base64 string). No arithmetic, no ordering (`compare_values` returns Equal for Bytes), no IN list (rejected with clear error).
+**Implementation:**
+- `cq-core/schema.rs`: `ColumnType::Bytes` variant + `TypeCounts.bytes` + `compute_mappings` arm.
+- `cq-core/store.rs`: `Value::Bytes(Option<Vec<u8>>)` variant; `bytes_cols: Vec<Vec<Option<Vec<u8>>>>` backing store; `from_json` decodes base64, `to_json` encodes; `is_null`, `set`, `get`, `grow`, `null_out_row`, fast-path JSON encoder all updated.
+- `cq-core/sec_index.rs`: `IxKey::from_value` + `RangeKey::from_value` map Bytes to a String (base64) so equality lookups work.
+- `cq-core/predicate.rs`: `IsNull`/`IsNotNull` handle bytes columns; IN list and ordered comparisons explicitly rejected.
+- `cq-core/pivot.rs`: pivot on a bytes column is a no-op (returns empty / no match).
+- `cq-core/query.rs`: GroupKeyPart maps bytes via base64; `compare_values` returns Equal.
+- New workspace dep: `base64 = "0.22"` for encode/decode.
+**Tests landed:**
+- 2 unit tests in `query::tests::{bytes_column_round_trips_via_value, bytes_filter_is_null_works}` covering store round-trip + IS NULL filter.
+**Out of scope (still deferred):** `Array` and `Object` as first-class column types — would each need their own backing store, JSON parsing rules, and predicate semantics (`json_extract`, `array_length`, etc.). Nested JSON continues to flatten via dotted-paths into String columns (existing behaviour).
 
 ## Q11 — Schema evolution (online add column) *(§2 row 12)*
 **Status:** ⏳
