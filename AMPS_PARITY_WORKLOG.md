@@ -37,9 +37,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_table_aliases.rs` — aliased SOW (filter, GROUP BY, ORDER BY) matches the unqualified form against a real server.
 
 ## P2 — Parser: scalar arithmetic in SELECT-list *(§1.1 row 7)*
-**Status:** ⏳
-**Scope:** `SELECT a, b, a + b AS sum FROM t` evaluates server-side. Adds `ScalarExpr` / `ComputedColumn`. Lets the Atlas publisher stop pre-computing `mv_x_pct`, `mv_abs`.
-**Tests:** parse, eval round-trip, e2e against running server.
+**Status:** ✅ done
+**Scope:** `SELECT a, b, a + b AS sum FROM t` evaluates server-side. Atlas publisher can stop pre-computing `mv_x_pct`, `mv_abs`.
+**Implementation:** `ScalarExpr` (Col/Lit/Add/Sub/Mul/Div/Neg) + `ComputedColumn`. `try_compile_scalar_expr` detects arithmetic in SELECT items, compiles to `ScalarExpr`, and emits per-row evaluated cells. Null-on-error semantics (zero-div, type mismatch). `query_streaming_json`'s fast path now falls through to the buffered path when `query.computed` is non-empty.
+**Tests landed:**
+- 4 unit tests in `query::tests::parse_select_arithmetic_*` (add+alias, multiple ops, parenthesised, div-by-zero null).
+- E2E `crates/cq-e2e-tests/tests/parser_select_arithmetic.rs` — `price * quantity AS notional` and `(price - quantity) / quantity AS pct_spread` against a running server.
 
 ## P3 — Parser: HAVING clause *(§1.3 row 7)*
 **Status:** ⏳

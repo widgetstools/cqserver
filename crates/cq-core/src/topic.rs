@@ -1248,7 +1248,11 @@ impl Topic {
         let needs_full_buffer = !query.order_by.is_empty()
             || query.limit.is_some()
             || query.is_aggregate()
-            || !query.group_by.is_empty();
+            || !query.group_by.is_empty()
+            // P2 — computed columns (`SELECT a + b AS sum FROM t`)
+            // need the full executor's row-build path; the direct
+            // columnar stream below only emits raw projected cells.
+            || !query.computed.is_empty();
         if needs_full_buffer {
             let mut result = crate::query::execute_query_with_index(
                 &query,
@@ -1351,7 +1355,11 @@ impl Topic {
         let needs_full_buffer = !query.order_by.is_empty()
             || query.limit.is_some()
             || query.is_aggregate()
-            || !query.group_by.is_empty();
+            || !query.group_by.is_empty()
+            // P2 — computed columns (`SELECT a + b AS sum FROM t`)
+            // need the full executor's row-build path; the direct
+            // columnar stream below only emits raw projected cells.
+            || !query.computed.is_empty();
         if needs_full_buffer {
             // Same shape as query_streaming for the buffered path —
             // run the executor, drop tombstones, then serialize each

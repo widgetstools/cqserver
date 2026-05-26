@@ -66,6 +66,82 @@ pub struct ParsedQuery {
     /// with non-equi predicates, multi-table chained joins) are
     /// rejected at parse time and reserved for follow-ups.
     pub join: Option<JoinSpec>,
+    /// P2 — scalar expressions in the SELECT list (`a + b AS sum`).
+    /// Empty for queries that only project bare columns. Each entry
+    /// is emitted as an extra `(alias, value)` pair appended to each
+    /// output row by the non-aggregate executor. Aggregate-path
+    /// support (`SUM(a + b)`) is tracked separately.
+    pub computed: Vec<ComputedColumn>,
+}
+
+/// P2 — one computed column in the SELECT list. The alias is what
+/// appears as the key in each output row's JSON map; the expr is
+/// evaluated against the source row's values.
+#[derive(Debug, Clone)]
+pub struct ComputedColumn {
+    pub alias: String,
+    pub expr: ScalarExpr,
+}
+
+/// P2 — a tiny expression tree for scalar arithmetic in SELECT.
+/// Intentionally minimal: just the four BinaryOps, column refs, and
+/// numeric/string literals. Division by zero, null inputs, and type
+/// coercion failures all evaluate to `Value::Null` — same behaviour
+/// as the AMPS-style "soft null" propagation.
+#[derive(Debug, Clone)]
+pub enum ScalarExpr {
+    Col(usize),
+    LitDouble(f64),
+    LitLong(i64),
+    LitString(CompactString),
+    Add(Box<ScalarExpr>, Box<ScalarExpr>),
+    Sub(Box<ScalarExpr>, Box<ScalarExpr>),
+    Mul(Box<ScalarExpr>, Box<ScalarExpr>),
+    Div(Box<ScalarExpr>, Box<ScalarExpr>),
+    Neg(Box<ScalarExpr>),
+}
+
+impl ScalarExpr {
+    /// Evaluate against a single source row. Returns `Value::Null`
+    /// on missing/null inputs, division by zero, or type errors so
+    /// callers can emit a JSON `null` cell.
+    pub fn eval(&self, row: &[Value]) -> Value {
+        match self {
+            ScalarExpr::Col(i) => row.get(*i).cloned().unwrap_or(Value::Null),
+            ScalarExpr::LitDouble(d) => Value::Double(*d),
+            ScalarExpr::LitLong(l) => Value::Long(*l),
+            ScalarExpr::LitString(s) => Value::String(Some(s.clone())),
+            ScalarExpr::Add(a, b) => num_binop(&a.eval(row), &b.eval(row), |x, y| x + y),
+            ScalarExpr::Sub(a, b) => num_binop(&a.eval(row), &b.eval(row), |x, y| x - y),
+            ScalarExpr::Mul(a, b) => num_binop(&a.eval(row), &b.eval(row), |x, y| x * y),
+            ScalarExpr::Div(a, b) => {
+                let l = a.eval(row);
+                let r = b.eval(row);
+                match (value_as_f64(&l), value_as_f64(&r)) {
+                    (Some(_), Some(0.0)) => Value::Null,
+                    (Some(x), Some(y)) => Value::Double(x / y),
+                    _ => Value::Null,
+                }
+            }
+            ScalarExpr::Neg(e) => match value_as_f64(&e.eval(row)) {
+                Some(x) => Value::Double(-x),
+                None => Value::Null,
+            },
+        }
+    }
+}
+
+fn num_binop(a: &Value, b: &Value, op: impl Fn(f64, f64) -> f64) -> Value {
+    match (value_as_f64(a), value_as_f64(b)) {
+        (Some(x), Some(y)) => Value::Double(op(x, y)),
+        _ => Value::Null,
+    }
+}
+
+fn value_as_f64(v: &Value) -> Option<f64> {
+    // Delegate to the store's null-aware coercion so NULL_LONG /
+    // NULL_INT / NaN aren't silently treated as zero.
+    v.as_f64()
 }
 
 /// Compiled `A JOIN B USING (col, ...)` spec. Schemas of both sides
@@ -582,7 +658,7 @@ fn parse_select(
     //     column refs + aggregate function calls. The presence of
     //     either an aggregate call or a non-empty GROUP BY switches
     //     the executor into aggregate mode.
-    let (projection, aggregates) =
+    let (projection, aggregates, computed) =
         parse_projection_or_aggregates(&select.projection, schema, &group_by)?;
 
     // --- WHERE clause → predicate ---
@@ -621,6 +697,7 @@ fn parse_select(
         pivot: None,
         unpivot: None,
         join: join_spec,
+        computed,
     })
 }
 
@@ -825,6 +902,7 @@ fn parse_pivot_query(
         pivot: Some(pivot),
         unpivot: None,
         join: None,
+        computed: Vec::new(),
     })
 }
 
@@ -936,6 +1014,7 @@ fn parse_unpivot_query(
         pivot: None,
         unpivot: Some(unpivot),
         join: None,
+        computed: Vec::new(),
     })
 }
 
@@ -967,16 +1046,17 @@ fn parse_projection_or_aggregates(
     items: &[SelectItem],
     schema: &Schema,
     group_by: &[usize],
-) -> Result<(Vec<usize>, Vec<AggregateSpec>), QueryError> {
+) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<ComputedColumn>), QueryError> {
     // First pass: detect whether any item is an aggregate function.
     let has_agg = items
         .iter()
         .any(|i| matches!(extract_expr(i), Some(e) if is_aggregate_function_call(e)));
 
     if !has_agg && group_by.is_empty() {
-        // Plain projection — unchanged from previous behaviour.
-        let projection = parse_projection(items, schema)?;
-        return Ok((projection, Vec::new()));
+        // Plain projection — P2 extends this to also handle scalar
+        // expressions (`a + b AS sum`) via the second return value.
+        let (projection, computed) = parse_projection(items, schema)?;
+        return Ok((projection, Vec::new(), computed));
     }
 
     // Aggregate path.
@@ -1022,7 +1102,7 @@ fn parse_projection_or_aggregates(
         // executor by leaving both vectors as-is.
     }
 
-    Ok((Vec::new(), aggregates))
+    Ok((Vec::new(), aggregates, Vec::new()))
 }
 
 fn extract_expr(item: &SelectItem) -> Option<&Expr> {
@@ -1109,22 +1189,138 @@ fn parse_aggregate_call(
 fn parse_projection(
     items: &[SelectItem],
     schema: &Schema,
-) -> Result<Vec<usize>, QueryError> {
+) -> Result<(Vec<usize>, Vec<ComputedColumn>), QueryError> {
     let mut cols = Vec::new();
+    let mut computed = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard(_) => {
-                // Empty projection = all columns
-                return Ok(Vec::new());
+                // Empty projection = all columns; computed columns
+                // cannot mix with * because their alias placement is
+                // ambiguous. Reject the mix early.
+                if !computed.is_empty() {
+                    return Err(QueryError::ParseError(
+                        "SELECT * cannot be combined with computed columns".into(),
+                    ));
+                }
+                return Ok((Vec::new(), Vec::new()));
             }
             SelectItem::UnnamedExpr(expr) => {
-                let col = resolve_select_column(expr, schema)?;
-                cols.push(col);
+                if let Some(scalar) = try_compile_scalar_expr(expr, schema)? {
+                    let alias = expr_display_alias(expr);
+                    computed.push(ComputedColumn { alias, expr: scalar });
+                } else {
+                    let col = resolve_select_column(expr, schema)?;
+                    cols.push(col);
+                }
             }
-            _ => return Err(QueryError::ParseError(format!("Unsupported SELECT item: {:?}", item))),
+            SelectItem::ExprWithAlias { expr, alias } => {
+                // Alias on a bare column ref → still a projection but
+                // the executor's row map uses the source column name
+                // (the alias-as-rename for plain columns is a separate
+                // gap, low ROI). Alias on a scalar expression → a
+                // computed column with the user-supplied alias.
+                if let Some(scalar) = try_compile_scalar_expr(expr, schema)? {
+                    computed.push(ComputedColumn {
+                        alias: alias.value.clone(),
+                        expr: scalar,
+                    });
+                } else {
+                    let col = resolve_select_column(expr, schema)?;
+                    cols.push(col);
+                }
+            }
+            _ => {
+                return Err(QueryError::ParseError(format!(
+                    "Unsupported SELECT item: {:?}",
+                    item
+                )))
+            }
         }
     }
-    Ok(cols)
+    Ok((cols, computed))
+}
+
+/// P2 — `Some(expr)` if `expr` is a scalar arithmetic expression
+/// (BinaryOp/UnaryOp/Nested over a numeric op) that should be evaluated
+/// per-row. `None` if it's a bare column ref that the projection path
+/// should handle. Returns `Err` on an unsupported shape inside an
+/// arithmetic tree so the user sees a clear parser diagnostic.
+fn try_compile_scalar_expr(
+    expr: &Expr,
+    schema: &Schema,
+) -> Result<Option<ScalarExpr>, QueryError> {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator};
+    match expr {
+        Expr::BinaryOp { op, .. }
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) =>
+        {
+            Ok(Some(compile_scalar(expr, schema)?))
+        }
+        Expr::UnaryOp { op: UnaryOperator::Minus, .. } => {
+            Ok(Some(compile_scalar(expr, schema)?))
+        }
+        Expr::Nested(inner) => try_compile_scalar_expr(inner, schema),
+        _ => Ok(None),
+    }
+}
+
+fn compile_scalar(expr: &Expr, schema: &Schema) -> Result<ScalarExpr, QueryError> {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator, Value as SqlValue, ValueWithSpan};
+    match expr {
+        Expr::Identifier(id) => {
+            let idx = schema
+                .index_of(&id.value)
+                .ok_or_else(|| QueryError::UnknownColumn(id.value.clone()))?;
+            Ok(ScalarExpr::Col(idx))
+        }
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            SqlValue::Number(n, _) => {
+                if let Ok(i) = n.parse::<i64>() {
+                    Ok(ScalarExpr::LitLong(i))
+                } else {
+                    Ok(ScalarExpr::LitDouble(n.parse().unwrap_or(0.0)))
+                }
+            }
+            SqlValue::SingleQuotedString(s) => Ok(ScalarExpr::LitString(s.into())),
+            other => Err(QueryError::ParseError(format!(
+                "unsupported literal in scalar expression: {other:?}"
+            ))),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let l = Box::new(compile_scalar(left, schema)?);
+            let r = Box::new(compile_scalar(right, schema)?);
+            match op {
+                BinaryOperator::Plus => Ok(ScalarExpr::Add(l, r)),
+                BinaryOperator::Minus => Ok(ScalarExpr::Sub(l, r)),
+                BinaryOperator::Multiply => Ok(ScalarExpr::Mul(l, r)),
+                BinaryOperator::Divide => Ok(ScalarExpr::Div(l, r)),
+                _ => Err(QueryError::ParseError(format!(
+                    "unsupported binary op in scalar expression: {op:?}"
+                ))),
+            }
+        }
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+            Ok(ScalarExpr::Neg(Box::new(compile_scalar(expr, schema)?)))
+        }
+        Expr::Nested(inner) => compile_scalar(inner, schema),
+        _ => Err(QueryError::ParseError(format!(
+            "unsupported expression in scalar context: {expr:?}"
+        ))),
+    }
+}
+
+/// Build a display alias for an unaliased computed SELECT item. We
+/// stringify the expression (the same form sqlparser uses for `Display`)
+/// — mirrors AMPS's behaviour and keeps the JSON key stable per SQL.
+fn expr_display_alias(expr: &Expr) -> String {
+    expr.to_string()
 }
 
 fn resolve_select_column(expr: &Expr, schema: &Schema) -> Result<usize, QueryError> {
@@ -1416,7 +1612,21 @@ pub fn execute_query_with_index_filtered(
 
     let rows: Vec<serde_json::Map<String, serde_json::Value>> = matching_rows
         .iter()
-        .map(|&row| store.get_row_map_projected(row, &proj_indices))
+        .map(|&row| {
+            let mut map = store.get_row_map_projected(row, &proj_indices);
+            // P2 — append computed scalar columns. Evaluated against
+            // the FULL row (every source column visible to ScalarExpr),
+            // not just the projection set. Null-on-error semantics.
+            if !query.computed.is_empty() {
+                let row_values: Vec<Value> = (0..store.schema().column_count())
+                    .map(|c| store.get(c, row))
+                    .collect();
+                for cc in &query.computed {
+                    map.insert(cc.alias.clone(), cc.expr.eval(&row_values).to_json());
+                }
+            }
+            map
+        })
         .collect();
 
     QueryResult {
@@ -2896,6 +3106,78 @@ mod tests {
         assert_eq!(join.right_topic, "securities");
         assert_eq!(join.using, vec!["cusip".to_string()]);
         assert_eq!(q.topic, "positions");
+    }
+
+    // ───── P2 — scalar arithmetic in SELECT-list ────────────────────
+
+    #[test]
+    fn parse_select_arithmetic_add_alias() {
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT symbol, price, price + 10 AS adj FROM trades WHERE price > 1000",
+            &schema,
+        )
+        .expect("arithmetic in SELECT must parse");
+        assert_eq!(q.computed.len(), 1, "expected 1 computed column");
+        assert_eq!(q.computed[0].alias, "adj");
+        let r = execute_query(&q, &store);
+        for row in &r.rows {
+            let p = row.get("price").unwrap().as_f64().unwrap();
+            let adj = row.get("adj").unwrap().as_f64().unwrap();
+            assert!((adj - (p + 10.0)).abs() < 1e-9, "adj = price + 10");
+        }
+    }
+
+    #[test]
+    fn parse_select_arithmetic_multiple_ops() {
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT symbol, price * quantity AS notional, price - quantity AS spread FROM trades",
+            &schema,
+        )
+        .expect("two computed columns must parse");
+        assert_eq!(q.computed.len(), 2);
+        let r = execute_query(&q, &store);
+        for row in &r.rows {
+            assert!(row.contains_key("notional"));
+            assert!(row.contains_key("spread"));
+            assert!(row.contains_key("symbol"));
+        }
+    }
+
+    #[test]
+    fn parse_select_arithmetic_parenthesised() {
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT symbol, (price - quantity) / quantity AS pct FROM trades",
+            &schema,
+        )
+        .expect("parenthesised arithmetic must parse");
+        assert_eq!(q.computed.len(), 1);
+        let r = execute_query(&q, &store);
+        for row in &r.rows {
+            let pct = row.get("pct").and_then(|v| v.as_f64());
+            assert!(pct.is_some(), "pct must be numeric, got {row:?}");
+        }
+    }
+
+    #[test]
+    fn parse_select_arithmetic_div_by_zero_yields_null() {
+        let s = Arc::new(Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Long],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 8);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("a"))),
+            Value::Long(0),
+        ]);
+        let q = parse_query("SELECT k, 1.0 / v AS rcp FROM t", &s).unwrap();
+        let r = execute_query(&q, &store);
+        assert_eq!(r.rows.len(), 1);
+        let rcp = r.rows[0].get("rcp");
+        // null is encoded as Value::Null; 0-divisor → null.
+        assert!(rcp.map(|v| v.is_null()).unwrap_or(false));
     }
 
     #[test]
