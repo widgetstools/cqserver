@@ -108,8 +108,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_count_distinct.rs` covers overall + per-desk distinct counts on a 6-row trader fixture.
 
 ## P11 — JOIN: ON-clause equi-join (translated to USING) *(§1.4 row 1)*
-**Status:** ⏳
-**Scope:** Accept `INNER JOIN B ON a.x = b.x`; translate same-named-column equi-joins to the existing USING path. Reject non-equi or rename-required cases with a clear error.
+**Status:** ✅ done
+**Scope:** Accept `INNER JOIN B ON a.x = b.x`; translate to the existing USING path when both sides reference the same column name. Reject non-equi predicates, OR-combined predicates, mixed-in literals, and equalities between differently-named columns with a clear diagnostic pointing at USING.
+**Implementation:** `parse_join_clause` (`crates/cq-core/src/query.rs`) now matches `JoinConstraint::On(Expr)` and walks the AND-tree via the new `collect_equi_using` helper. The alias-rewrite pass already strips `a.col`/`b.col` to bare `col` before `parse_join_clause` runs; extended the rewrite to also cover the `Join` and `Left` variants (in addition to the existing `Inner`/`LeftOuter`/`RightOuter`/`FullOuter`). `peek_join` now performs the alias-rewrite before consulting the JOIN so the SOW JOIN path also accepts ON-equi.
+**Tests landed:**
+- 4 unit tests in `query::tests::parse_join_on_*` covering single-column ON-equi, multi-column ON-equi, rejection of differently-named columns, rejection of non-equi predicates.
+- E2E `crates/cq-e2e-tests/tests/parser_join_on.rs` runs the same JOIN as both `JOIN ... ON a.cusip = b.cusip` and `JOIN ... USING (cusip)` and asserts identical per-sector exposure rollups.
 
 ## P12 — JOIN: LEFT OUTER JOIN *(§1.4 row 3)*
 **Status:** ⏳

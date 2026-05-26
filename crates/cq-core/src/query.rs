@@ -626,14 +626,25 @@ fn rewrite_qualified_refs_in_query(query: &mut sqlparser::ast::Query, refs: &Has
         if let Some(e) = select.having.as_mut() {
             rewrite_expr(e, refs);
         }
-        // JOIN constraints (ON-clause Expr — currently rejected, but
-        // P11 will use this).
+        // JOIN constraints (ON-clause Expr — P11 uses these). Covers
+        // both `Join(constraint)` (bare `JOIN`) and the explicit
+        // `Inner/Left/Right/Full` variants, plus the `LeftOuter`
+        // alias for `LEFT OUTER JOIN`.
         for from in &mut select.from {
             for join in &mut from.joins {
-                if let sqlparser::ast::JoinOperator::Inner(
+                if let sqlparser::ast::JoinOperator::Join(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                )
+                | sqlparser::ast::JoinOperator::Inner(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                )
+                | sqlparser::ast::JoinOperator::Left(
                     sqlparser::ast::JoinConstraint::On(expr),
                 )
                 | sqlparser::ast::JoinOperator::LeftOuter(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                )
+                | sqlparser::ast::JoinOperator::Right(
                     sqlparser::ast::JoinConstraint::On(expr),
                 )
                 | sqlparser::ast::JoinOperator::RightOuter(
@@ -743,7 +754,15 @@ pub fn peek_join(sql: &str) -> Result<Option<(String, String, Vec<String>)>, Que
         Statement::Query(q) => q,
         _ => return Err(QueryError::ParseError("Only SELECT statements supported".into())),
     };
-    let select = match q.body.as_ref() {
+    // P11 — peek_join is called BEFORE the main parse path, but the
+    // ON-clause translator in parse_join_clause expects the alias
+    // rewrite to have run (so `a.col` → `col`). Clone + rewrite here
+    // before consulting the JOIN so the SOW JOIN path supports both
+    // `JOIN ... USING (col)` and `JOIN ... ON a.col = b.col`.
+    let mut q_owned = (**q).clone();
+    let refs = collect_table_refs(&q_owned);
+    rewrite_qualified_refs_in_query(&mut q_owned, &refs);
+    let select = match q_owned.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(QueryError::ParseError("Expected SELECT".into())),
     };
@@ -939,6 +958,54 @@ fn parse_select(
     })
 }
 
+/// P11 — walk an ON-clause expression and collect USING column names.
+/// Accepts AND-trees of `Identifier(c) = Identifier(c)` (where both
+/// sides are bare identifiers after the alias-rewrite pass and share
+/// the same column name). Rejects non-equi predicates, OR, mixed-in
+/// literals, and equalities between differently-named columns.
+fn collect_equi_using(expr: &Expr, out: &mut Vec<String>) -> Result<(), QueryError> {
+    use sqlparser::ast::BinaryOperator;
+    match expr {
+        Expr::Nested(e) => collect_equi_using(e, out),
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            collect_equi_using(left, out)?;
+            collect_equi_using(right, out)
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let l_name = ident_name(left).ok_or_else(|| {
+                QueryError::ParseError(format!(
+                    "ON-clause supports only `col = col` equalities (after alias rewrite); got LHS: {left:?}"
+                ))
+            })?;
+            let r_name = ident_name(right).ok_or_else(|| {
+                QueryError::ParseError(format!(
+                    "ON-clause supports only `col = col` equalities (after alias rewrite); got RHS: {right:?}"
+                ))
+            })?;
+            if l_name != r_name {
+                return Err(QueryError::ParseError(format!(
+                    "ON-clause equi-join requires both sides to share the same column name (got `{l_name}` vs `{r_name}`); rename a column or use USING(col)"
+                )));
+            }
+            if !out.iter().any(|c| c == &l_name) {
+                out.push(l_name);
+            }
+            Ok(())
+        }
+        _ => Err(QueryError::ParseError(format!(
+            "ON-clause supports only AND-combined `col = col` equi-joins; got: {expr:?}"
+        ))),
+    }
+}
+
+fn ident_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::Nested(e) => ident_name(e),
+        _ => None,
+    }
+}
+
 /// P4 — extract a numeric literal as `usize`. Returns `None` for any
 /// non-literal or non-fitting value. Used by the LIMIT/OFFSET parser.
 fn extract_usize_literal(expr: &Expr) -> Option<usize> {
@@ -1013,9 +1080,21 @@ fn parse_join_clause(
                 on.to_string().trim_matches('"').to_string()
             })
             .collect(),
+        // P11 — `ON a.col = b.col` translated to USING(col). The
+        // alias-rewrite pass already turned `a.col` / `b.col` into
+        // bare `col` references on both sides; here we recurse
+        // through AND-trees of `Identifier = Identifier` equalities
+        // and require both sides to share the same name. Anything
+        // else (non-equi, different names, mixed-in literals, OR)
+        // returns a clear error pointing the user at USING.
+        JoinConstraint::On(expr) => {
+            let mut cols: Vec<String> = Vec::new();
+            collect_equi_using(expr, &mut cols)?;
+            cols
+        }
         _ => {
             return Err(QueryError::ParseError(
-                "JOIN must specify USING (col, ...)".into(),
+                "JOIN must specify USING (col, ...) or ON a.c = b.c with matching column names".into(),
             ))
         }
     };
@@ -3531,15 +3610,9 @@ mod tests {
         assert!(r.is_err(), "LEFT OUTER JOIN must be rejected today");
     }
 
-    #[test]
-    fn parse_join_rejects_on_clause_for_now() {
-        let combined = Schema::from_strs(
-            &["k", "v"],
-            &[ColumnType::String, ColumnType::Long],
-        );
-        let r = parse_query("SELECT v FROM a JOIN b ON a.k = b.k", &combined);
-        assert!(r.is_err(), "ON-clause JOIN must be rejected today");
-    }
+    // (Was `parse_join_rejects_on_clause_for_now` — superseded by P11
+    // which translates ON-equi-same-name to USING. See
+    // `parse_join_on_equi_same_column_name` above.)
 
     // ───── P1 — table aliases + qualified column refs ────────────────
 
@@ -3695,6 +3768,61 @@ mod tests {
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "NVDA");
         assert_eq!(r.rows[1].get("symbol").unwrap().as_str().unwrap(), "AAPL");
+    }
+
+    // ───── P11 — JOIN ON (translated to USING) ───────────────────────
+
+    #[test]
+    fn parse_join_on_equi_same_column_name() {
+        let combined = Schema::from_strs(
+            &["cusip", "v"],
+            &[ColumnType::String, ColumnType::Long],
+        );
+        let q = parse_query(
+            "SELECT v FROM a JOIN b ON a.cusip = b.cusip",
+            &combined,
+        )
+        .expect("ON-equi-same-name must parse");
+        let j = q.join.expect("must have join");
+        assert_eq!(j.right_topic, "b");
+        assert_eq!(j.using, vec!["cusip".to_string()]);
+    }
+
+    #[test]
+    fn parse_join_on_multi_column_equi() {
+        let combined = Schema::from_strs(
+            &["k1", "k2", "v"],
+            &[ColumnType::String, ColumnType::String, ColumnType::Long],
+        );
+        let q = parse_query(
+            "SELECT v FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2",
+            &combined,
+        )
+        .expect("multi-key ON-equi must parse");
+        let j = q.join.expect("join");
+        assert_eq!(j.using, vec!["k1".to_string(), "k2".to_string()]);
+    }
+
+    #[test]
+    fn parse_join_on_rejects_different_column_names() {
+        let combined = Schema::from_strs(
+            &["x", "y"],
+            &[ColumnType::String, ColumnType::String],
+        );
+        let r = parse_query("SELECT y FROM a JOIN b ON a.x = b.y", &combined);
+        assert!(r.is_err(), "different-named columns must be rejected");
+        let err = r.unwrap_err().to_string();
+        assert!(
+            err.contains("same name") || err.contains("USING"),
+            "expected diagnostic mentioning same-name / USING, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_join_on_rejects_non_equi() {
+        let combined = Schema::from_strs(&["v"], &[ColumnType::Long]);
+        let r = parse_query("SELECT v FROM a JOIN b ON a.v > b.v", &combined);
+        assert!(r.is_err(), "non-equi ON must be rejected");
     }
 
     // ───── P10 — COUNT(DISTINCT col) ─────────────────────────────────
