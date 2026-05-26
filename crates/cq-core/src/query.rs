@@ -444,6 +444,9 @@ pub enum AggFn {
     /// `MEDIAN(col)` is sugar for `PERCENTILE_CONT(col, 0.5)`.
     /// O(n) memory per group; exact (no sketch).
     PercentileCont,
+    /// P10 — `COUNT(DISTINCT col)`. Exact (HashSet per group).
+    /// HyperLogLog is a future optimisation.
+    CountDistinct,
 }
 
 impl AggFn {
@@ -459,6 +462,7 @@ impl AggFn {
             AggFn::Variance => "VARIANCE",
             AggFn::VarianceSamp => "VAR_SAMP",
             AggFn::PercentileCont => "PERCENTILE_CONT",
+            AggFn::CountDistinct => "COUNT_DISTINCT",
         }
     }
 }
@@ -1422,6 +1426,43 @@ fn parse_aggregate_call(
         }
     };
 
+    // P10 — COUNT(DISTINCT col) is a different aggregate from COUNT(col).
+    // The `DISTINCT` keyword lives on `arg_list.duplicate_treatment`.
+    let is_distinct = matches!(
+        arg_list.duplicate_treatment,
+        Some(sqlparser::ast::DuplicateTreatment::Distinct)
+    );
+    if is_distinct {
+        if func != AggFn::Count {
+            return Err(QueryError::ParseError(format!(
+                "DISTINCT is only supported on COUNT, got {name}"
+            )));
+        }
+        if arg_list.args.len() != 1 {
+            return Err(QueryError::ParseError(format!(
+                "COUNT(DISTINCT ...) expects one column argument, got {}",
+                arg_list.args.len()
+            )));
+        }
+        let col_expr = match &arg_list.args[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+            other => {
+                return Err(QueryError::ParseError(format!(
+                    "COUNT(DISTINCT ...) argument must be a column reference, got {other:?}"
+                )))
+            }
+        };
+        let col_idx = resolve_select_column(col_expr, schema)?;
+        let col_name = schema.column_name(col_idx).to_string();
+        let default_alias = format!("COUNT(DISTINCT {col_name})");
+        return Ok(Some(AggregateSpec {
+            func: AggFn::CountDistinct,
+            col: Some(col_idx),
+            alias: alias.map(str::to_string).unwrap_or(default_alias),
+            percentile_q: None,
+        }));
+    }
+
     // P9 — PERCENTILE_CONT(col, q): two positional args. MEDIAN(col):
     // sugar for PERCENTILE_CONT(col, 0.5).
     if func == AggFn::PercentileCont {
@@ -2001,7 +2042,7 @@ pub fn execute_query_with_index_filtered(
 /// variant — unlike the secondary index, GROUP BY treats null as its
 /// own group rather than skipping it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum GroupKeyPart {
+pub enum GroupKeyPart {
     Null,
     Int(i32),
     Long(i64),
@@ -2076,6 +2117,9 @@ pub enum AggState {
     /// O(n) memory per group. `q` is captured at init time from the
     /// matching `AggregateSpec.percentile_q`.
     Percentile { values: Vec<f64>, q: f64 },
+    /// P10 — exact distinct count via per-group set of canonicalised
+    /// values. Reuses `GroupKeyPart` for hashable Value coverage.
+    CountDistinct(HashSet<GroupKeyPart>),
 }
 
 /// Which moment to return from a Welford state's `finalize`.
@@ -2148,6 +2192,7 @@ impl AggState {
                 values: Vec::new(),
                 q: spec_q.unwrap_or(0.5),
             },
+            (AggFn::CountDistinct, _) => AggState::CountDistinct(HashSet::new()),
             // SUM/MIN/MAX on a string column without a type-specific
             // variant (e.g. SUM(name)) — fall through to a sentinel
             // that ignores input so the executor doesn't panic. The
@@ -2269,6 +2314,16 @@ impl AggState {
                     }
                 }
             }
+            AggState::CountDistinct(set) => {
+                if let Some(val) = v {
+                    // Nulls are skipped — `COUNT(DISTINCT col)`
+                    // counts the distinct *non-null* values per
+                    // standard SQL semantics.
+                    if !val.is_null() {
+                        set.insert(GroupKeyPart::from_value(val));
+                    }
+                }
+            }
         }
     }
 
@@ -2324,6 +2379,7 @@ impl AggState {
                     serde_json::Value::from(s.as_str())
                 }
             }
+            AggState::CountDistinct(set) => serde_json::Value::from(set.len() as u64),
             AggState::Percentile { values, q } => {
                 if values.is_empty() {
                     return serde_json::Value::Null;
@@ -3639,6 +3695,86 @@ mod tests {
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "NVDA");
         assert_eq!(r.rows[1].get("symbol").unwrap().as_str().unwrap(), "AAPL");
+    }
+
+    // ───── P10 — COUNT(DISTINCT col) ─────────────────────────────────
+
+    #[test]
+    fn parses_count_distinct() {
+        let (schema, _) = make_store();
+        let q = parse_query(
+            "SELECT COUNT(DISTINCT desk) AS n_desks FROM trades",
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(q.aggregates.len(), 1);
+        assert_eq!(q.aggregates[0].alias, "n_desks");
+    }
+
+    #[test]
+    fn count_distinct_dedups() {
+        let (schema, store) = make_store();
+        // make_store has 3 distinct desks: RATES, EQUITIES, TECH.
+        let q = parse_query(
+            "SELECT COUNT(DISTINCT desk) AS n FROM trades",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        let n = r.rows[0].get("n").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(n, 3, "expected 3 distinct desks");
+    }
+
+    #[test]
+    fn count_distinct_with_group_by() {
+        let s = Arc::new(Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Long],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 16);
+        // a: {1, 2, 2, 3} → 3 distinct
+        // b: {7, 7} → 1 distinct
+        for (k, v) in &[("a", 1i64), ("a", 2), ("a", 2), ("a", 3), ("b", 7), ("b", 7)] {
+            store.append_row(&[
+                Value::String(Some(CompactString::new(*k))),
+                Value::Long(*v),
+            ]);
+        }
+        let q = parse_query(
+            "SELECT k, COUNT(DISTINCT v) AS d FROM t GROUP BY k",
+            &s,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        let by_k: std::collections::HashMap<String, u64> = r
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("k").unwrap().as_str().unwrap().to_string(),
+                    row.get("d").unwrap().as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_k["a"], 3);
+        assert_eq!(by_k["b"], 1);
+    }
+
+    #[test]
+    fn count_distinct_skips_nulls() {
+        let s = Arc::new(Schema::from_strs(
+            &["v"],
+            &[ColumnType::Long],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 8);
+        store.append_row(&[Value::Long(1)]);
+        store.append_row(&[Value::Null]);
+        store.append_row(&[Value::Long(2)]);
+        store.append_row(&[Value::Null]);
+        let q = parse_query("SELECT COUNT(DISTINCT v) AS n FROM t", &s).unwrap();
+        let r = execute_query(&q, &store);
+        let n = r.rows[0].get("n").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(n, 2, "nulls must not be counted");
     }
 
     // ───── P9 — PERCENTILE_CONT / MEDIAN ─────────────────────────────

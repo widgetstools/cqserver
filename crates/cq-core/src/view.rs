@@ -133,6 +133,8 @@ impl View {
                 | (AggFn::VarianceSamp, _) => ColumnType::Double,
                 // P9 — PERCENTILE_CONT / MEDIAN always return Double.
                 (AggFn::PercentileCont, _) => ColumnType::Double,
+                // P10 — COUNT(DISTINCT col) returns Long.
+                (AggFn::CountDistinct, _) => ColumnType::Long,
             };
             types.push(ty);
         }

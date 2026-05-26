@@ -100,8 +100,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_percentile.rs` runs MEDIAN + PERCENTILE_CONT(0.5) + PERCENTILE_CONT(0.95) in one SOW against {2,4,4,4,5,5,7,9} (median = 4.5, p95 = 8.3).
 
 ## P10 — Aggregates: COUNT(DISTINCT col) *(§1.1 row 9)*
-**Status:** ⏳
-**Scope:** Exact distinct count via per-group set. HyperLogLog optimization out of scope.
+**Status:** ✅ done
+**Scope:** `COUNT(DISTINCT col)` returns per-group distinct non-null count. Exact via `HashSet<GroupKeyPart>` per group. HyperLogLog is a future optimisation.
+**Implementation:** New `AggFn::CountDistinct` variant + `AggState::CountDistinct(HashSet<GroupKeyPart>)`. Parser checks `arg_list.duplicate_treatment` for `Some(DuplicateTreatment::Distinct)` on COUNT calls; emits `CountDistinct` instead of `Count`. Reuses the existing `GroupKeyPart` enum for hashable Value coverage. View schema derivation maps to `Long`.
+**Tests landed:**
+- 4 unit tests in `query::tests::{parses_count_distinct, count_distinct_dedups, count_distinct_with_group_by, count_distinct_skips_nulls}`.
+- E2E `crates/cq-e2e-tests/tests/parser_count_distinct.rs` covers overall + per-desk distinct counts on a 6-row trader fixture.
 
 ## P11 — JOIN: ON-clause equi-join (translated to USING) *(§1.4 row 1)*
 **Status:** ⏳
