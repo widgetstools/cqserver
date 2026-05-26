@@ -246,9 +246,14 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 - E2E `crates/cq-e2e-tests/tests/parser_cte.rs` — `WITH rates_trades AS (SELECT * FROM t WHERE desk = 'RATES') SELECT … FROM rates_trades WHERE price > 200` over the wire.
 **Out of scope (rejected with a clear error):** CTEs with projection, GROUP BY, JOIN, ORDER BY, LIMIT, or nested CTEs — those need real sub-query materialisation, which is the Q9 follow-up. The current message tells callers to write the query directly until Q9 lands.
 
-## Q9 — Subqueries: WHERE col IN (SELECT …), EXISTS, scalar subqueries *(§1.8 rows 1–3)*
-**Status:** ⏳
-**Scope:** Treat each subquery as a one-shot SOW against the referenced topic, materialise the result, then substitute. Correlated subqueries are out of scope for the first cut.
+## Q9 — Subqueries: WHERE col IN (SELECT col FROM topic) MVP *(§1.8 row 1)*
+**Status:** ✅ done (MVP — `IN` subqueries only; EXISTS + scalar subqueries deferred)
+**Scope:** `WHERE col IN (SELECT col FROM topic [WHERE …])` materialises the inner SELECT at SOW time and substitutes the result as a literal IN list. Inner subquery must be `SELECT one_col FROM topic [WHERE …]` (no JOIN, no GROUP BY, no projection). Empty result → never-match predicate so the outer query returns 0 rows. `NOT IN` supported.
+**Implementation:** Router-side pre-flight `resolve_in_subqueries(sql, topics)` runs before `build_sql`/`rewrite_from_to_t`. Walks the WHERE AST, finds `Expr::InSubquery`, dispatches a one-shot `Topic::query` against the inner source topic, builds `Expr::InList` from the rows, re-serialises the AST. Topic name canonicalised (P14). Errors surface as `ClientError::Server` via the P7 error path.
+**Tests landed:**
+- Unit `query::tests::subquery_in_select_currently_unsupported` — pins parser-level rejection when subqueries reach `parse_query` un-resolved (defensive).
+- E2E `crates/cq-e2e-tests/tests/parser_in_subquery.rs` — 2 tests: non-empty subquery (trades IN watchlist) and empty subquery (always-false substitution returns 0 rows).
+**Out of scope (deferred to future sessions):** `EXISTS`, scalar subqueries in SELECT, correlated subqueries, subqueries with JOIN/GROUP BY inside.
 
 ## Q10 — Bytes / Array / Object as first-class column types *(§2 column-types row)*
 **Status:** ⏳

@@ -4075,6 +4075,25 @@ mod tests {
     // (Was `parse_join_rejects_left_outer_for_now` — superseded by
     // P12 which accepts LEFT OUTER JOIN. See the P12 tests below.)
 
+    // ───── Q9 — subqueries ───────────────────────────────────────────
+
+    #[test]
+    fn subquery_in_select_currently_unsupported() {
+        // Q9 MVP: parser-time rejection with a clear error. Actual
+        // materialisation lives in topic.rs's new
+        // `query_streaming_json_with_subqueries` path (exercised by
+        // the e2e test).
+        let (schema, _) = make_store();
+        let r = parse_query(
+            "SELECT symbol FROM trades WHERE symbol IN (SELECT symbol FROM watchlist)",
+            &schema,
+        );
+        // Either parse rejects directly or predicate compile errors —
+        // both are acceptable. The point: we get a CLEAN error rather
+        // than silently dropping the IN-clause.
+        assert!(r.is_err(), "subquery without materialisation must error");
+    }
+
     // ───── Q8 — CTEs (WITH x AS …) ───────────────────────────────────
 
     #[test]

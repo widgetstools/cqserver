@@ -11,6 +11,188 @@ use cq_core::query::peek_join;
 use cq_core::topic::SharedTopic;
 use cq_protocol::command::Command;
 use cq_protocol::message::CqMessage;
+
+/// Q9 — pre-flight subquery materialisation. Walks the WHERE clause
+/// for `Expr::InSubquery` patterns (e.g.
+/// `WHERE symbol IN (SELECT symbol FROM watchlist)`), runs each
+/// subquery as a one-shot SOW against its source topic, and
+/// substitutes the result back as a literal IN list. Returns the
+/// rewritten SQL. If `sql` contains no subqueries, returns it
+/// unchanged. Errors if a subquery's source topic doesn't exist or
+/// if the inner SELECT is something we don't materialise yet
+/// (multi-column projection, JOIN, GROUP BY, etc.).
+///
+/// MVP scope:
+/// - Only `Expr::InSubquery` (not EXISTS, not scalar subqueries).
+/// - Inner SELECT must be `SELECT one_col FROM topic [WHERE …]`.
+/// - Materialisation uses `Topic::query` so it picks up everything
+///   the regular SOW path supports (filters, aliases via P1, etc.).
+fn resolve_in_subqueries(
+    sql: &str,
+    topics: &dashmap::DashMap<String, SharedTopic>,
+) -> Result<String, String> {
+    use sqlparser::ast::{SetExpr, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    let dialect = GenericDialect {};
+    let mut ast = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| format!("parse: {e}"))?;
+    if ast.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let stmt = &mut ast[0];
+    let q = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(sql.to_string()),
+    };
+    let select = match q.body.as_mut() {
+        SetExpr::Select(s) => s,
+        _ => return Ok(sql.to_string()),
+    };
+    let mut changed = false;
+    if let Some(where_expr) = select.selection.as_mut() {
+        rewrite_in_subqueries(where_expr, topics, &mut changed)?;
+    }
+    if !changed {
+        return Ok(sql.to_string());
+    }
+    // sqlparser's Display impl round-trips the AST back to SQL text.
+    Ok(format!("{q}"))
+}
+
+fn rewrite_in_subqueries(
+    expr: &mut sqlparser::ast::Expr,
+    topics: &dashmap::DashMap<String, SharedTopic>,
+    changed: &mut bool,
+) -> Result<(), String> {
+    use sqlparser::ast::{Expr, SetExpr, TableFactor, Value, ValueWithSpan, SelectItem, GroupByExpr};
+    match expr {
+        Expr::InSubquery { expr: inner_lhs, subquery, negated } => {
+            // Materialise the subquery → InList of literals.
+            // Subquery shape: SELECT one_col FROM topic [WHERE …].
+            let inner_query = match subquery.as_ref() {
+                SetExpr::Select(s) => s,
+                _ => {
+                    return Err("subquery must be a SELECT (no set ops)".into());
+                }
+            };
+            if inner_query.projection.len() != 1 {
+                return Err(
+                    "subquery must project exactly one column".into(),
+                );
+            }
+            let proj_col_expr = match &inner_query.projection[0] {
+                SelectItem::UnnamedExpr(e) => e,
+                SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => return Err(
+                    "subquery projection must be a column ref".into(),
+                ),
+            };
+            let proj_col_name = match proj_col_expr {
+                Expr::Identifier(id) => id.value.clone(),
+                _ => return Err(
+                    "subquery projection must be a bare column identifier".into(),
+                ),
+            };
+            if inner_query.from.len() != 1 || !inner_query.from[0].joins.is_empty() {
+                return Err("subquery FROM must be a single topic (no JOIN)".into());
+            }
+            if !matches!(&inner_query.group_by, GroupByExpr::Expressions(g, _) if g.is_empty())
+            {
+                return Err("subquery cannot have GROUP BY".into());
+            }
+            let topic_name = match &inner_query.from[0].relation {
+                TableFactor::Table { name, .. } => {
+                    let raw = name.to_string();
+                    let trimmed = raw.trim_matches('"').trim_matches('`').trim_matches('[').trim_matches(']');
+                    trimmed.to_string()
+                }
+                _ => return Err("subquery FROM must be a plain topic name".into()),
+            };
+            // Materialise: build a SQL string `SELECT col FROM t [WHERE …]`
+            // and call Topic::query.
+            let canonical = cq_core::topic::canonicalize_topic(&topic_name);
+            let topic = topics
+                .get(&canonical)
+                .ok_or_else(|| format!("subquery topic `{topic_name}` not found"))?;
+            let where_part = inner_query
+                .selection
+                .as_ref()
+                .map(|e| format!(" WHERE {e}"))
+                .unwrap_or_default();
+            let sub_sql = format!("SELECT {proj_col_name} FROM t{where_part}");
+            let result = topic
+                .query(&sub_sql)
+                .map_err(|e| format!("subquery: {e}"))?;
+            // Build the IN list from the result column values.
+            let mut lits: Vec<Expr> = Vec::with_capacity(result.rows.len());
+            for row in &result.rows {
+                let v = row
+                    .get(proj_col_name.as_str())
+                    .ok_or_else(|| format!("subquery missing col `{proj_col_name}`"))?;
+                let lit = match v {
+                    serde_json::Value::String(s) => {
+                        Expr::Value(ValueWithSpan {
+                            value: Value::SingleQuotedString(s.clone()),
+                            span: sqlparser::tokenizer::Span::empty(),
+                        })
+                    }
+                    serde_json::Value::Number(n) => Expr::Value(ValueWithSpan {
+                        value: Value::Number(n.to_string(), false),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }),
+                    serde_json::Value::Bool(b) => Expr::Value(ValueWithSpan {
+                        value: Value::Boolean(*b),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }),
+                    _ => continue, // skip nulls
+                };
+                lits.push(lit);
+            }
+            // Replace `lhs IN (subquery)` with `lhs IN (lit, lit, ...)`.
+            // Edge case: empty result → `lhs IN ()` which sqlparser
+            // dislikes. Substitute with `false` (resp. `true` if
+            // negated) so the predicate evaluates to no-match.
+            *expr = if lits.is_empty() {
+                // Empty IN list: synthesize an always-false predicate
+                // (or always-true if NOT IN). We use
+                // `col IS NULL AND col IS NOT NULL` — always false
+                // regardless of col type — and negate for NOT IN.
+                let null_check = Expr::IsNull(inner_lhs.clone());
+                let not_null_check = Expr::IsNotNull(inner_lhs.clone());
+                let always_false = Expr::BinaryOp {
+                    left: Box::new(null_check),
+                    op: sqlparser::ast::BinaryOperator::And,
+                    right: Box::new(not_null_check),
+                };
+                if *negated {
+                    Expr::UnaryOp {
+                        op: sqlparser::ast::UnaryOperator::Not,
+                        expr: Box::new(always_false),
+                    }
+                } else {
+                    always_false
+                }
+            } else {
+                Expr::InList {
+                    expr: inner_lhs.clone(),
+                    list: lits,
+                    negated: *negated,
+                }
+            };
+            *changed = true;
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_in_subqueries(left, topics, changed)?;
+            rewrite_in_subqueries(right, topics, changed)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            rewrite_in_subqueries(expr, topics, changed)
+        }
+        _ => Ok(()),
+    }
+}
 use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -996,6 +1178,29 @@ fn handle_sow(
         return;
     }
 
+    // Q9 — pre-flight subquery materialisation. Walks any
+    // `WHERE col IN (SELECT col FROM topic)` in msg.sql, resolves
+    // each subquery as a one-shot SOW against the topic registry,
+    // and substitutes the result back as a literal IN list. Returns
+    // the rewritten SQL on success; on failure returns a clean
+    // server error to the client.
+    let mut msg = msg;
+    if let Some(raw_sql_ref) = msg.sql.as_deref() {
+        match resolve_in_subqueries(raw_sql_ref, topics) {
+            Ok(rewritten) => {
+                if rewritten != raw_sql_ref {
+                    msg.sql = Some(rewritten);
+                }
+            }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!("Subquery: {e}"),
+                ));
+                return;
+            }
+        }
+    }
     // For the JOIN path we run `peek_join` + `parse_query` against the
     // RAW user SQL (not the rewritten `FROM t …` form) — column refs
     // like `p.position_id` only resolve when the left-side alias is
