@@ -132,8 +132,14 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_matches_regex.rs` runs a regex filter over a 5-symbol fixture and verifies invalid patterns surface as `ClientError::Server`.
 
 ## P14 — Topic registry: normalise slash-prefix *(§4 bug 5)*
-**Status:** ⏳
-**Scope:** Topics canonicalise to `/name` at registration; remove the ad-hoc dual-lookup workarounds in `init_view` and the SOW JOIN resolver.
+**Status:** ✅ done
+**Scope:** Topics canonicalise to `/name` at registration; the ad-hoc dual-lookup workarounds in `init_view` (server) and `deliver_join_snapshot` (transport router) have been replaced with a single canonical lookup.
+**Implementation:** New `cq_core::topic::canonicalize_topic(name)` helper. Applied at:
+- `cq-server/src/main.rs` topic registration (line 228), view-config name + source resolution (line 826–829), JOIN right-side resolver (line 856–864), and view registration (line 918).
+- `cq-transport/src/router.rs` `deliver_join_snapshot` right-topic lookup (line 932–934).
+**Tests landed:**
+- Unit `topic::tests::canonicalize_topic_round_trips` covering idempotence + multi-segment paths.
+- E2E `crates/cq-e2e-tests/tests/topic_slash_normalization.rs` declares a `[[views]]` block whose JOIN SQL uses BARE topic names (`FROM p14_pos JOIN p14_sec USING (cusip)`) against slash-prefixed registry entries (`/p14_pos`, `/p14_sec`); verifies both the view runner and the inline JOIN SOW path resolve correctly.
 
 ## P15 — SDK: HA failover across multiple URIs *(§3.1 row 12)*
 **Status:** ⏳

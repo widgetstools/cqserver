@@ -925,13 +925,10 @@ fn handle_sow(
     if let Some(raw) = raw_sql.as_deref() {
         match peek_join(raw) {
             Ok(Some((_, right_topic_name, _using))) => {
-                let right_topic = topics
-                    .get(&right_topic_name)
-                    .map(|e| e.value().clone())
-                    .or_else(|| {
-                        let with_slash = format!("/{right_topic_name}");
-                        topics.get(&with_slash).map(|e| e.value().clone())
-                    });
+                // P14 — registry keys are canonical (slash-prefixed);
+                // canonicalise the SQL-derived name and look up once.
+                let key = cq_core::topic::canonicalize_topic(&right_topic_name);
+                let right_topic = topics.get(&key).map(|e| e.value().clone());
                 let right_topic = match right_topic {
                     Some(t) => t,
                     None => {

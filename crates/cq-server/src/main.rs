@@ -225,8 +225,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        topics.insert(topic_cfg.name.clone(), shared);
-        info!(topic = %topic_cfg.name, "Topic ready");
+        // P14 — register under the canonical slash-prefixed name so
+        // every lookup (router SOW, SDK publish, view source resolver)
+        // can use one form instead of dual-checking.
+        let canonical = cq_core::topic::canonicalize_topic(&topic_cfg.name);
+        topics.insert(canonical.clone(), shared);
+        info!(topic = %canonical, "Topic ready");
     }
 
     info!(topics = topics.len(), "Topic registry initialized");
@@ -816,16 +820,21 @@ fn init_view(
     topics: &Arc<DashMap<String, SharedTopic>>,
     registry: cq_transport::session::SessionRegistry,
 ) -> Result<std::thread::JoinHandle<()>, String> {
-    if topics.contains_key(&cfg.name) {
+    // P14 — view name and source name are both canonicalised so the
+    // collision check and source lookup hit the same key the topic
+    // registration used.
+    let canonical_view = cq_core::topic::canonicalize_topic(&cfg.name);
+    let canonical_source = cq_core::topic::canonicalize_topic(&cfg.source);
+    if topics.contains_key(&canonical_view) {
         return Err(format!(
             "view name `{}` collides with an existing topic",
-            cfg.name
+            canonical_view
         ));
     }
     let source = topics
-        .get(&cfg.source)
+        .get(&canonical_source)
         .map(|e| e.value().clone())
-        .ok_or_else(|| format!("source topic `{}` not found", cfg.source))?;
+        .ok_or_else(|| format!("source topic `{}` not found", canonical_source))?;
 
     // S20 — detect a JOIN clause on the view SQL. JOIN views go
     // through `build_view_topic_joined` (parses against the
@@ -844,9 +853,17 @@ fn init_view(
         let topics_for_resolver = topics.clone();
         let (vt, q, g, rt) = View::build_view_topic_joined(
             &source,
-            move |name| topics_for_resolver.get(name).map(|e| e.value().clone()),
+            move |name| {
+                // P14 — registry is canonical (slash-prefixed). The
+                // SQL may carry either form; canonicalise and look
+                // up once.
+                let key = cq_core::topic::canonicalize_topic(name);
+                topics_for_resolver
+                    .get(&key)
+                    .map(|e| e.value().clone())
+            },
             &cfg.sql,
-            cfg.name.clone(),
+            canonical_view.clone(),
             cfg.initial_capacity,
         )
         .map_err(|e| format!("build joined view topic: {}", e))?;
@@ -855,7 +872,7 @@ fn init_view(
         let (vt, q, g) = View::build_view_topic(
             &source,
             &cfg.sql,
-            cfg.name.clone(),
+            canonical_view.clone(),
             cfg.initial_capacity,
         )
         .map_err(|e| format!("build view topic: {}", e))?;
@@ -898,7 +915,7 @@ fn init_view(
         registry,
     );
 
-    topics.insert(cfg.name.clone(), view_topic_arc);
+    topics.insert(canonical_view, view_topic_arc);
     Ok(evaluator_handle)
 }
 
@@ -936,6 +953,8 @@ fn column_type_from_spec(t: ColumnTypeSpec) -> ColumnType {
         ColumnTypeSpec::Int => ColumnType::Int,
         ColumnTypeSpec::Long | ColumnTypeSpec::Integer => ColumnType::Long,
         ColumnTypeSpec::Double | ColumnTypeSpec::Float => ColumnType::Double,
+        ColumnTypeSpec::Bool => ColumnType::Bool,
+        ColumnTypeSpec::Timestamp => ColumnType::Timestamp,
     }
 }
 
@@ -1015,6 +1034,8 @@ fn parse_type_str(s: &str) -> Result<ColumnType, Box<dyn std::error::Error>> {
         "int" | "i32" => Ok(ColumnType::Int),
         "long" | "i64" | "integer" => Ok(ColumnType::Long),
         "double" | "f64" | "float" => Ok(ColumnType::Double),
+        "bool" | "boolean" => Ok(ColumnType::Bool),
+        "timestamp" | "datetime" | "ts" => Ok(ColumnType::Timestamp),
         other => Err(format!("unknown column type: {other}").into()),
     }
 }

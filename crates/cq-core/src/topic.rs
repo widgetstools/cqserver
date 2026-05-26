@@ -203,6 +203,30 @@ pub struct Topic {
     replication_notify: Arc<tokio::sync::Notify>,
 }
 
+/// P14 — canonical topic-name form. AMPS_PARITY §4 bug 5 documented
+/// the slash-prefix asymmetry: topics register as `/positions` but
+/// SQL clauses (`FROM positions JOIN ...`) often write bare names.
+/// Centralising the form here lets the registry insert/lookup paths
+/// agree without per-call-site dual-lookup helpers.
+///
+/// Rules:
+/// - Empty input stays empty (caller is expected to error before this).
+/// - A leading `/` is preserved.
+/// - Any other input gets `/` prepended.
+///
+/// `canonicalize_topic("trades") == "/trades"`
+/// `canonicalize_topic("/trades") == "/trades"`
+pub fn canonicalize_topic(name: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{name}")
+    }
+}
+
 impl Topic {
     pub fn new(config: TopicConfig, schema: Arc<Schema>, capacity: usize) -> Self {
         let state = StoreState::build(
@@ -1910,6 +1934,24 @@ mod tests {
     use crate::schema::ColumnType;
     use crate::subscription::DeltaType;
     use compact_str::CompactString;
+
+    // ───── P14 — canonicalize_topic ─────────────────────────────────
+
+    #[test]
+    fn canonicalize_topic_round_trips() {
+        assert_eq!(canonicalize_topic("trades"), "/trades");
+        assert_eq!(canonicalize_topic("/trades"), "/trades");
+        // Idempotent.
+        assert_eq!(
+            canonicalize_topic(&canonicalize_topic("trades")),
+            "/trades"
+        );
+        // Multi-level paths are preserved as-is when slash-prefixed.
+        assert_eq!(canonicalize_topic("/v/by_desk"), "/v/by_desk");
+        assert_eq!(canonicalize_topic("v/by_desk"), "/v/by_desk");
+        // Empty stays empty.
+        assert_eq!(canonicalize_topic(""), "");
+    }
 
     // ───── P5 — keyless topics upsert into row 0 (no append) ────────
 
