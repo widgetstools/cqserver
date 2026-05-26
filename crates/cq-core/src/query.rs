@@ -69,6 +69,13 @@ pub struct ParsedQuery {
     /// with non-equi predicates, multi-table chained joins) are
     /// rejected at parse time and reserved for follow-ups.
     pub join: Option<JoinSpec>,
+    /// Q7 — window-function columns. Each is evaluated per row after
+    /// the projection step: rows are partitioned by `partition_by`,
+    /// sorted by `order_by`, then the window fn (ROW_NUMBER / RANK /
+    /// DENSE_RANK / LAG / LEAD) assigns a per-row value emitted under
+    /// the spec's alias. Non-aggregate path only — combining window
+    /// fns with GROUP BY would need a separate pass and is deferred.
+    pub windows: Vec<WindowColumn>,
     /// P3 — HAVING predicate evaluated after group-by finalise. None
     /// for non-aggregate queries (HAVING without GROUP BY is rejected
     /// at parse time, matching AMPS).
@@ -149,6 +156,33 @@ fn value_as_f64(v: &Value) -> Option<f64> {
     // Delegate to the store's null-aware coercion so NULL_LONG /
     // NULL_INT / NaN aren't silently treated as zero.
     v.as_f64()
+}
+
+/// Q7 — one window-function column on the SELECT list.
+#[derive(Debug, Clone)]
+pub struct WindowColumn {
+    pub alias: String,
+    /// Schema column indices to partition rows on; empty = single
+    /// global partition.
+    pub partition_by: Vec<usize>,
+    /// `(col_idx, ascending)` per ORDER BY entry. Empty = no
+    /// intra-partition ordering (RANK/ROW_NUMBER fall back to
+    /// row-arrival order).
+    pub order_by: Vec<(usize, bool)>,
+    pub kind: WindowFn,
+}
+
+#[derive(Debug, Clone)]
+pub enum WindowFn {
+    RowNumber,
+    Rank,
+    DenseRank,
+    /// `LAG(col, offset, default)` — value from the row `offset` back
+    /// in the partition's sorted order. `default` is emitted when
+    /// the lookup falls off the partition's leading edge.
+    Lag { col: usize, offset: usize },
+    /// `LEAD(col, offset, default)` — same but forward.
+    Lead { col: usize, offset: usize },
 }
 
 /// P3 — compiled HAVING expression. Evaluated against a finalised
@@ -912,7 +946,7 @@ fn parse_select(
     //     column refs + aggregate function calls. The presence of
     //     either an aggregate call or a non-empty GROUP BY switches
     //     the executor into aggregate mode.
-    let (projection, aggregates, computed) =
+    let (projection, aggregates, computed, windows) =
         parse_projection_or_aggregates(&select.projection, schema, &group_by)?;
 
     // --- HAVING (P3) — compile against [group_names ++ aggregate_aliases].
@@ -971,6 +1005,7 @@ fn parse_select(
         computed,
         having,
         offset,
+        windows,
     })
 }
 
@@ -1257,6 +1292,7 @@ fn parse_pivot_query(
         computed: Vec::new(),
         having: None,
         offset: None,
+        windows: Vec::new(),
     })
 }
 
@@ -1371,6 +1407,7 @@ fn parse_unpivot_query(
         computed: Vec::new(),
         having: None,
         offset: None,
+        windows: Vec::new(),
     })
 }
 
@@ -1402,17 +1439,15 @@ fn parse_projection_or_aggregates(
     items: &[SelectItem],
     schema: &Schema,
     group_by: &[usize],
-) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<ComputedColumn>), QueryError> {
+) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<ComputedColumn>, Vec<WindowColumn>), QueryError> {
     // First pass: detect whether any item is an aggregate function.
     let has_agg = items
         .iter()
         .any(|i| matches!(extract_expr(i), Some(e) if is_aggregate_function_call(e)));
 
     if !has_agg && group_by.is_empty() {
-        // Plain projection — P2 extends this to also handle scalar
-        // expressions (`a + b AS sum`) via the second return value.
-        let (projection, computed) = parse_projection(items, schema)?;
-        return Ok((projection, Vec::new(), computed));
+        let (projection, computed, windows) = parse_projection(items, schema)?;
+        return Ok((projection, Vec::new(), computed, windows));
     }
 
     // Aggregate path.
@@ -1458,7 +1493,7 @@ fn parse_projection_or_aggregates(
         // executor by leaving both vectors as-is.
     }
 
-    Ok((Vec::new(), aggregates, Vec::new()))
+    Ok((Vec::new(), aggregates, Vec::new(), Vec::new()))
 }
 
 fn extract_expr(item: &SelectItem) -> Option<&Expr> {
@@ -1677,24 +1712,24 @@ fn parse_aggregate_call(
 fn parse_projection(
     items: &[SelectItem],
     schema: &Schema,
-) -> Result<(Vec<usize>, Vec<ComputedColumn>), QueryError> {
+) -> Result<(Vec<usize>, Vec<ComputedColumn>, Vec<WindowColumn>), QueryError> {
     let mut cols = Vec::new();
     let mut computed = Vec::new();
+    let mut windows = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard(_) => {
-                // Empty projection = all columns; computed columns
-                // cannot mix with * because their alias placement is
-                // ambiguous. Reject the mix early.
-                if !computed.is_empty() {
+                if !computed.is_empty() || !windows.is_empty() {
                     return Err(QueryError::ParseError(
-                        "SELECT * cannot be combined with computed columns".into(),
+                        "SELECT * cannot be combined with computed/window columns".into(),
                     ));
                 }
-                return Ok((Vec::new(), Vec::new()));
+                return Ok((Vec::new(), Vec::new(), Vec::new()));
             }
             SelectItem::UnnamedExpr(expr) => {
-                if let Some(scalar) = try_compile_scalar_expr(expr, schema)? {
+                if let Some(window) = try_compile_window(expr, None, schema)? {
+                    windows.push(window);
+                } else if let Some(scalar) = try_compile_scalar_expr(expr, schema)? {
                     let alias = expr_display_alias(expr);
                     computed.push(ComputedColumn { alias, expr: scalar });
                 } else {
@@ -1703,12 +1738,9 @@ fn parse_projection(
                 }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                // Alias on a bare column ref → still a projection but
-                // the executor's row map uses the source column name
-                // (the alias-as-rename for plain columns is a separate
-                // gap, low ROI). Alias on a scalar expression → a
-                // computed column with the user-supplied alias.
-                if let Some(scalar) = try_compile_scalar_expr(expr, schema)? {
+                if let Some(window) = try_compile_window(expr, Some(&alias.value), schema)? {
+                    windows.push(window);
+                } else if let Some(scalar) = try_compile_scalar_expr(expr, schema)? {
                     computed.push(ComputedColumn {
                         alias: alias.value.clone(),
                         expr: scalar,
@@ -1726,7 +1758,104 @@ fn parse_projection(
             }
         }
     }
-    Ok((cols, computed))
+    Ok((cols, computed, windows))
+}
+
+/// Q7 — `Some(window)` if `expr` is a window-function call
+/// (`Expr::Function` with `over: Some(WindowSpec(...))`). `None` for
+/// everything else, so callers continue with the scalar / projection
+/// path.
+fn try_compile_window(
+    expr: &sqlparser::ast::Expr,
+    alias_override: Option<&str>,
+    schema: &Schema,
+) -> Result<Option<WindowColumn>, QueryError> {
+    use sqlparser::ast::{Expr, WindowType};
+    let f = match expr {
+        Expr::Function(f) => f,
+        _ => return Ok(None),
+    };
+    let spec = match &f.over {
+        Some(WindowType::WindowSpec(s)) => s,
+        Some(WindowType::NamedWindow(_)) => {
+            return Err(QueryError::ParseError(
+                "named windows not supported; inline OVER (...) directly".into(),
+            ));
+        }
+        None => return Ok(None),
+    };
+    let name = f.name.to_string().to_ascii_uppercase();
+    let kind = match name.as_str() {
+        "ROW_NUMBER" => WindowFn::RowNumber,
+        "RANK" => WindowFn::Rank,
+        "DENSE_RANK" => WindowFn::DenseRank,
+        "LAG" | "LEAD" => {
+            let arg_list = match &f.args {
+                FunctionArguments::List(l) => l,
+                _ => {
+                    return Err(QueryError::ParseError(format!(
+                        "{name}() requires (col [, offset]) args"
+                    )))
+                }
+            };
+            if arg_list.args.is_empty() {
+                return Err(QueryError::ParseError(format!(
+                    "{name}() requires at least one argument"
+                )));
+            }
+            let col_expr = match &arg_list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                other => {
+                    return Err(QueryError::ParseError(format!(
+                        "{name}: first arg must be a column ref, got {other:?}"
+                    )))
+                }
+            };
+            let col = resolve_select_column(col_expr, schema)?;
+            let offset = if arg_list.args.len() >= 2 {
+                match &arg_list.args[1] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v))) => {
+                        if let sqlparser::ast::Value::Number(n, _) = &v.value {
+                            n.parse::<usize>().unwrap_or(1)
+                        } else {
+                            return Err(QueryError::ParseError(format!(
+                                "{name}: offset must be a numeric literal"
+                            )));
+                        }
+                    }
+                    _ => 1,
+                }
+            } else {
+                1
+            };
+            match name.as_str() {
+                "LAG" => WindowFn::Lag { col, offset },
+                _ => WindowFn::Lead { col, offset },
+            }
+        }
+        _ => {
+            return Err(QueryError::ParseError(format!(
+                "window function {name}() not supported; use ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD"
+            )));
+        }
+    };
+    let mut partition_by: Vec<usize> = Vec::new();
+    for pe in &spec.partition_by {
+        partition_by.push(resolve_select_column(pe, schema)?);
+    }
+    let mut order_by: Vec<(usize, bool)> = Vec::new();
+    for ob in &spec.order_by {
+        let col = resolve_select_column(&ob.expr, schema)?;
+        let asc = ob.options.asc.unwrap_or(true);
+        order_by.push((col, asc));
+    }
+    let default_alias = format!("{}()", name);
+    Ok(Some(WindowColumn {
+        alias: alias_override.map(str::to_string).unwrap_or(default_alias),
+        partition_by,
+        order_by,
+        kind,
+    }))
 }
 
 /// P2 — `Some(expr)` if `expr` is a scalar arithmetic expression
@@ -2107,7 +2236,7 @@ pub fn execute_query_with_index_filtered(
         query.projection.clone()
     };
 
-    let rows: Vec<serde_json::Map<String, serde_json::Value>> = matching_rows
+    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = matching_rows
         .iter()
         .map(|&row| {
             let mut map = store.get_row_map_projected(row, &proj_indices);
@@ -2126,14 +2255,138 @@ pub fn execute_query_with_index_filtered(
         })
         .collect();
 
+    // Q7 — window functions. Per spec: partition rows by
+    // `partition_by` values, sort each partition by `order_by`,
+    // assign per-row values. We use the source row indices in
+    // `matching_rows` to know each output row's full column values
+    // (the projection may have dropped columns referenced by
+    // PARTITION BY / ORDER BY).
+    if !query.windows.is_empty() && !rows.is_empty() {
+        for wc in &query.windows {
+            apply_window(wc, &mut rows, &matching_rows, store);
+        }
+    }
+
     QueryResult {
         rows,
         total_matches,
-        // `matching_rows` is the post-sort, post-limit list of row
-        // indices the projection just walked — in lockstep with
-        // `rows`. Callers (Topic::query + streaming + subscribe)
-        // use this to apply the tombstone filter by row index.
         source_rows: matching_rows,
+    }
+}
+
+/// Q7 — apply one window column to the result rows. Mutates `rows`
+/// in place; each row gets the window value under `wc.alias`.
+fn apply_window(
+    wc: &WindowColumn,
+    rows: &mut [serde_json::Map<String, serde_json::Value>],
+    source_rows: &[u32],
+    store: &ColumnStore,
+) {
+    // Partition: map partition-key → Vec<output_row_index>.
+    let mut parts: HashMap<Vec<GroupKeyPart>, Vec<usize>> = HashMap::new();
+    let mut part_order: Vec<Vec<GroupKeyPart>> = Vec::new();
+    for (i, &src) in source_rows.iter().enumerate() {
+        let key: Vec<GroupKeyPart> = wc
+            .partition_by
+            .iter()
+            .map(|&c| GroupKeyPart::from_value(&store.get(c, src)))
+            .collect();
+        if !parts.contains_key(&key) {
+            part_order.push(key.clone());
+        }
+        parts.entry(key).or_default().push(i);
+    }
+    // Per-partition: sort by order_by, then assign per kind.
+    for key in &part_order {
+        let mut partition = parts.remove(key).unwrap();
+        if !wc.order_by.is_empty() {
+            partition.sort_by(|&a, &b| {
+                let sa = source_rows[a];
+                let sb = source_rows[b];
+                for &(col, asc) in &wc.order_by {
+                    let ord = compare_values(store, col, sa, sb);
+                    let ord = if asc { ord } else { ord.reverse() };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        match &wc.kind {
+            WindowFn::RowNumber => {
+                for (rank, &out_idx) in partition.iter().enumerate() {
+                    rows[out_idx].insert(
+                        wc.alias.clone(),
+                        serde_json::Value::from((rank as u64) + 1),
+                    );
+                }
+            }
+            WindowFn::Rank => {
+                let mut last_rank: u64 = 0;
+                let mut last_pos: u64 = 0;
+                for (pos, &out_idx) in partition.iter().enumerate() {
+                    let pos = pos as u64;
+                    if pos == 0 {
+                        last_rank = 1;
+                    } else {
+                        let prev_src = source_rows[partition[pos as usize - 1]];
+                        let curr_src = source_rows[out_idx];
+                        let ties = wc.order_by.iter().all(|&(col, _)| {
+                            compare_values(store, col, prev_src, curr_src) == Ordering::Equal
+                        });
+                        if !ties {
+                            last_rank = pos + 1;
+                        }
+                    }
+                    last_pos = pos + 1;
+                    rows[out_idx]
+                        .insert(wc.alias.clone(), serde_json::Value::from(last_rank));
+                }
+                let _ = last_pos;
+            }
+            WindowFn::DenseRank => {
+                let mut last_rank: u64 = 0;
+                for (pos, &out_idx) in partition.iter().enumerate() {
+                    if pos == 0 {
+                        last_rank = 1;
+                    } else {
+                        let prev_src = source_rows[partition[pos - 1]];
+                        let curr_src = source_rows[out_idx];
+                        let ties = wc.order_by.iter().all(|&(col, _)| {
+                            compare_values(store, col, prev_src, curr_src) == Ordering::Equal
+                        });
+                        if !ties {
+                            last_rank += 1;
+                        }
+                    }
+                    rows[out_idx]
+                        .insert(wc.alias.clone(), serde_json::Value::from(last_rank));
+                }
+            }
+            WindowFn::Lag { col, offset } => {
+                for (pos, &out_idx) in partition.iter().enumerate() {
+                    let val = if pos >= *offset {
+                        let src = source_rows[partition[pos - offset]];
+                        store.get(*col, src).to_json()
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    rows[out_idx].insert(wc.alias.clone(), val);
+                }
+            }
+            WindowFn::Lead { col, offset } => {
+                for (pos, &out_idx) in partition.iter().enumerate() {
+                    let val = if pos + offset < partition.len() {
+                        let src = source_rows[partition[pos + offset]];
+                        store.get(*col, src).to_json()
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    rows[out_idx].insert(wc.alias.clone(), val);
+                }
+            }
+        }
     }
 }
 
@@ -3701,6 +3954,110 @@ mod tests {
 
     // (Was `parse_join_rejects_left_outer_for_now` — superseded by
     // P12 which accepts LEFT OUTER JOIN. See the P12 tests below.)
+
+    // ───── Q7 — window functions ─────────────────────────────────────
+
+    fn make_window_store() -> (Arc<Schema>, ColumnStore) {
+        // (sym, px) — sym is partition col, px is order col.
+        let s = Arc::new(Schema::from_strs(
+            &["sym", "px"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 16);
+        // AAPL: 150, 100, 200 → sorted ASC: 100, 150, 200
+        // MSFT: 300, 50     → sorted ASC: 50, 300
+        for (sym, px) in &[
+            ("AAPL", 150.0_f64),
+            ("AAPL", 100.0),
+            ("AAPL", 200.0),
+            ("MSFT", 300.0),
+            ("MSFT", 50.0),
+        ] {
+            store.append_row(&[
+                Value::String(Some(CompactString::new(*sym))),
+                Value::Double(*px),
+            ]);
+        }
+        (s, store)
+    }
+
+    #[test]
+    fn parses_row_number_over_partition_order() {
+        let (s, _) = make_window_store();
+        let q = parse_query(
+            "SELECT sym, px, ROW_NUMBER() OVER (PARTITION BY sym ORDER BY px ASC) AS rn FROM t",
+            &s,
+        )
+        .expect("ROW_NUMBER must parse");
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.windows[0].alias, "rn");
+    }
+
+    #[test]
+    fn row_number_assigns_per_partition_sorted_index() {
+        let (s, store) = make_window_store();
+        let q = parse_query(
+            "SELECT sym, px, ROW_NUMBER() OVER (PARTITION BY sym ORDER BY px ASC) AS rn FROM t",
+            &s,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        // Build (sym, px) → rn map and check.
+        let mut got: std::collections::HashMap<(String, i64), u64> =
+            std::collections::HashMap::new();
+        for row in &r.rows {
+            let sym = row.get("sym").unwrap().as_str().unwrap().to_string();
+            let px = row.get("px").unwrap().as_f64().unwrap() as i64;
+            let rn = row.get("rn").unwrap().as_u64().unwrap();
+            got.insert((sym, px), rn);
+        }
+        // AAPL ASC: 100→1, 150→2, 200→3.
+        assert_eq!(got.get(&("AAPL".into(), 100)).copied(), Some(1));
+        assert_eq!(got.get(&("AAPL".into(), 150)).copied(), Some(2));
+        assert_eq!(got.get(&("AAPL".into(), 200)).copied(), Some(3));
+        // MSFT ASC: 50→1, 300→2.
+        assert_eq!(got.get(&("MSFT".into(), 50)).copied(), Some(1));
+        assert_eq!(got.get(&("MSFT".into(), 300)).copied(), Some(2));
+    }
+
+    #[test]
+    fn rank_assigns_dense_or_gapped() {
+        // Two AAPL rows with same px should tie at rank 1 (both
+        // RANK and DENSE_RANK); the third gets rank 3 for RANK,
+        // rank 2 for DENSE_RANK.
+        let s = Arc::new(Schema::from_strs(
+            &["sym", "px"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 8);
+        for (sym, px) in &[("A", 1.0_f64), ("A", 1.0), ("A", 2.0)] {
+            store.append_row(&[
+                Value::String(Some(CompactString::new(*sym))),
+                Value::Double(*px),
+            ]);
+        }
+        let q = parse_query(
+            "SELECT sym, px, \
+                    RANK()       OVER (PARTITION BY sym ORDER BY px ASC) AS rk, \
+                    DENSE_RANK() OVER (PARTITION BY sym ORDER BY px ASC) AS dr \
+             FROM t",
+            &s,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        for row in &r.rows {
+            let px = row.get("px").unwrap().as_f64().unwrap();
+            let rk = row.get("rk").unwrap().as_u64().unwrap();
+            let dr = row.get("dr").unwrap().as_u64().unwrap();
+            if px == 2.0 {
+                assert_eq!(rk, 3);
+                assert_eq!(dr, 2);
+            } else {
+                assert_eq!(rk, 1);
+                assert_eq!(dr, 1);
+            }
+        }
+    }
 
     // ───── Q1 — RIGHT OUTER + FULL OUTER JOIN ────────────────────────
 

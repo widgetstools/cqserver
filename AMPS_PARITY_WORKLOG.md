@@ -229,8 +229,13 @@ Also added `" PIVOT ("` / `" UNPIVOT ("` to `rewrite_from_to_t`'s clause-boundar
 - E2E `crates/cq-e2e-tests/tests/admin_clients.rs` — two clients (publisher + subscriber) each call `logon_with` carrying a `client_name`; `/admin/clients` returns an array with at least the subscriber's `clientName=subscriber-b` entry showing `subscriptions ≥ 1`.
 
 ## Q7 — Window functions: ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD *(§1.7)*
-**Status:** ⏳
-**Scope:** `OVER (PARTITION BY ... ORDER BY ...)` parser, plus an executor stage that sorts each partition then emits the per-row window value alongside the projection. Bounded to non-streaming (one-shot SOW) for the first cut; continuous-window is a follow-up.
+**Status:** ✅ done (one-shot SOW; continuous-window deferred)
+**Scope:** `OVER (PARTITION BY ... ORDER BY ...)` for the 5 standard window functions. Parser detects function calls with `over: Some(WindowSpec)`, compiles `WindowColumn { alias, partition_by, order_by, kind }`, and the executor partitions/sorts/assigns after the row build step. Mixes with regular projection columns in the same SELECT.
+**Implementation:** New `WindowColumn` + `WindowFn` types in `crates/cq-core/src/query.rs`. `try_compile_window` recognises the 5 fn names and compiles partition/order_by indices from the OVER spec. `apply_window` (called from `execute_query_with_index_filtered` non-aggregate path) does the heavy lifting. `query_streaming_json`'s `needs_full_buffer` extended to include `!query.windows.is_empty()`.
+**Tests landed:**
+- 3 unit tests in `query::tests::{parses_row_number_over_partition_order, row_number_assigns_per_partition_sorted_index, rank_assigns_dense_or_gapped}`.
+- E2E `crates/cq-e2e-tests/tests/parser_window_fns.rs` runs ROW_NUMBER + LAG(px,1) + LEAD(px,1) in one wire SOW, asserts ranks + prev/next values for both AAPL (3 rows) and MSFT (2 rows) partitions; edge rows surface `null` for the missing lag/lead.
+**Out of scope:** continuous-window subscriptions (window values update as the source SOW changes) — single SELECT-time evaluation only. Windowed aggregates (`SUM(x) OVER (...)`, `COUNT(*) OVER (...)`) — folds into a future session.
 
 ## Q8 — CTEs (WITH x AS …) *(§1.8 row 4)*
 **Status:** ⏳

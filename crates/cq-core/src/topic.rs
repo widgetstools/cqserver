@@ -1298,7 +1298,10 @@ impl Topic {
             // Q3 — PIVOT/UNPIVOT queries also need the buffered
             // path; the fast path emits raw projected cells and
             // bypasses execute_pivot_query entirely.
-            || query.is_pivot();
+            || query.is_pivot()
+            // Q7 — window functions need the buffered path so we can
+            // partition + sort before emitting.
+            || !query.windows.is_empty();
         if needs_full_buffer {
             let mut result = crate::query::execute_query_with_index(
                 &query,
@@ -1409,7 +1412,10 @@ impl Topic {
             // Q3 — PIVOT/UNPIVOT queries also need the buffered
             // path; the fast path emits raw projected cells and
             // bypasses execute_pivot_query entirely.
-            || query.is_pivot();
+            || query.is_pivot()
+            // Q7 — window functions need the buffered path so we can
+            // partition + sort before emitting.
+            || !query.windows.is_empty();
         if needs_full_buffer {
             // Same shape as query_streaming for the buffered path —
             // run the executor, drop tombstones, then serialize each

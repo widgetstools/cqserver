@@ -1022,6 +1022,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         // Seed: row 0 is already in store and matches predicate.
@@ -1064,6 +1065,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         engine.add(Subscription::new("s1".into(), query).into_sparse(vec![0]));
@@ -1107,6 +1109,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         engine.add(Subscription::new("s1".into(), query).into_sparse(vec![0]));
@@ -1147,6 +1150,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         engine.add(Subscription::new("s1".into(), query));
@@ -1189,6 +1193,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         let sub = Subscription::new("sub-1".into(), query);
@@ -1253,6 +1258,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         engine.add(Subscription::new("s".into(), query));
@@ -1300,6 +1306,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         engine.add(Subscription::new("s".into(), query));
@@ -1345,6 +1352,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         }
     }
@@ -1420,6 +1428,7 @@ mod tests {
             join: None,
             computed: Vec::new(),
             having: None,
+            windows: Vec::new(),
             offset: None,
         };
         engine.add(Subscription::new("s1".into(), query));
