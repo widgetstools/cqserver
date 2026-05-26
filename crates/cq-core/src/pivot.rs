@@ -48,11 +48,13 @@ enum AnchorKeyPart {
     Int(i32),
     DoubleBits(u64),
     String(CompactString),
+    Bool(bool),
+    Timestamp(i64),
 }
 
 impl AnchorKeyPart {
     fn from_value(v: &Value) -> Self {
-        use crate::store::{NULL_INT, NULL_LONG};
+        use crate::store::{NULL_INT, NULL_LONG, NULL_TIMESTAMP};
         match v {
             Value::Null => AnchorKeyPart::Null,
             Value::String(None) => AnchorKeyPart::Null,
@@ -63,6 +65,10 @@ impl AnchorKeyPart {
             Value::Int(n) => AnchorKeyPart::Int(*n),
             Value::Double(d) if d.is_nan() => AnchorKeyPart::Null,
             Value::Double(d) => AnchorKeyPart::DoubleBits(d.to_bits()),
+            Value::Bool(None) => AnchorKeyPart::Null,
+            Value::Bool(Some(b)) => AnchorKeyPart::Bool(*b),
+            Value::Timestamp(t) if *t == NULL_TIMESTAMP => AnchorKeyPart::Null,
+            Value::Timestamp(t) => AnchorKeyPart::Timestamp(*t),
         }
     }
 
@@ -75,6 +81,10 @@ impl AnchorKeyPart {
                 .map(JV::Number)
                 .unwrap_or(JV::Null),
             AnchorKeyPart::String(s) => JV::String(s.to_string()),
+            AnchorKeyPart::Bool(b) => JV::Bool(*b),
+            AnchorKeyPart::Timestamp(t) => {
+                JV::String(crate::store::format_timestamp_micros(*t))
+            }
         }
     }
 }
@@ -90,6 +100,10 @@ fn discover_pivot_values(query: &ParsedQuery, store: &ColumnStore) -> Vec<PivotL
     let mut seen_longs: std::collections::BTreeSet<i64> =
         std::collections::BTreeSet::new();
     let mut seen_double_bits: std::collections::BTreeSet<u64> =
+        std::collections::BTreeSet::new();
+    let mut seen_bools: std::collections::BTreeSet<bool> =
+        std::collections::BTreeSet::new();
+    let mut seen_timestamps: std::collections::BTreeSet<i64> =
         std::collections::BTreeSet::new();
     let candidates = plan_candidates(query, store, None);
     candidates.for_each(|row| {
@@ -124,6 +138,17 @@ fn discover_pivot_values(query: &ParsedQuery, store: &ColumnStore) -> Vec<PivotL
                     seen_double_bits.insert(d.to_bits());
                 }
             }
+            ColumnType::Bool => {
+                if let Some(b) = store.get_bool(pivot.pivot_col, row) {
+                    seen_bools.insert(b);
+                }
+            }
+            ColumnType::Timestamp => {
+                let t = store.get_timestamp(pivot.pivot_col, row);
+                if t != crate::store::NULL_TIMESTAMP {
+                    seen_timestamps.insert(t);
+                }
+            }
         }
     });
     match schema.column_type(pivot.pivot_col) {
@@ -143,6 +168,11 @@ fn discover_pivot_values(query: &ParsedQuery, store: &ColumnStore) -> Vec<PivotL
             });
             bits.into_iter().map(PivotLiteral::Double).collect()
         }
+        ColumnType::Bool => seen_bools.into_iter().map(PivotLiteral::Bool).collect(),
+        ColumnType::Timestamp => seen_timestamps
+            .into_iter()
+            .map(PivotLiteral::Timestamp)
+            .collect(),
     }
 }
 
@@ -186,6 +216,23 @@ fn match_pivot_value(
             let bits = d.to_bits();
             pivot_values.iter().position(|v| match v {
                 PivotLiteral::Double(target) => *target == bits,
+                _ => false,
+            })
+        }
+        ColumnType::Bool => {
+            let b = store.get_bool(pivot_col, row)?;
+            pivot_values.iter().position(|v| match v {
+                PivotLiteral::Bool(target) => *target == b,
+                _ => false,
+            })
+        }
+        ColumnType::Timestamp => {
+            let t = store.get_timestamp(pivot_col, row);
+            if t == crate::store::NULL_TIMESTAMP {
+                return None;
+            }
+            pivot_values.iter().position(|v| match v {
+                PivotLiteral::Timestamp(target) => *target == t,
                 _ => false,
             })
         }
@@ -301,7 +348,7 @@ pub fn execute_pivot_query(query: &ParsedQuery, store: &ColumnStore) -> QueryRes
                     .aggregates
                     .iter()
                     .enumerate()
-                    .map(|(i, a)| AggState::init(a.func, agg_col_types[i]))
+                    .map(|(i, a)| AggState::init_with_q(a.func, agg_col_types[i], a.percentile_q))
                     .collect()
             });
         for (i, spec) in pivot.aggregates.iter().enumerate() {
@@ -335,7 +382,8 @@ pub fn execute_pivot_query(query: &ParsedQuery, store: &ColumnStore) -> QueryRes
                 } else {
                     // No matching rows for this (anchor, pivot_value):
                     // emit the aggregate's "no observations" value.
-                    let mut empty_state = AggState::init(agg.func, agg_col_types[ai]);
+                    let mut empty_state =
+                        AggState::init_with_q(agg.func, agg_col_types[ai], agg.percentile_q);
                     let _ = &mut empty_state;
                     empty_state.finalize()
                 };

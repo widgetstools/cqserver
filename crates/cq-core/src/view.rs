@@ -131,6 +131,8 @@ impl View {
                 | (AggFn::StddevSamp, _)
                 | (AggFn::Variance, _)
                 | (AggFn::VarianceSamp, _) => ColumnType::Double,
+                // P9 — PERCENTILE_CONT / MEDIAN always return Double.
+                (AggFn::PercentileCont, _) => ColumnType::Double,
             };
             types.push(ty);
         }

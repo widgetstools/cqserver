@@ -440,6 +440,10 @@ pub enum AggFn {
     Variance,
     /// P8 — sample variance (`VAR_SAMP`).
     VarianceSamp,
+    /// P9 — `PERCENTILE_CONT(col, q)` — linear-interpolated percentile.
+    /// `MEDIAN(col)` is sugar for `PERCENTILE_CONT(col, 0.5)`.
+    /// O(n) memory per group; exact (no sketch).
+    PercentileCont,
 }
 
 impl AggFn {
@@ -454,6 +458,7 @@ impl AggFn {
             AggFn::StddevSamp => "STDDEV_SAMP",
             AggFn::Variance => "VARIANCE",
             AggFn::VarianceSamp => "VAR_SAMP",
+            AggFn::PercentileCont => "PERCENTILE_CONT",
         }
     }
 }
@@ -466,6 +471,9 @@ pub struct AggregateSpec {
     /// Output key in the result row (e.g. `"SUM(price)"` or the
     /// user-supplied alias `"total"`).
     pub alias: String,
+    /// P9 — for `PercentileCont`, the percentile fraction `q ∈ [0,1]`.
+    /// `None` for every other AggFn.
+    pub percentile_q: Option<f64>,
 }
 
 impl ParsedQuery {
@@ -1373,6 +1381,8 @@ fn is_aggregate_function_call(expr: &Expr) -> bool {
                 | "VARIANCE"
                 | "VAR_POP"
                 | "VAR_SAMP"
+                | "PERCENTILE_CONT"
+                | "MEDIAN"
         )
     } else {
         false
@@ -1399,10 +1409,10 @@ fn parse_aggregate_call(
         "STDDEV_SAMP" => AggFn::StddevSamp,
         "VARIANCE" | "VAR_POP" => AggFn::Variance,
         "VAR_SAMP" => AggFn::VarianceSamp,
+        "PERCENTILE_CONT" | "MEDIAN" => AggFn::PercentileCont,
         _ => return Ok(None),
     };
 
-    // Extract the single function argument (or `*`).
     let arg_list = match &f.args {
         FunctionArguments::List(l) => l,
         _ => {
@@ -1411,6 +1421,81 @@ fn parse_aggregate_call(
             )))
         }
     };
+
+    // P9 — PERCENTILE_CONT(col, q): two positional args. MEDIAN(col):
+    // sugar for PERCENTILE_CONT(col, 0.5).
+    if func == AggFn::PercentileCont {
+        let (col_expr, q): (&Expr, f64) = if name == "MEDIAN" {
+            if arg_list.args.len() != 1 {
+                return Err(QueryError::ParseError(format!(
+                    "MEDIAN expects exactly one argument, got {}",
+                    arg_list.args.len()
+                )));
+            }
+            match &arg_list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => (e, 0.5),
+                other => {
+                    return Err(QueryError::ParseError(format!(
+                        "MEDIAN: unsupported argument shape: {other:?}"
+                    )))
+                }
+            }
+        } else {
+            if arg_list.args.len() != 2 {
+                return Err(QueryError::ParseError(format!(
+                    "PERCENTILE_CONT expects two arguments (column, q in [0,1]), got {}",
+                    arg_list.args.len()
+                )));
+            }
+            let col_e = match &arg_list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                other => {
+                    return Err(QueryError::ParseError(format!(
+                        "PERCENTILE_CONT: column arg must be a column reference, got {other:?}"
+                    )))
+                }
+            };
+            let q_val = match &arg_list.args[1] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(vws))) => match &vws.value {
+                    sqlparser::ast::Value::Number(n, _) => n.parse::<f64>().map_err(|e| {
+                        QueryError::ParseError(format!(
+                            "PERCENTILE_CONT: q must parse as a number, got {n}: {e}"
+                        ))
+                    })?,
+                    other => {
+                        return Err(QueryError::ParseError(format!(
+                            "PERCENTILE_CONT: q must be a numeric literal, got {other:?}"
+                        )))
+                    }
+                },
+                other => {
+                    return Err(QueryError::ParseError(format!(
+                        "PERCENTILE_CONT: q must be a numeric literal, got {other:?}"
+                    )))
+                }
+            };
+            (col_e, q_val)
+        };
+        if !(0.0..=1.0).contains(&q) {
+            return Err(QueryError::ParseError(format!(
+                "PERCENTILE_CONT: q must be in [0, 1], got {q}"
+            )));
+        }
+        let col_idx = resolve_select_column(col_expr, schema)?;
+        let col_name = schema.column_name(col_idx).to_string();
+        let default_alias = if name == "MEDIAN" {
+            format!("MEDIAN({col_name})")
+        } else {
+            format!("PERCENTILE_CONT({col_name},{q})")
+        };
+        return Ok(Some(AggregateSpec {
+            func: AggFn::PercentileCont,
+            col: Some(col_idx),
+            alias: alias.map(str::to_string).unwrap_or(default_alias),
+            percentile_q: Some(q),
+        }));
+    }
+
     if arg_list.args.len() != 1 {
         return Err(QueryError::ParseError(format!(
             "{name} expects exactly one argument, got {}",
@@ -1444,6 +1529,7 @@ fn parse_aggregate_call(
         func,
         col,
         alias: alias.map(str::to_string).unwrap_or(default_alias),
+        percentile_q: None,
     }))
 }
 
@@ -1986,6 +2072,10 @@ pub enum AggState {
         m2: f64,
         kind: WelfordKind,
     },
+    /// P9 — exact percentile via per-group sorted value buffer.
+    /// O(n) memory per group. `q` is captured at init time from the
+    /// matching `AggregateSpec.percentile_q`.
+    Percentile { values: Vec<f64>, q: f64 },
 }
 
 /// Which moment to return from a Welford state's `finalize`.
@@ -2003,8 +2093,19 @@ pub enum WelfordKind {
 
 impl AggState {
     /// Build the initial state for an aggregate, given the column
-    /// type (or `None` for COUNT(*)).
+    /// type (or `None` for COUNT(*)). For percentile-style aggregates
+    /// the caller must pass `spec_q` from the matching AggregateSpec.
     pub fn init(func: AggFn, col_type: Option<crate::schema::ColumnType>) -> AggState {
+        Self::init_with_q(func, col_type, None)
+    }
+
+    /// P9 — like `init` but accepts the per-spec percentile fraction.
+    /// Callers that may handle PercentileCont aggregates must use this.
+    pub fn init_with_q(
+        func: AggFn,
+        col_type: Option<crate::schema::ColumnType>,
+        spec_q: Option<f64>,
+    ) -> AggState {
         use crate::schema::ColumnType;
         match (func, col_type) {
             (AggFn::Count, _) => AggState::Count(0),
@@ -2042,6 +2143,10 @@ impl AggState {
             },
             (AggFn::VarianceSamp, _) => AggState::Welford {
                 count: 0, mean: 0.0, m2: 0.0, kind: WelfordKind::VarSamp,
+            },
+            (AggFn::PercentileCont, _) => AggState::Percentile {
+                values: Vec::new(),
+                q: spec_q.unwrap_or(0.5),
             },
             // SUM/MIN/MAX on a string column without a type-specific
             // variant (e.g. SUM(name)) — fall through to a sentinel
@@ -2157,6 +2262,13 @@ impl AggState {
                     }
                 }
             }
+            AggState::Percentile { values, .. } => {
+                if let Some(val) = v {
+                    if let Some(x) = val.as_f64() {
+                        values.push(x);
+                    }
+                }
+            }
         }
     }
 
@@ -2211,6 +2323,25 @@ impl AggState {
                 } else {
                     serde_json::Value::from(s.as_str())
                 }
+            }
+            AggState::Percentile { values, q } => {
+                if values.is_empty() {
+                    return serde_json::Value::Null;
+                }
+                // O(n log n) per finalise; OK at moderate per-group
+                // cardinality. For high-cardinality groups consider
+                // sketching (deferred).
+                let mut sorted: Vec<f64> = values.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                let rank = q * (sorted.len() - 1) as f64;
+                let lo = rank.floor() as usize;
+                let hi = rank.ceil() as usize;
+                let v = if lo == hi {
+                    sorted[lo]
+                } else {
+                    sorted[lo] + (rank - lo as f64) * (sorted[hi] - sorted[lo])
+                };
+                serde_json::Value::from(v)
             }
             AggState::Welford { count, m2, kind, .. } => {
                 if *count == 0 {
@@ -2288,7 +2419,7 @@ fn execute_aggregate_query(
                 .aggregates
                 .iter()
                 .enumerate()
-                .map(|(i, a)| AggState::init(a.func, agg_col_types[i]))
+                .map(|(i, a)| AggState::init_with_q(a.func, agg_col_types[i], a.percentile_q))
                 .collect()
         });
         // Update every aggregate.
@@ -2321,7 +2452,7 @@ fn execute_aggregate_query(
     if empty_implicit_group {
         let mut row_map = serde_json::Map::new();
         for (i, spec) in query.aggregates.iter().enumerate() {
-            let state = AggState::init(spec.func, agg_col_types[i]);
+            let state = AggState::init_with_q(spec.func, agg_col_types[i], spec.percentile_q);
             row_map.insert(spec.alias.clone(), state.finalize());
         }
         // P3 — HAVING also applies to the implicit-group row.
@@ -3508,6 +3639,83 @@ mod tests {
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0].get("symbol").unwrap().as_str().unwrap(), "NVDA");
         assert_eq!(r.rows[1].get("symbol").unwrap().as_str().unwrap(), "AAPL");
+    }
+
+    // ───── P9 — PERCENTILE_CONT / MEDIAN ─────────────────────────────
+
+    #[test]
+    fn parses_percentile_cont_and_median() {
+        let (schema, _) = make_numeric_store();
+        let q1 = parse_query("SELECT PERCENTILE_CONT(v, 0.5) AS p50 FROM t", &schema).unwrap();
+        assert_eq!(q1.aggregates.len(), 1);
+        let q2 = parse_query("SELECT MEDIAN(v) AS m FROM t", &schema).unwrap();
+        assert_eq!(q2.aggregates.len(), 1);
+    }
+
+    #[test]
+    fn percentile_cont_known_values() {
+        let (schema, store) = make_numeric_store();
+        // Sorted values: 2, 4, 4, 4, 5, 5, 7, 9 (N=8).
+        // p50 with linear interp between rank 3.5 → midpoint of 4 and 5 = 4.5.
+        // p100 = 9, p0 = 2.
+        let q = parse_query(
+            "SELECT PERCENTILE_CONT(v, 0.5) AS p50, \
+                    PERCENTILE_CONT(v, 0.0) AS p0, \
+                    PERCENTILE_CONT(v, 1.0) AS p100 FROM t",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        let row = &r.rows[0];
+        let p50 = row.get("p50").and_then(|x| x.as_f64()).unwrap();
+        let p0 = row.get("p0").and_then(|x| x.as_f64()).unwrap();
+        let p100 = row.get("p100").and_then(|x| x.as_f64()).unwrap();
+        assert!((p50 - 4.5).abs() < 1e-9, "p50 expected 4.5, got {p50}");
+        assert!((p0 - 2.0).abs() < 1e-9);
+        assert!((p100 - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn median_matches_percentile_50() {
+        let (schema, store) = make_numeric_store();
+        let q = parse_query(
+            "SELECT MEDIAN(v) AS m, PERCENTILE_CONT(v, 0.5) AS p50 FROM t",
+            &schema,
+        )
+        .unwrap();
+        let r = execute_query(&q, &store);
+        let m = r.rows[0].get("m").and_then(|x| x.as_f64()).unwrap();
+        let p = r.rows[0].get("p50").and_then(|x| x.as_f64()).unwrap();
+        assert!((m - p).abs() < 1e-9, "MEDIAN should equal PERCENTILE_CONT(0.5)");
+    }
+
+    #[test]
+    fn percentile_with_group_by() {
+        let s = Arc::new(Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let mut store = ColumnStore::new(s.clone(), 16);
+        for (k, v) in &[("a", 1.0), ("a", 3.0), ("a", 5.0), ("b", 10.0), ("b", 20.0)] {
+            store.append_row(&[
+                Value::String(Some(CompactString::new(*k))),
+                Value::Double(*v),
+            ]);
+        }
+        let q = parse_query("SELECT k, MEDIAN(v) AS m FROM t GROUP BY k", &s).unwrap();
+        let r = execute_query(&q, &store);
+        let by_k: std::collections::HashMap<String, f64> = r
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("k").unwrap().as_str().unwrap().to_string(),
+                    row.get("m").unwrap().as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert!((by_k["a"] - 3.0).abs() < 1e-9, "median of {{1,3,5}} = 3");
+        assert!((by_k["b"] - 15.0).abs() < 1e-9, "median of {{10,20}} = 15");
     }
 
     // ───── P8 — STDDEV / STDDEV_SAMP / VARIANCE ──────────────────────

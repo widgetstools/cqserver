@@ -92,8 +92,12 @@ Per AMPS_PARITY.md §5 honest assessment:
 - E2E `crates/cq-e2e-tests/tests/parser_stddev.rs` runs all 4 functions in one SOW against the same fixture, asserts the expected numeric values.
 
 ## P9 — Aggregates: PERCENTILE_CONT / MEDIAN *(§1.3 row 4)*
-**Status:** ⏳
-**Scope:** Exact percentile via per-group value vector. Documented O(n) memory tradeoff.
+**Status:** ✅ done
+**Scope:** `PERCENTILE_CONT(col, q)` with `q ∈ [0,1]` returns the linear-interpolated percentile. `MEDIAN(col)` is sugar for `PERCENTILE_CONT(col, 0.5)`. Exact (no sketching) — O(n) memory per group; documented tradeoff for high-cardinality groups.
+**Implementation:** New `AggFn::PercentileCont` variant + `AggState::Percentile { values, q }` in `crates/cq-core/src/query.rs`. Adds `percentile_q: Option<f64>` to `AggregateSpec`; new `AggState::init_with_q` helper threads it through the executor + pivot + view paths.
+**Tests landed:**
+- 4 unit tests in `query::tests::{parses_percentile_cont_and_median, percentile_cont_known_values, median_matches_percentile_50, percentile_with_group_by}`.
+- E2E `crates/cq-e2e-tests/tests/parser_percentile.rs` runs MEDIAN + PERCENTILE_CONT(0.5) + PERCENTILE_CONT(0.95) in one SOW against {2,4,4,4,5,5,7,9} (median = 4.5, p95 = 8.3).
 
 ## P10 — Aggregates: COUNT(DISTINCT col) *(§1.1 row 9)*
 **Status:** ⏳
