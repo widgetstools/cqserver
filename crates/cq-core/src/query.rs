@@ -25,7 +25,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A parsed and compiled query ready for execution.
 #[derive(Debug, Clone)]
@@ -118,6 +118,10 @@ pub enum PivotLiteral {
     String(compact_str::CompactString),
     Long(i64),
     Double(u64), // f64.to_bits()
+    Bool(bool),
+    /// i64 microseconds since UNIX epoch — same internal form as the
+    /// Timestamp column. `as_column_label` renders as RFC 3339.
+    Timestamp(i64),
 }
 
 impl PivotLiteral {
@@ -128,6 +132,8 @@ impl PivotLiteral {
             PivotLiteral::String(s) => s.to_string(),
             PivotLiteral::Long(n) => n.to_string(),
             PivotLiteral::Double(bits) => f64::from_bits(*bits).to_string(),
+            PivotLiteral::Bool(b) => b.to_string(),
+            PivotLiteral::Timestamp(v) => crate::store::format_timestamp_micros(*v),
         }
     }
 }
@@ -224,8 +230,206 @@ pub fn parse_query(sql: &str, schema: &Schema) -> Result<ParsedQuery, QueryError
 
     let statement = &ast[0];
     match statement {
-        Statement::Query(query) => parse_select(query, schema),
+        Statement::Query(query) => {
+            // P1 — alias-rewrite pass. We clone the AST so we can
+            // mutate `Expr::CompoundIdentifier([alias_or_topic, col])`
+            // → `Expr::Identifier(col)` for every alias/topic ref we
+            // saw in the FROM clause. Downstream code (predicate
+            // compile, projection lookup, ORDER BY, GROUP BY) then
+            // sees unqualified column refs and resolves them against
+            // the (already-combined-for-JOIN) `schema`.
+            let mut q = (**query).clone();
+            let refs = collect_table_refs(&q);
+            rewrite_qualified_refs_in_query(&mut q, &refs);
+            parse_select(&q, schema)
+        }
         _ => Err(QueryError::ParseError("Only SELECT statements supported".into())),
+    }
+}
+
+/// P1 — collect every name that can legally appear as the left side
+/// of a `t.col` compound identifier: each table's real name AND its
+/// alias (when present). For `FROM trades p JOIN securities s USING
+/// (cusip)` we collect `{"trades", "p", "securities", "s"}`.
+fn collect_table_refs(query: &sqlparser::ast::Query) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return refs,
+    };
+    for from in &select.from {
+        collect_from_table_factor(&from.relation, &mut refs);
+        for j in &from.joins {
+            collect_from_table_factor(&j.relation, &mut refs);
+        }
+    }
+    refs
+}
+
+fn collect_from_table_factor(tf: &TableFactor, refs: &mut HashSet<String>) {
+    match tf {
+        TableFactor::Table { name, alias, .. } => {
+            let topic = strip_identifier_quotes(&name.to_string());
+            refs.insert(topic);
+            if let Some(a) = alias {
+                refs.insert(a.name.value.clone());
+            }
+        }
+        TableFactor::Pivot { table, alias, .. } | TableFactor::Unpivot { table, alias, .. } => {
+            collect_from_table_factor(table, refs);
+            if let Some(a) = alias {
+                refs.insert(a.name.value.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// P1 — rewrite every `Expr::CompoundIdentifier([t, col])` → `Expr::Identifier(col)`
+/// when `t` is a known alias/topic ref. Walks SELECT items, WHERE,
+/// GROUP BY, HAVING, ORDER BY, and JOIN constraints (which today are
+/// USING-only but the ON-clause path P11 will exercise).
+fn rewrite_qualified_refs_in_query(query: &mut sqlparser::ast::Query, refs: &HashSet<String>) {
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        // SELECT items.
+        for item in &mut select.projection {
+            match item {
+                SelectItem::UnnamedExpr(e) => rewrite_expr(e, refs),
+                SelectItem::ExprWithAlias { expr, .. } => rewrite_expr(expr, refs),
+                SelectItem::QualifiedWildcard(kind, _) => {
+                    // `t.*` → `*` when `t` is a known ref. We can't
+                    // mutate the variant in place, so detect-and-replace.
+                    if let sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(obj) = kind {
+                        let first = obj.0.first().and_then(|p| p.as_ident()).map(|i| i.value.clone());
+                        if let Some(n) = first {
+                            if refs.contains(&strip_identifier_quotes(&n)) {
+                                *item = SelectItem::Wildcard(
+                                    sqlparser::ast::WildcardAdditionalOptions::default(),
+                                );
+                            }
+                        }
+                    }
+                }
+                SelectItem::Wildcard(_) => {}
+            }
+        }
+        // WHERE.
+        if let Some(e) = select.selection.as_mut() {
+            rewrite_expr(e, refs);
+        }
+        // GROUP BY.
+        match &mut select.group_by {
+            GroupByExpr::Expressions(exprs, _) => {
+                for e in exprs {
+                    rewrite_expr(e, refs);
+                }
+            }
+            GroupByExpr::All(_) => {}
+        }
+        // HAVING (P3 will compile this; P1 just rewrites refs so it's
+        // ready by the time P3 lands).
+        if let Some(e) = select.having.as_mut() {
+            rewrite_expr(e, refs);
+        }
+        // JOIN constraints (ON-clause Expr — currently rejected, but
+        // P11 will use this).
+        for from in &mut select.from {
+            for join in &mut from.joins {
+                if let sqlparser::ast::JoinOperator::Inner(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                )
+                | sqlparser::ast::JoinOperator::LeftOuter(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                )
+                | sqlparser::ast::JoinOperator::RightOuter(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                )
+                | sqlparser::ast::JoinOperator::FullOuter(
+                    sqlparser::ast::JoinConstraint::On(expr),
+                ) = &mut join.join_operator
+                {
+                    rewrite_expr(expr, refs);
+                }
+            }
+        }
+    }
+    // ORDER BY.
+    if let Some(ob) = query.order_by.as_mut() {
+        if let sqlparser::ast::OrderByKind::Expressions(items) = &mut ob.kind {
+            for item in items {
+                rewrite_expr(&mut item.expr, refs);
+            }
+        }
+    }
+}
+
+/// Recursively rewrite `CompoundIdentifier([t, col])` → `Identifier(col)`
+/// for every `t` in `refs`. Other forms (3-part `db.t.col`, function
+/// args, nested ops) are walked recursively.
+fn rewrite_expr(expr: &mut Expr, refs: &HashSet<String>) {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let first = strip_identifier_quotes(&parts[0].value);
+            if refs.contains(&first) {
+                let col = parts[1].clone();
+                *expr = Expr::Identifier(col);
+            }
+        }
+        Expr::CompoundIdentifier(_) => {}
+        Expr::Identifier(_) | Expr::Value(_) | Expr::Wildcard(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr(left, refs);
+            rewrite_expr(right, refs);
+        }
+        Expr::UnaryOp { expr, .. } => rewrite_expr(expr, refs),
+        Expr::Nested(e) => rewrite_expr(e, refs),
+        Expr::Cast { expr, .. } => rewrite_expr(expr, refs),
+        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsTrue(e) | Expr::IsFalse(e) => {
+            rewrite_expr(e, refs);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_expr(expr, refs);
+            for e in list {
+                rewrite_expr(e, refs);
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            rewrite_expr(expr, refs);
+            rewrite_expr(low, refs);
+            rewrite_expr(high, refs);
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. } => {
+            rewrite_expr(expr, refs);
+            rewrite_expr(pattern, refs);
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(args) = &mut f.args {
+                for a in &mut args.args {
+                    match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => rewrite_expr(e, refs),
+                        FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => {
+                            rewrite_expr(e, refs)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Case { conditions, else_result, operand, .. } => {
+            if let Some(op) = operand.as_mut() {
+                rewrite_expr(op, refs);
+            }
+            for w in conditions {
+                rewrite_expr(&mut w.condition, refs);
+                rewrite_expr(&mut w.result, refs);
+            }
+            if let Some(e) = else_result.as_mut() {
+                rewrite_expr(e, refs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -649,6 +853,13 @@ fn parse_pivot_value_list(
                 crate::predicate::extract_f64(&it.expr)
                     .map_err(QueryError::PredicateError)?
                     .to_bits(),
+            ),
+            ColumnType::Bool => PivotLiteral::Bool(
+                crate::predicate::extract_bool(&it.expr).map_err(QueryError::PredicateError)?,
+            ),
+            ColumnType::Timestamp => PivotLiteral::Timestamp(
+                crate::predicate::extract_timestamp(&it.expr)
+                    .map_err(QueryError::PredicateError)?,
             ),
         };
         out.push(lit);
@@ -1230,6 +1441,11 @@ enum GroupKeyPart {
     Long(i64),
     DoubleBits(u64),
     String(CompactString),
+    Bool(bool),
+    /// i64 microseconds since UNIX epoch. Distinct from `Long` so the
+    /// JSON projection emits an RFC 3339 string for timestamp group
+    /// keys instead of a bare integer.
+    Timestamp(i64),
 }
 
 impl GroupKeyPart {
@@ -1244,6 +1460,10 @@ impl GroupKeyPart {
             Value::Int(n) => GroupKeyPart::Int(*n),
             Value::Double(d) if d.is_nan() => GroupKeyPart::Null,
             Value::Double(d) => GroupKeyPart::DoubleBits(d.to_bits()),
+            Value::Bool(None) => GroupKeyPart::Null,
+            Value::Bool(Some(b)) => GroupKeyPart::Bool(*b),
+            Value::Timestamp(t) if *t == crate::store::NULL_TIMESTAMP => GroupKeyPart::Null,
+            Value::Timestamp(t) => GroupKeyPart::Timestamp(*t),
         }
     }
 
@@ -1254,6 +1474,10 @@ impl GroupKeyPart {
             GroupKeyPart::Long(n) => serde_json::Value::from(*n),
             GroupKeyPart::DoubleBits(bits) => serde_json::Value::from(f64::from_bits(*bits)),
             GroupKeyPart::String(s) => serde_json::Value::from(s.as_str()),
+            GroupKeyPart::Bool(b) => serde_json::Value::from(*b),
+            GroupKeyPart::Timestamp(t) => {
+                serde_json::Value::from(crate::store::format_timestamp_micros(*t))
+            }
         }
     }
 }
@@ -1654,6 +1878,19 @@ fn compare_values(store: &ColumnStore, col: usize, row_a: u32, row_b: u32) -> Or
         ColumnType::String => {
             let a = store.get_string(col, row_a);
             let b = store.get_string(col, row_b);
+            a.cmp(&b)
+        }
+        ColumnType::Bool => {
+            // false < true; nulls sort first (matches SQL NULLS FIRST).
+            let a = store.get_bool(col, row_a);
+            let b = store.get_bool(col, row_b);
+            a.cmp(&b)
+        }
+        ColumnType::Timestamp => {
+            // i64 ordering puts NULL_TIMESTAMP (= i64::MIN) first,
+            // which matches SQL NULLS FIRST semantics for timestamps.
+            let a = store.get_timestamp(col, row_a);
+            let b = store.get_timestamp(col, row_b);
             a.cmp(&b)
         }
     }
@@ -2558,6 +2795,149 @@ mod tests {
         );
         let r = parse_query("SELECT v FROM a JOIN b ON a.k = b.k", &combined);
         assert!(r.is_err(), "ON-clause JOIN must be rejected today");
+    }
+
+    // ───── P1 — table aliases + qualified column refs ────────────────
+
+    #[test]
+    fn parse_table_alias_simple_select() {
+        // `FROM trades p` + `p.symbol`, `p.price` — the alias-rewrite
+        // pass should make this equivalent to the unaliased form.
+        let (schema, store) = make_store();
+        let aliased = parse_query(
+            "SELECT p.symbol, p.price FROM trades p WHERE p.price > 200",
+            &schema,
+        )
+        .expect("aliased parse must succeed");
+        let plain = parse_query(
+            "SELECT symbol, price FROM trades WHERE price > 200",
+            &schema,
+        )
+        .unwrap();
+        // Topic must be the real name (alias is a rename, not the topic).
+        assert_eq!(aliased.topic, "trades");
+        // Projection columns should match.
+        assert_eq!(aliased.projection, plain.projection);
+        // Execution must produce the same rows.
+        let a = execute_query(&aliased, &store);
+        let p = execute_query(&plain, &store);
+        assert_eq!(a.rows.len(), p.rows.len());
+        for (l, r) in a.rows.iter().zip(p.rows.iter()) {
+            assert_eq!(l, r);
+        }
+    }
+
+    #[test]
+    fn parse_table_alias_in_group_by_and_aggregate() {
+        let (schema, store) = make_store();
+        let aliased = parse_query(
+            "SELECT t.desk, SUM(t.quantity) AS total FROM trades t GROUP BY t.desk",
+            &schema,
+        )
+        .expect("aliased aggregate must parse");
+        let plain = parse_query(
+            "SELECT desk, SUM(quantity) AS total FROM trades GROUP BY desk",
+            &schema,
+        )
+        .unwrap();
+        let a = execute_query(&aliased, &store);
+        let p = execute_query(&plain, &store);
+        // Compare by desk → total (order independent).
+        let mut a_map = std::collections::HashMap::new();
+        for row in &a.rows {
+            a_map.insert(
+                row.get("desk").unwrap().as_str().unwrap().to_string(),
+                row.get("total").unwrap().as_i64().unwrap(),
+            );
+        }
+        let mut p_map = std::collections::HashMap::new();
+        for row in &p.rows {
+            p_map.insert(
+                row.get("desk").unwrap().as_str().unwrap().to_string(),
+                row.get("total").unwrap().as_i64().unwrap(),
+            );
+        }
+        assert_eq!(a_map, p_map);
+    }
+
+    #[test]
+    fn parse_table_alias_in_order_by() {
+        let (schema, store) = make_store();
+        let aliased = parse_query(
+            "SELECT p.symbol, p.price FROM trades p ORDER BY p.price DESC LIMIT 3",
+            &schema,
+        )
+        .expect("aliased ORDER BY must parse");
+        let a = execute_query(&aliased, &store);
+        assert_eq!(a.rows.len(), 3);
+        assert_eq!(a.rows[0].get("symbol").unwrap(), "AMZN");
+    }
+
+    #[test]
+    fn parse_table_alias_in_join() {
+        // Both sides aliased; USING column referenced unqualified.
+        let left = Schema::from_strs(
+            &["cusip", "qty", "ticker"],
+            &[ColumnType::String, ColumnType::Long, ColumnType::String],
+        );
+        let right = Schema::from_strs(
+            &["cusip", "sector"],
+            &[ColumnType::String, ColumnType::String],
+        );
+        let combined = combined_join_schema(&left, &right, &["cusip".to_string()]);
+        let q = parse_query(
+            "SELECT s.sector, SUM(p.qty) AS total \
+             FROM positions p JOIN securities s USING (cusip) \
+             GROUP BY s.sector",
+            &combined,
+        )
+        .expect("aliased join must parse");
+        let join = q.join.as_ref().expect("expected JoinSpec");
+        assert_eq!(join.right_topic, "securities");
+        assert_eq!(join.using, vec!["cusip".to_string()]);
+        assert_eq!(q.topic, "positions");
+    }
+
+    #[test]
+    fn parse_self_named_table_qualifies_with_itself() {
+        // The wire SOW pipeline rewrites the FROM clause to `t`. If
+        // the user-written SQL was `SELECT trades.col FROM trades`,
+        // by the time it reaches the parser it's
+        // `SELECT t.col FROM t`. Without an explicit alias, the
+        // table-ref set must still contain "t" so the rewrite fires
+        // — otherwise the SOW hangs/errors mid-pipeline.
+        let (schema, store) = make_store();
+        let q = parse_query(
+            "SELECT t.symbol, t.price FROM t WHERE t.price > 200",
+            &schema,
+        )
+        .expect("FROM-t with t.col must parse");
+        let p = parse_query(
+            "SELECT symbol, price FROM t WHERE price > 200",
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(q.projection, p.projection);
+        let a = execute_query(&q, &store);
+        let b = execute_query(&p, &store);
+        assert_eq!(a.rows.len(), b.rows.len());
+    }
+
+    #[test]
+    fn parse_table_alias_unknown_alias_falls_through() {
+        // Reference to an unknown alias should fall through to the
+        // existing "unknown column" error path — not silently drop.
+        let (schema, _store) = make_store();
+        let err = parse_query(
+            "SELECT q.symbol FROM trades p",
+            &schema,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("q.symbol") || msg.contains("q") || msg.contains("symbol"),
+            "expected unknown-column error to surface, got: {msg}"
+        );
     }
 
     #[test]
