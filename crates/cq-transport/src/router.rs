@@ -473,6 +473,7 @@ pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) 
     match msg.command {
         Command::Logon => handle_logon(session, msg, &ctx.auth),
         Command::Publish => handle_publish(session, msg, ctx),
+        Command::PublishBatch => handle_publish_batch(session, msg, ctx),
         Command::DeltaPublish => handle_delta_publish(session, msg, ctx),
         Command::Sow => handle_sow(
             session,
@@ -756,6 +757,96 @@ fn handle_publish(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
 
 fn handle_delta_publish(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
     handle_publish_inner(session, msg, ctx, true);
+}
+
+/// Q2 — atomic batched publish. Commits all N rows in input order
+/// under a single sequence of `upsert_map` calls; emits one Ack
+/// whose `sequences` carries the assigned seq per row. On the first
+/// per-row error, stops, sends an Err ack with the index that
+/// failed, and the surviving prefix is already durable in the
+/// txlog (matches the AMPS contract: a batch is not atomic across
+/// failures, but per-row durability is preserved).
+fn handle_publish_batch(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
+    if ctx.read_only {
+        metrics::counter!("cq_publish_rejected_read_only_total").increment(1);
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id,
+            "read-only follower; publish to leader",
+        ));
+        return;
+    }
+    let topic_name = match &msg.topic {
+        Some(t) => t.clone(),
+        None => {
+            let _ = session
+                .send_message(&CqMessage::error(msg.command_id, "Missing topic"));
+            return;
+        }
+    };
+    if !check_entitlement(session, &msg.command_id, &ctx.auth, Op::Publish, &topic_name) {
+        return;
+    }
+    let batch = match msg.batch.as_ref() {
+        Some(b) if !b.is_empty() => b,
+        Some(_) => {
+            // Empty batch — ack with empty sequences vec.
+            let mut ack = CqMessage::ack_ok(msg.command_id);
+            ack.sequences = Some(Vec::new());
+            let _ = session.send_message(&ack);
+            return;
+        }
+        None => {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "publish_batch missing `batch` payload",
+            ));
+            return;
+        }
+    };
+    let topic = match ctx.topics.get(&topic_name) {
+        Some(t) => t.value().clone(),
+        None => {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                &format!("Topic not found: {}", topic_name),
+            ));
+            return;
+        }
+    };
+    let started = Instant::now();
+    let mut seqs: Vec<u64> = Vec::with_capacity(batch.len());
+    for (i, payload) in batch.iter().enumerate() {
+        let obj = match payload {
+            serde_json::Value::Object(m) => m,
+            _ => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id.clone(),
+                    &format!("publish_batch[{i}]: expected object, got {payload:?}"),
+                ));
+                return;
+            }
+        };
+        match topic.upsert_map(obj) {
+            Ok(seq) => seqs.push(seq),
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id.clone(),
+                    &format!("publish_batch[{i}] failed: {e}"),
+                ));
+                return;
+            }
+        }
+    }
+    let n = batch.len() as u64;
+    let elapsed_us = started.elapsed().as_micros() as f64;
+    metrics::counter!("cq_publish_batch_total", "topic" => topic_name.clone()).increment(1);
+    metrics::counter!("cq_publish_batch_rows_total", "topic" => topic_name.clone())
+        .increment(n);
+    metrics::histogram!("cq_publish_batch_latency_us", "topic" => topic_name.clone())
+        .record(elapsed_us);
+    let mut ack = CqMessage::ack_ok(msg.command_id);
+    ack.sequences = Some(seqs);
+    let _ = session.send_message(&ack);
 }
 
 fn handle_publish_inner(

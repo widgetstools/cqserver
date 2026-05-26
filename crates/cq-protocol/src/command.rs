@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 pub enum Command {
     /// Publish/upsert a record to a topic.
     Publish,
+    /// Q2 — atomic publish of N records to one topic. Carries the
+    /// batch in `CqMessage::batch` (array of payload objects). The
+    /// server commits all N rows under one `state.write()` and
+    /// returns a single Ack whose `seqs` field carries the assigned
+    /// sequence per row, in input order. One txlog frame, one ack,
+    /// one mutation-event burst — saves N-1 round-trips compared to
+    /// the SDK-level pipelining of P16.
+    PublishBatch,
     /// Publish a sparse update: the payload contains the row key
     /// plus only the fields that changed. The server merges those
     /// fields into the existing SOW record (or inserts a brand-new

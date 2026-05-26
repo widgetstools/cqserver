@@ -276,38 +276,29 @@ export class Client {
   }
 
   /**
-   * P16 — pipelined batched publish. Sends every message in `msgs`
-   * to `topic` in a single tight loop without waiting for individual
-   * acks, then awaits all of them. Same correctness as N sequential
-   * `publish()` calls, but the round-trip latencies are paid in
-   * parallel — the slowest single ack bounds the total wall-clock
-   * instead of summing N ack-RTTs.
+   * Q2 — atomic batched publish. Sends every message in `msgs` to
+   * `topic` in a single wire frame; the server commits them under
+   * one upsert burst and returns a single Ack carrying the per-row
+   * sequences in input order.
    *
-   * Returned sequences are in the same order as `msgs`. Throws if
-   * ANY individual publish rejects (the others have already been
-   * sent and their acks will arrive but be silently discarded;
-   * server-side they're durable on the txlog).
+   * Saves N-1 round-trips compared to N sequential `publish()`
+   * calls. AMPS-equivalent shape: one frame, one ack, one txlog
+   * append. (P16's earlier implementation used SDK-level
+   * `Promise.all`; Q2 replaces it with the wire-level batch frame
+   * that landed in `Command::PublishBatch`.)
    *
-   * **Implementation note (vs. AMPS_PARITY.md §3.2 row 4).** AMPS's
-   * `publishBatch` is a single wire frame producing a single ack;
-   * cqserver hasn't yet bumped its wire protocol to support that
-   * shape (a future session — folds in alongside S28's wire-version
-   * negotiation). For trading-floor publisher loops the pipelined
-   * SDK-level batch already captures the latency win (no per-msg
-   * RTT serialisation); the wire-frame change is incremental on
-   * top.
+   * Throws on the first per-row failure; the surviving prefix is
+   * already durable on the txlog (matches the AMPS contract — a
+   * batch is not atomic across failures, per-row durability is
+   * preserved).
    */
   async publishBatch(
     topic: string,
     msgs: Record<string, unknown>[],
   ): Promise<number[]> {
     if (msgs.length === 0) return [];
-    // Fire every publish concurrently — the rpc() implementation
-    // assigns its own cid and registers a pending entry before
-    // sending, so the responses are correctly correlated even when
-    // sent in parallel.
-    const promises = msgs.map((d) => this.publish(topic, d));
-    return Promise.all(promises);
+    const r = await this.rpc({ c: 'publish_batch', t: topic, bat: msgs });
+    return r.seqs ?? [];
   }
 
   /**

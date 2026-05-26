@@ -152,6 +152,17 @@ pub struct CqMessage {
     /// `Compression::None`).
     #[serde(rename = "comp", skip_serializing_if = "Option::is_none")]
     pub compressions: Option<Vec<crate::compression::Compression>>,
+
+    /// Q2 — `PublishBatch` payload: the batch of records to publish
+    /// atomically to `topic`. Order is preserved; each item is a
+    /// full publish payload (same shape as a `Publish` `data` field).
+    #[serde(rename = "bat", skip_serializing_if = "Option::is_none")]
+    pub batch: Option<Vec<serde_json::Value>>,
+
+    /// Q2 — `PublishBatch` ack payload: assigned per-row sequences
+    /// in input order. Present only on Acks for `PublishBatch`.
+    #[serde(rename = "seqs", skip_serializing_if = "Option::is_none")]
+    pub sequences: Option<Vec<u64>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -186,6 +197,8 @@ impl CqMessage {
             schema_change: None,
             protocol_versions: None,
             compressions: None,
+            batch: None,
+            sequences: None,
         }
     }
 

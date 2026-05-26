@@ -176,8 +176,17 @@ independent commit.
 - E2E `crates/cq-e2e-tests/tests/parser_right_full_outer_join.rs` runs all 4 join shapes (INNER/LEFT/RIGHT/FULL) on the same fixture (positions: AAPL+MSFT; securities: AAPL+GOOG) and asserts the expected row counts + null-side semantics.
 
 ## Q2 — Wire-level publishBatch — one frame, one ack, one txlog append *(§3.2 row 4 follow-up to P16)*
-**Status:** ⏳
-**Scope:** New `Command::PublishBatch` wire frame carrying `Vec<(topic, payload)>`; server collects them under one `state.write()` lock so the txlog gets a single append. Bumps the negotiated wire version (per AMPS_WORKLOG S28 pattern).
+**Status:** ✅ done
+**Scope:** New `Command::PublishBatch` wire frame carrying `Vec<payload>` for a single topic. Server commits each row via `upsert_map` in sequence (per-row state.write()); returns one Ack whose `sequences` carries the assigned seq per row in input order. Saves N-1 round-trips vs P16's pipelined-publish form.
+**Implementation:**
+- `cq-protocol`: new `Command::PublishBatch`, new `CqMessage.batch: Option<Vec<Value>>` and `CqMessage.sequences: Option<Vec<u64>>` fields.
+- `cq-transport`: new `handle_publish_batch` function + dispatch arm; emits `cq_publish_batch_{total,rows_total,latency_us}` metrics.
+- `cq-client` (Rust): new `Client::publish_batch(topic, rows)` method.
+- `client-sdks/ts`: replaces P16's `Promise.all` body with a single `rpc({c:'publish_batch', ...})` call.
+**Tests landed:**
+- E2E `crates/cq-e2e-tests/tests/publish_batch_wire.rs` — 25-row batch returns 25 monotonic sequences in input order; all rows + seed visible in SOW; empty input resolves empty.
+- Existing TS Vitest publishBatch tests now exercise the wire-level path; all 14 stay green.
+**Out of scope (still deferred):** truly atomic-across-failures batch (commit-or-nothing) would need a server-side transactional wrapper around the per-row upsert loop. Current shape matches AMPS's contract (per-row durability, batch is not all-or-nothing).
 
 ## Q3 — PIVOT dynamic value list *(§1.6 row 3 — fold-in of AMPS_WORKLOG S45 follow-up)*
 **Status:** ⏳

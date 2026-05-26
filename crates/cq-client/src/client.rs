@@ -397,6 +397,30 @@ impl Client {
         Ok(resp.sequence.unwrap_or(0))
     }
 
+    /// Q2 — atomic batched publish. Sends every record in `rows` to
+    /// `topic` in a single wire frame; the server commits them as
+    /// one batched upsert and returns a single Ack carrying the
+    /// per-row sequences in input order. Saves N-1 round-trips
+    /// compared to the SDK-level pipelining of `publish` × N.
+    ///
+    /// Returns the assigned sequences in input order. Errors on the
+    /// first per-row failure (the surviving prefix is already
+    /// durable on the txlog — same semantics AMPS exposes).
+    pub async fn publish_batch(
+        &self,
+        topic: &str,
+        rows: Vec<Value>,
+    ) -> ClientResult<Vec<u64>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut m = CqMessage::new(Command::PublishBatch);
+        m.topic = Some(topic.into());
+        m.batch = Some(rows);
+        let resp = self.rpc(m).await?;
+        Ok(resp.sequences.unwrap_or_default())
+    }
+
     /// Sparse update: `data` must contain the topic's key field(s)
     /// plus only the fields that changed. The server merges those
     /// fields into the existing row, leaving unspecified fields
