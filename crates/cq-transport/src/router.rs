@@ -7,6 +7,7 @@
 use crate::auth::{Op, SharedAuth};
 use crate::queue::QueueRegistry;
 use crate::session::{DeliveryRoute, Session, SessionRegistry};
+use cq_core::query::peek_join;
 use cq_core::topic::SharedTopic;
 use cq_protocol::command::Command;
 use cq_protocol::message::CqMessage;
@@ -884,6 +885,13 @@ fn handle_sow(
         return;
     }
 
+    // For the JOIN path we run `peek_join` + `parse_query` against the
+    // RAW user SQL (not the rewritten `FROM t …` form) — column refs
+    // like `p.position_id` only resolve when the left-side alias is
+    // intact, which the rewrite would strip. The streaming non-JOIN
+    // path still uses the rewritten SQL since C-4 mandates the topic
+    // name never reach the SQL parser for a single-topic SOW.
+    let raw_sql = msg.sql.clone();
     let sql = build_sql(&msg);
     let sub_id = msg.command_id.clone().unwrap_or_default();
 
@@ -907,6 +915,65 @@ fn handle_sow(
 
     let hard_max_rows = query_limits.hard_max_sow_result_rows;
     let hard_max_bytes = query_limits.hard_max_sow_result_bytes;
+
+    // JOIN path: when the SQL contains `JOIN <right> USING (...)`, the
+    // streaming SOW evaluator doesn't apply — query_streaming_json only
+    // walks a single topic. Resolve the right side from the registry,
+    // run the cross-topic join inline (it's one-shot, not cached) and
+    // emit the same group_begin/sow_batch/group_end frame envelope so
+    // the SDK's SOW collector treats it identically to a normal SOW.
+    if let Some(raw) = raw_sql.as_deref() {
+        match peek_join(raw) {
+            Ok(Some((_, right_topic_name, _using))) => {
+                let right_topic = topics
+                    .get(&right_topic_name)
+                    .map(|e| e.value().clone())
+                    .or_else(|| {
+                        let with_slash = format!("/{right_topic_name}");
+                        topics.get(&with_slash).map(|e| e.value().clone())
+                    });
+                let right_topic = match right_topic {
+                    Some(t) => t,
+                    None => {
+                        let _ = session.send_message(&CqMessage::error(
+                            msg.command_id,
+                            &format!(
+                                "Right-side JOIN topic not found: {right_topic_name}"
+                            ),
+                        ));
+                        return;
+                    }
+                };
+                let raw_owned = raw.to_string();
+                tokio::spawn(async move {
+                    deliver_join_snapshot(
+                        topic,
+                        right_topic,
+                        raw_owned,
+                        sub_id,
+                        topic_label,
+                        session_id,
+                        codec_slot,
+                        tx,
+                        batch_size,
+                        hard_max_rows,
+                        hard_max_bytes,
+                    )
+                    .await;
+                });
+                return;
+            }
+            Ok(None) => { /* falls through to single-topic streaming path */ }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!("Parse JOIN: {e}"),
+                ));
+                return;
+            }
+        }
+    }
+
     tokio::spawn(async move {
         deliver_streaming_snapshot(
             topic,
@@ -1758,8 +1825,24 @@ fn rewrite_from_to_t(sql: &str) -> String {
         return sql.to_string();
     };
     let after_from = from_pos + 4;
-    // Find the start of the next clause boundary.
-    let clauses = [" WHERE ", " GROUP BY ", " ORDER BY ", " LIMIT ", " HAVING "];
+    // Find the start of the next clause boundary. `JOIN` is treated as
+    // a boundary so that `FROM <left> JOIN <right> USING (...)` keeps
+    // the JOIN clause intact while still anonymising the left-side
+    // table identifier. peek_join + the SOW JOIN path rely on the
+    // JOIN/USING text being preserved on the wire.
+    let clauses = [
+        " WHERE ",
+        " GROUP BY ",
+        " ORDER BY ",
+        " LIMIT ",
+        " HAVING ",
+        " JOIN ",
+        " INNER JOIN ",
+        " LEFT JOIN ",
+        " RIGHT JOIN ",
+        " FULL JOIN ",
+        " CROSS JOIN ",
+    ];
     let mut end = sql.len();
     for kw in clauses {
         if let Some(p) = upper[after_from..].find(kw) {
@@ -1965,7 +2048,13 @@ async fn deliver_streaming_snapshot(
                 }
                 Err(e) => {
                     abandon_snapshot_cache_slot(&topic_label, &sql);
-                    if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                    // P7 — include the sub_id (== client cid) in the
+                    // error so the client can route it to the awaiting
+                    // sow_msg's snapshot_completion instead of dropping
+                    // a cid-less ack on the floor.
+                    let mut err_msg = CqMessage::error(Some(sub_id.clone()), &e);
+                    err_msg.sub_id = Some(sub_id.clone());
+                    if let Some(f) = encode_frame(codec, &err_msg) {
                         let _ = tx.send(f).await;
                     }
                     return;
@@ -2132,5 +2221,147 @@ async fn deliver_streaming_snapshot(
         batches = batches_sent,
         elapsed_ms,
         "SOW snapshot delivered"
+    );
+}
+
+/// One-shot ad-hoc JOIN evaluator for the SOW path. Bypasses the
+/// streaming/cache infrastructure of `deliver_streaming_snapshot` —
+/// ad-hoc joins are bespoke and the result set is bounded by group
+/// cardinality, so we just run `execute_join_query` to materialize
+/// the rows, then chunk them into `sow_batch` frames at the same
+/// `batch_size` the streaming path uses. The frame envelope
+/// (`group_begin`, `sow_batch`*, `group_end`) is byte-compatible with
+/// the streaming path so SDK-side collectors don't care which one
+/// produced the snapshot.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_join_snapshot(
+    left: SharedTopic,
+    right: SharedTopic,
+    sql: String,
+    sub_id: String,
+    topic_label: String,
+    session_id: String,
+    codec_slot: crate::session::SharedCodec,
+    tx: crate::session::OutboundTx,
+    batch_size: usize,
+    hard_max_rows: u64,
+    hard_max_bytes: u64,
+) {
+    use crate::session::encode_frame;
+    use std::time::Instant;
+
+    let codec = *codec_slot.lock();
+    let started = Instant::now();
+
+    // Run the JOIN on a blocking thread so the JSON serialization
+    // doesn't block the tokio runtime. The right Arc is moved into
+    // the closure together with the left so the topic locks acquired
+    // inside `execute_join_query` (read-locks on both topics' state)
+    // are released before we touch the wire.
+    let left_for_block = left.clone();
+    let right_for_block = right.clone();
+    let sql_for_block = sql.clone();
+    let result: Result<Vec<serde_json::Map<String, serde_json::Value>>, String> =
+        tokio::task::spawn_blocking(move || {
+            use cq_core::query::{combined_join_schema, parse_query};
+            let left_schema = left_for_block.schema();
+            let right_schema = right_for_block.schema();
+            let (_, _, using) = match peek_join(&sql_for_block) {
+                Ok(Some(tup)) => tup,
+                Ok(None) => {
+                    return Err(
+                        "deliver_join_snapshot called on non-JOIN SQL".into(),
+                    );
+                }
+                Err(e) => return Err(format!("peek_join: {e}")),
+            };
+            let combined = combined_join_schema(&left_schema, &right_schema, &using);
+            let query = parse_query(&sql_for_block, &combined)
+                .map_err(|e| format!("parse: {e}"))?;
+            let qr = left_for_block
+                .execute_join_query(&query, &right_for_block)
+                .map_err(|e| format!("execute_join_query: {e}"))?;
+            Ok(qr.rows)
+        })
+        .await
+        .map_err(|e| format!("blocking task join: {e}"))
+        .and_then(|inner| inner);
+
+    let rows = match result {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(session = %session_id, topic = %topic_label, error = %e, "JOIN snapshot failed");
+            if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+                let _ = tx.send(f).await;
+            }
+            return;
+        }
+    };
+
+    // group_begin → batches → group_end.
+    if let Some(f) = encode_frame(codec, &CqMessage::group_begin(&sub_id, rows.len())) {
+        if tx.send(f).await.is_err() {
+            return;
+        }
+    }
+
+    let cap = batch_size.max(1);
+    let mut batches_sent: usize = 0;
+    let mut rows_sent: usize = 0;
+    let mut bytes_sent: u64 = 0;
+    let mut aborted_reason: Option<String> = None;
+    let mut chunk: Vec<serde_json::Map<String, serde_json::Value>> = Vec::with_capacity(cap);
+    for row in rows {
+        chunk.push(row);
+        if chunk.len() >= cap {
+            let n = chunk.len();
+            let batch_bytes: u64 = (n as u64).saturating_mul(256);
+            if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, std::mem::replace(&mut chunk, Vec::with_capacity(cap)))) {
+                if tx.send(f).await.is_err() {
+                    return;
+                }
+            }
+            batches_sent += 1;
+            rows_sent += n;
+            bytes_sent += batch_bytes;
+            if hard_max_rows > 0 && rows_sent as u64 > hard_max_rows {
+                aborted_reason = Some(format!(
+                    "rows_emitted = {rows_sent} exceeded hard_max_sow_result_rows = {hard_max_rows}"
+                ));
+                break;
+            }
+            if hard_max_bytes > 0 && bytes_sent > hard_max_bytes {
+                aborted_reason = Some(format!(
+                    "bytes_emitted = {bytes_sent} exceeded hard_max_sow_result_bytes = {hard_max_bytes}"
+                ));
+                break;
+            }
+        }
+    }
+    if !chunk.is_empty() && aborted_reason.is_none() {
+        let n = chunk.len();
+        if let Some(f) = encode_frame(codec, &CqMessage::sow_batch(&sub_id, chunk)) {
+            if tx.send(f).await.is_err() {
+                return;
+            }
+        }
+        batches_sent += 1;
+        rows_sent += n;
+    }
+    if let Some(reason) = &aborted_reason {
+        tracing::warn!(session = %session_id, topic = %topic_label, %reason, "JOIN snapshot aborted by hard cap");
+    }
+    if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
+        let _ = tx.send(f).await;
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        session = %session_id,
+        topic = %topic_label,
+        rows = rows_sent,
+        batches = batches_sent,
+        elapsed_ms,
+        "JOIN SOW snapshot delivered"
     );
 }

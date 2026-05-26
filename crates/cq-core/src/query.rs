@@ -3358,6 +3358,16 @@ mod tests {
         assert_eq!(q.topic, "positions");
     }
 
+    #[test]
+    fn parse_select_unknown_column_errors() {
+        let (schema, _store) = make_store();
+        let r = parse_query("SELECT bogus_col FROM t", &schema);
+        match r {
+            Err(QueryError::UnknownColumn(c)) => assert_eq!(c, "bogus_col"),
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
     // ───── P4 — OFFSET clause ───────────────────────────────────────
 
     #[test]

@@ -74,9 +74,14 @@ Per AMPS_PARITY.md §5 honest assessment:
 **Tests landed:**
 - E2E `crates/cq-e2e-tests/tests/view_join_sow_fresh_subscriber.rs` — 2 tests, both green: a clean fresh-subscriber SOW after seed, and a stress variant running 10 fresh-subscriber SOWs under continuous publisher load.
 
-## P7 — Engine: clear encode-once cache slot on SOW failure *(§4 bug 4)*
-**Status:** ⏳
-**Scope:** A failed SOW request must not leave its `Building` slot in the encode-once-fanout cache (currently wedges all identical follow-ups until restart).
+## P7 — Engine + SDK: clear encode-once cache slot AND surface SOW errors to client *(§4 bug 4)*
+**Status:** ✅ done
+**Scope:** AMPS_PARITY documented a server-side wedge: failed SOWs leaving the encode-once-fanout cache in `Building`. Diagnosing exposed a related (and more user-visible) bug: server-side error frames from `deliver_streaming_snapshot` carried `command_id: None`, so the client driver dropped them and `sow_sql` blocked until the 30s ack_timeout instead of returning the error promptly.
+**Implementation:**
+- Server: `deliver_streaming_snapshot` error path now includes `Some(sub_id)` (== client cid) in the error CqMessage, alongside the already-present `abandon_snapshot_cache_slot` call.
+- Client: `snapshot_completions` is now `oneshot::Sender<Option<String>>` — `None` for normal `GroupEnd`, `Some(reason)` for error acks. The Ack handler short-circuits any in-flight SOW's completion when `Status::Error` arrives for its cid. `sow_msg` returns `ClientError::Server(reason)` instantly instead of timing out.
+**Tests landed:**
+- E2E `crates/cq-e2e-tests/tests/snapshot_cache_no_wedge.rs` — sends a failing SOW (`SELECT bogus_col FROM t`), then the SAME failing SOW again, then a valid SOW; all three complete in well under a second (previously the first hung for the 30s ack_timeout).
 
 ## P8 — Aggregates: STDDEV / STDDEV_SAMP / VARIANCE *(§1.3 row 3)*
 **Status:** ⏳

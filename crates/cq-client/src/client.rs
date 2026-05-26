@@ -62,8 +62,11 @@ struct ClientInner {
     /// replay surviving entries via `replay_publish_store`.
     publish_store: parking_lot::RwLock<Option<crate::publish_store::LocalPublishStore>>,
     /// `cid → completion signal` for one-shot SOW (snapshot) responses.
-    /// The driver fires this when it sees the matching `GroupEnd`.
-    snapshot_completions: Arc<DashMap<String, oneshot::Sender<()>>>,
+    /// The driver fires `Ok(None)` when it sees the matching `GroupEnd`,
+    /// or `Ok(Some(err))` when it sees an error ack — letting the awaiting
+    /// `sow_msg` short-circuit instead of waiting for a group_end that
+    /// will never arrive (P7 — AMPS_PARITY §4 bug 4 client-side analogue).
+    snapshot_completions: Arc<DashMap<String, oneshot::Sender<Option<String>>>>,
     /// `cid → rows seen so far` for one-shot SOW. The driver appends
     /// each `sow_row` event keyed by sub_id == cid.
     snapshot_buffers: Arc<DashMap<String, Mutex<Vec<Map<String, Value>>>>>,
@@ -160,7 +163,7 @@ impl Client {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<CqMessage>();
         let pending: Arc<DashMap<String, oneshot::Sender<CqMessage>>> = Arc::new(DashMap::new());
         let subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>> = Arc::new(DashMap::new());
-        let snapshot_completions: Arc<DashMap<String, oneshot::Sender<()>>> =
+        let snapshot_completions: Arc<DashMap<String, oneshot::Sender<Option<String>>>> =
             Arc::new(DashMap::new());
         let snapshot_buffers: Arc<DashMap<String, Mutex<Vec<Map<String, Value>>>>> =
             Arc::new(DashMap::new());
@@ -470,9 +473,9 @@ impl Client {
             return Err(ClientError::ConnectionClosed);
         }
 
-        let _ = match self.inner.ack_timeout {
+        let outcome: Option<String> = match self.inner.ack_timeout {
             Some(t) => match tokio::time::timeout(t, rx).await {
-                Ok(Ok(())) => (),
+                Ok(Ok(v)) => v,
                 Ok(Err(_)) => return Err(ClientError::ConnectionClosed),
                 Err(_) => {
                     self.inner.snapshot_buffers.remove(&cid);
@@ -482,6 +485,11 @@ impl Client {
             },
             None => rx.await.map_err(|_| ClientError::ConnectionClosed)?,
         };
+
+        if let Some(err) = outcome {
+            self.inner.snapshot_buffers.remove(&cid);
+            return Err(ClientError::Server(err));
+        }
 
         let rows = self
             .inner
@@ -836,7 +844,7 @@ async fn driver_loop(
     mut out_rx: mpsc::UnboundedReceiver<CqMessage>,
     pending: Arc<DashMap<String, oneshot::Sender<CqMessage>>>,
     subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>>,
-    snapshot_completions: Arc<DashMap<String, oneshot::Sender<()>>>,
+    snapshot_completions: Arc<DashMap<String, oneshot::Sender<Option<String>>>>,
     snapshot_buffers: Arc<DashMap<String, Mutex<Vec<Map<String, Value>>>>>,
     pending_subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>>,
     codec: Codec,
@@ -888,7 +896,7 @@ fn handle_inbound(
     msg: CqMessage,
     pending: &DashMap<String, oneshot::Sender<CqMessage>>,
     subs: &DashMap<String, mpsc::UnboundedSender<Delta>>,
-    snapshot_completions: &DashMap<String, oneshot::Sender<()>>,
+    snapshot_completions: &DashMap<String, oneshot::Sender<Option<String>>>,
     snapshot_buffers: &DashMap<String, Mutex<Vec<Map<String, Value>>>>,
     pending_subs: &DashMap<String, mpsc::UnboundedSender<Delta>>,
 ) {
@@ -907,6 +915,17 @@ fn handle_inbound(
                 }
             }
             if let Some(cid) = msg.command_id.as_ref() {
+                // P7 — if this is an error ack for an in-flight SOW
+                // (no group_end will ever arrive), short-circuit the
+                // snapshot_completion with the error message so the
+                // awaiting caller returns ClientError::Server promptly
+                // instead of timing out.
+                if msg.status == Some(Status::Error) {
+                    if let Some((_, snap_tx)) = snapshot_completions.remove(cid) {
+                        let err = msg.reason.clone().unwrap_or_else(|| "server error".into());
+                        let _ = snap_tx.send(Some(err));
+                    }
+                }
                 if let Some((_, sender)) = pending.remove(cid) {
                     let _ = sender.send(msg);
                     return;
@@ -972,7 +991,7 @@ fn handle_inbound(
         Command::GroupEnd => {
             if let Some(sid) = msg.sub_id.as_ref() {
                 if let Some((_, tx)) = snapshot_completions.remove(sid) {
-                    let _ = tx.send(());
+                    let _ = tx.send(None);
                 }
             }
         }
