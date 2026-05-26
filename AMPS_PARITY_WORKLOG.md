@@ -158,15 +158,75 @@ Per AMPS_PARITY.md §5 honest assessment:
 
 ---
 
-## Deferred (out of scope for this worklog)
+## Q-series — formerly deferred, now in scope
 
-- **Window functions** (`OVER (PARTITION BY ...)`, ROW_NUMBER, LAG/LEAD) — multi-month parser project, low Atlas demo ROI.
-- **Subqueries / CTEs** (`WITH x AS`, scalar subqueries, EXISTS) — same.
-- **FULL OUTER / RIGHT OUTER / AS OF JOIN** — niche after P12 (LEFT OUTER) lands.
-- **Bytes / Array / Object as first-class column types** — schema-evolution sized rewrite.
-- **Schema evolution (online add column)** — separate plan.
-- **SDK-side TLS, batched compressed publish, connection-name echo, per-client metrics, trace-id propagation** — small follow-ups; server-side TLS already has `crates/cq-e2e-tests/tests/tls.rs`.
-- **Pivot dynamic value list**, **pivot-as-view** — folded into AMPS_WORKLOG S45's follow-up.
+The P1–P16 series above closed the Atlas-demo-driven gaps. The Q-series
+takes on the items previously deferred — JOIN variants, wire-level batched
+publish, pivot extensions, SDK polish, then the big-ticket parser items
+(window functions, CTEs, subqueries) and the column-type rework. Same
+contract as P-series: each session has unit + e2e tests and an
+independent commit.
+
+## Q1 — JOIN: RIGHT OUTER + FULL OUTER *(§1.4 rows 4–5)*
+**Status:** ✅ done
+**Scope:** Extend P12's LEFT OUTER work to `RIGHT [OUTER] JOIN` (mirror) and `FULL [OUTER] JOIN` (union of LEFT + RIGHT). USING columns for right-only rows surface the right-side value so consumers don't see `cusip = null`.
+**Implementation:** `JoinKind::{RightOuter, FullOuter}` added; parser accepts `JoinOperator::{Right, RightOuter, FullOuter}`. `execute_join_query` now tracks matched right rows via a `roaring::RoaringBitmap` and, for RIGHT/FULL, emits the unmatched right-only rows after the main scan. USING-column resolution for right-only rows reaches into the right schema by name.
+**Tests landed:**
+- 4 unit tests in `query::tests::{parse_right_outer_join_succeeds, parse_full_outer_join_succeeds, right_outer_join_keeps_unmatched_right_rows, full_outer_join_keeps_both_sides}`.
+- E2E `crates/cq-e2e-tests/tests/parser_right_full_outer_join.rs` runs all 4 join shapes (INNER/LEFT/RIGHT/FULL) on the same fixture (positions: AAPL+MSFT; securities: AAPL+GOOG) and asserts the expected row counts + null-side semantics.
+
+## Q2 — Wire-level publishBatch — one frame, one ack, one txlog append *(§3.2 row 4 follow-up to P16)*
+**Status:** ⏳
+**Scope:** New `Command::PublishBatch` wire frame carrying `Vec<(topic, payload)>`; server collects them under one `state.write()` lock so the txlog gets a single append. Bumps the negotiated wire version (per AMPS_WORKLOG S28 pattern).
+
+## Q3 — PIVOT dynamic value list *(§1.6 row 3 — fold-in of AMPS_WORKLOG S45 follow-up)*
+**Status:** ⏳
+**Scope:** `PIVOT (...) FOR col IN (ANY)` — discover the value list from the source SOW at SOW time and (for views) at refresh time. Continuous-mode pivot already lives behind AMPS_WORKLOG S45; this fills in the dynamic IN list.
+
+## Q4 — Connection name echo + trace-id propagation *(§3.1 row 4 + §3.6 row 3)*
+**Status:** ⏳
+**Scope:** SDKs send a connection name during `logon` that the server echoes in connection-lifecycle logs. Adds a `trace_id` field that flows through router → executor → metrics for cross-process correlation.
+
+## Q5 — TS SDK TLS (wss:// + cert validation) *(§3.1 row 3)*
+**Status:** ⏳
+**Scope:** `Client.connect("wss://host/path")` works against a TLS-enabled server (existing `crates/cq-e2e-tests/tests/tls.rs`). Cert validation defaults to the system trust store; expose a `NODE_TLS_REJECT_UNAUTHORIZED=0`-style escape hatch for dev.
+
+## Q6 — Per-client metrics surface *(§3.6 row 1 — finish the "partial")*
+**Status:** ⏳
+**Scope:** Per-`session_id` (or `client_name` if set) counters for `frames_sent`, `frames_recv`, `publish_count`, `subscribe_count`, `bytes_out`, `bytes_in`. Exposed via `/admin/clients` and the existing Prometheus surface.
+
+## Q7 — Window functions: ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD *(§1.7)*
+**Status:** ⏳
+**Scope:** `OVER (PARTITION BY ... ORDER BY ...)` parser, plus an executor stage that sorts each partition then emits the per-row window value alongside the projection. Bounded to non-streaming (one-shot SOW) for the first cut; continuous-window is a follow-up.
+
+## Q8 — CTEs (WITH x AS …) *(§1.8 row 4)*
+**Status:** ⏳
+**Scope:** Non-recursive CTEs only. Parser collects the named subqueries and inlines each reference at compile time (effectively a macro expansion); recursive CTEs are out of scope.
+
+## Q9 — Subqueries: WHERE col IN (SELECT …), EXISTS, scalar subqueries *(§1.8 rows 1–3)*
+**Status:** ⏳
+**Scope:** Treat each subquery as a one-shot SOW against the referenced topic, materialise the result, then substitute. Correlated subqueries are out of scope for the first cut.
+
+## Q10 — Bytes / Array / Object as first-class column types *(§2 column-types row)*
+**Status:** ⏳
+**Scope:** Add `ColumnType::{Bytes, Array, Object}`; teach `Value` / `ColumnStore` / wire codecs about them. Dotted-path access for Object stays compatible.
+
+## Q11 — Schema evolution (online add column) *(§2 row 12)*
+**Status:** ⏳
+**Scope:** `ALTER TABLE t ADD COLUMN c <type> [NULL]` applied without dropping subscribers. Existing rows get the column with `NULL`; running queries that referenced the previous schema continue against their pinned `Arc<Schema>` until they re-parse.
+
+## Q12 — AS OF JOIN (temporal) *(§1.4 row 7)*
+**Status:** ⏳
+**Scope:** `A AS OF JOIN B ON a.ts = b.ts` — for each left row, find the right row whose `ts` is the largest value ≤ `a.ts`. Useful for trades-vs-prices reconstruction. Implementation: sort right side by `ts`, binary-search per left row.
+
+---
+
+## Deferred (out of scope even for the Q-series — major rewrites)
+
+- **Recursive CTEs** — would require a fixed-point evaluator distinct from Q8's macro-expansion model.
+- **Correlated subqueries** — would require a per-row sub-execution path, very different from Q9's materialise-once.
+- **Hash-join hints / broadcast hints** (`/*+ broadcast(b) */`) — folded into a future planner-hint pass; cqserver's executor is already a hash join, so the hint would be cosmetic until we add a sort-merge alternative.
+- **TLS / connection-name as part of the existing `tls` e2e** — handled by Q4 + Q5 above; the legacy "deferred" bullet is superseded.
 
 ---
 
@@ -179,4 +239,6 @@ At start of this worklog:
 - JOIN: 5 missing variants → 2 covered (P11–P12).
 - SDK: 12 SDK gaps → 2 covered (P15–P16); rest are small enough to land opportunistically.
 
-Total: **16 sessions** to bring the Query Builder tab to "arbitrary SQL works against cqserver" parity for the trading-floor demo's intended surface.
+Total P-series: **16 sessions** to bring the Query Builder tab to "arbitrary SQL works against cqserver" parity for the trading-floor demo's intended surface.
+
+Q-series adds **12 more** to close the remainder (RIGHT/FULL OUTER, wire-batch, pivot dynamic IN, conn-name + trace-id, TS TLS, per-client metrics, window functions, CTEs, subqueries, Bytes/Array/Object, schema evolution, AS OF JOIN).
