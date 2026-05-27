@@ -14,6 +14,7 @@ import type { ColDef } from 'ag-grid-community';
 import { fmtCcy, fmtSigned, fmtBps } from '@/lib/format';
 import { useLiveQuery, type LiveQuerySpec } from '@/lib/use-live-query';
 import { getCqClient, type Row } from '@/lib/cq-store';
+import { CatalogPanel } from './CatalogPanel';
 
 const FEATURE_LABEL: Record<QueryFeature, string> = {
   join: 'Joins',
@@ -363,6 +364,12 @@ export function QueryBuilderCanvas() {
         ? run.elapsedMs
         : 0;
 
+  // Append a catalog token to the editor with sensible spacing. SqlPanel
+  // mirrors the `value` prop into its editor, so updating editorValue
+  // inserts the token live.
+  const insertToken = (token: string) =>
+    setEditorValue((v) => (v && !v.endsWith(' ') && !v.endsWith('\n') ? `${v} ${token}` : `${v}${token}`));
+
   const panels: DockPanelSpec[] = [
     {
       id: 'library',
@@ -472,6 +479,11 @@ export function QueryBuilderCanvas() {
           </div>
         </PanelChrome>
       ),
+    },
+    {
+      id: 'catalog',
+      title: 'Schema Catalog',
+      render: () => <CatalogPanel onInsert={insertToken} />,
     },
     {
       id: 'editor',
@@ -610,6 +622,7 @@ export function QueryBuilderCanvas() {
 
   const layout: DockLayoutStep[] = [
     { id: 'library' },
+    { id: 'catalog', relativeTo: 'library', direction: 'below' },
     // Library is the pattern catalogue — shrink it by 30 % vs the
     // default 50/50 split so the SQL editor + result grid get the
     // working area they deserve. Editor takes 65 % of the parent
