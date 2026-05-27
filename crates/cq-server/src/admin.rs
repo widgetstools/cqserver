@@ -65,6 +65,9 @@ pub struct AdminState {
     /// Serializes POST /admin/views so concurrent creates can't
     /// lose-update the runtime-views file (read-modify-write).
     pub view_create_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-view teardown info so DELETE /admin/views can stop a view's
+    /// runner (soft delete; the evaluator lingers until restart).
+    pub view_teardown: Arc<dashmap::DashMap<String, crate::ViewTeardown>>,
 }
 
 /// Captured replication topology for `/admin/replication`.
@@ -101,6 +104,7 @@ pub async fn start_admin_server(
         .route("/admin/explain", post(explain_query))
         .route("/queues", get(get_queues))
         .route("/admin/views", get(get_views).post(create_view))
+        .route("/admin/views/:name", delete(delete_view))
         .route("/admin/catalog", get(get_catalog))
         .route("/admin/config", get(get_config_toml))
         .route("/admin/clients", get(get_clients))
@@ -549,10 +553,12 @@ async fn create_view(
     };
 
     match crate::init_view(&entry, &s.topics, s.registry.clone()) {
-        Ok(_handle) => {
-            // v1: no teardown — detach the runner/evaluator handle.
+        Ok((_handle, teardown)) => {
+            // The evaluator handle is detached; the teardown record is
+            // stashed so DELETE /admin/views can stop the runner.
             let canonical = cq_core::topic::canonicalize_topic(&entry.name);
-            s.view_names.insert(canonical);
+            s.view_names.insert(canonical.clone());
+            s.view_teardown.insert(canonical, teardown);
             if let Err(e) = crate::config::persist_runtime_view(&s.runtime_views_path, &entry) {
                 // Live but not persisted — surface so the operator knows
                 // it won't survive restart.
@@ -584,6 +590,37 @@ async fn create_view(
             (code, format!("create view failed: {e}")).into_response()
         }
     }
+}
+
+/// `DELETE /admin/views/{name}` — soft delete. Stops the view's runner
+/// (drops the source view-tap so the runner's receiver disconnects),
+/// removes the view from the live topic registry + catalog set + the
+/// persisted runtime-views file, so it disappears now and does not
+/// return on restart. The view's evaluator thread is NOT torn down (it
+/// holds the topic Arc and blocks on recv); it sits idle until the next
+/// restart. 404 if the name isn't a known view.
+async fn delete_view(
+    State(s): State<AdminState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let canonical = cq_core::topic::canonicalize_topic(&name);
+    let Some((_, teardown)) = s.view_teardown.remove(&canonical) else {
+        return (StatusCode::NOT_FOUND, format!("no such view: {canonical}")).into_response();
+    };
+    teardown.source.unregister_view_tap(teardown.left_tap_id);
+    if let Some((right, rid)) = teardown.right {
+        right.unregister_view_tap(rid);
+    }
+    s.topics.remove(&canonical);
+    s.view_names.remove(&canonical);
+    if let Err(e) = crate::config::remove_runtime_view(&s.runtime_views_path, &canonical) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("view stopped but de-persist failed: {e}"),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "deleted": canonical }))).into_response()
 }
 
 /// U5: `GET /admin/config` — the running config's TOML text (with
@@ -766,6 +803,8 @@ mod tests {
             raw_config_toml: Arc::new(String::new()),
             view_names: Arc::new(dashmap::DashSet::new()),
             runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
+            view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            view_teardown: Arc::new(dashmap::DashMap::new()),
         };
         Router::new()
             .route("/healthz", get(healthz))
@@ -857,6 +896,8 @@ mod tests {
             raw_config_toml: Arc::new(String::new()),
             view_names: Arc::new(dashmap::DashSet::new()),
             runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
+            view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            view_teardown: Arc::new(dashmap::DashMap::new()),
         };
         Router::new()
             .route("/admin/shard-for/:topic", get(shard_for))

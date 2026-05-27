@@ -289,10 +289,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runner thread, and spawns the view topic's own evaluator
     // thread so its subscribers see row-level deltas as the view's
     // SOW changes.
+    let view_teardown: Arc<DashMap<String, ViewTeardown>> = Arc::new(DashMap::new());
     for view_cfg in &server_config.views {
         match init_view(view_cfg, &topics, registry.clone()) {
-            Ok(handle) => {
+            Ok((handle, teardown)) => {
                 evaluator_handles.push(handle);
+                view_teardown
+                    .insert(cq_core::topic::canonicalize_topic(&view_cfg.name), teardown);
                 info!(
                     view = %view_cfg.name,
                     source = %view_cfg.source,
@@ -357,6 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         view_names: view_names.clone(),
         runtime_views_path: Arc::new(runtime_views_path.clone()),
         view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+        view_teardown: view_teardown.clone(),
     };
     let admin_addr = server_config.admin_addr.clone();
 
@@ -852,6 +856,15 @@ fn init_topic(
 /// map alongside regular topics, attaches a tap on the source for
 /// re-aggregation wake-ups, spawns the view runner thread, and
 /// spawns the view topic's own evaluator so subscribers see deltas.
+/// What soft-delete needs to stop a view's runner: drop the source
+/// view-tap(s) by id. (The evaluator is intentionally NOT torn down.)
+#[derive(Clone)]
+pub(crate) struct ViewTeardown {
+    pub source: SharedTopic,
+    pub left_tap_id: u64,
+    pub right: Option<(SharedTopic, u64)>,
+}
+
 /// Typed error from `init_view` so callers can distinguish a name
 /// collision (HTTP 409) from other failures (HTTP 400) without
 /// string-matching the message.
@@ -876,7 +889,7 @@ pub(crate) fn init_view(
     cfg: &ViewEntry,
     topics: &Arc<DashMap<String, SharedTopic>>,
     registry: cq_transport::session::SessionRegistry,
-) -> Result<std::thread::JoinHandle<()>, InitViewError> {
+) -> Result<(std::thread::JoinHandle<()>, ViewTeardown), InitViewError> {
     // P14 — view name and source name are both canonicalised so the
     // collision check and source lookup hit the same key the topic
     // registration used.
@@ -959,6 +972,11 @@ pub(crate) fn init_view(
         None => (None, None),
     };
 
+    // Clone the source(s) for the teardown record BEFORE they're moved
+    // into `View::new` below (SharedTopic is an Arc, cheap to clone).
+    let source_for_teardown = source.clone();
+    let right_for_teardown = right_topic_opt.clone();
+
     let view = View::new(
         source,
         view_topic_arc.clone(),
@@ -982,7 +1000,15 @@ pub(crate) fn init_view(
     );
 
     topics.insert(canonical_view, view_topic_arc);
-    Ok(evaluator_handle)
+    let teardown = ViewTeardown {
+        source: source_for_teardown,
+        left_tap_id,
+        right: match (right_for_teardown, right_tap_id) {
+            (Some(rt), Some(rid)) => Some((rt, rid)),
+            _ => None,
+        },
+    };
+    Ok((evaluator_handle, teardown))
 }
 
 /// Build a topic's `Schema` from its `TopicEntry`. Precedence:

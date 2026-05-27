@@ -945,6 +945,28 @@ pub fn persist_runtime_view(
     Ok(())
 }
 
+/// Remove a view (matched by canonical name) from the runtime-views
+/// file. Returns true if an entry was removed; false if the file is
+/// absent or the name wasn't present.
+pub fn remove_runtime_view(
+    path: &std::path::Path,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut views = load_runtime_views(path)?;
+    let want = cq_core::topic::canonicalize_topic(name);
+    let before = views.len();
+    views.retain(|v| cq_core::topic::canonicalize_topic(&v.name) != want);
+    if views.len() == before {
+        return Ok(false);
+    }
+    let file = RuntimeViewsFile { views };
+    let toml_text = toml::to_string_pretty(&file)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml_text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod runtime_views_tests {
     use super::*;
