@@ -54,6 +54,14 @@ pub struct AdminState {
     /// U5: rendered config TOML (post env-var substitution). Served
     /// verbatim by `/admin/config` for the Config screen.
     pub raw_config_toml: Arc<String>,
+    /// Live set of canonical view names (boot-declared + admin-created).
+    /// `GET /admin/catalog` uses this to tag each topic as
+    /// `topic` vs `view`. `POST /admin/views` inserts into it on
+    /// success.
+    pub view_names: Arc<dashmap::DashSet<String>>,
+    /// Path to the runtime-views file that `POST /admin/views` appends
+    /// to so admin-created views survive restart.
+    pub runtime_views_path: Arc<std::path::PathBuf>,
 }
 
 /// Captured replication topology for `/admin/replication`.

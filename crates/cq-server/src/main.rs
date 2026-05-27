@@ -331,6 +331,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         format!("tcp://{}", server_config.tcp_addr)
     };
+    let view_names: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+    for v in &server_config.views {
+        view_names.insert(cq_core::topic::canonicalize_topic(&v.name));
+    }
     let admin_state = AdminState {
         topics: topics.clone(),
         registry: registry.clone(),
@@ -350,6 +354,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen: server_config.replication.listen.clone(),
         }),
         raw_config_toml: Arc::new(raw_config_toml),
+        view_names: view_names.clone(),
+        runtime_views_path: Arc::new(runtime_views_path.clone()),
     };
     let admin_addr = server_config.admin_addr.clone();
 
@@ -845,7 +851,7 @@ fn init_topic(
 /// map alongside regular topics, attaches a tap on the source for
 /// re-aggregation wake-ups, spawns the view runner thread, and
 /// spawns the view topic's own evaluator so subscribers see deltas.
-fn init_view(
+pub(crate) fn init_view(
     cfg: &ViewEntry,
     topics: &Arc<DashMap<String, SharedTopic>>,
     registry: cq_transport::session::SessionRegistry,
