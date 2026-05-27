@@ -122,6 +122,23 @@ export interface ViewInfo {
   tap_capacity: number;
 }
 
+export interface CatalogColumn {
+  name: string;
+  type: string;
+}
+
+export interface CatalogEntry {
+  name: string;
+  kind: 'topic' | 'view';
+  columns: CatalogColumn[];
+}
+
+export interface CreateViewRequest {
+  name: string;
+  source: string;
+  sql: string;
+}
+
 export interface ExplainResponse {
   estimated_source_rows: number;
   estimated_result_rows: number;
@@ -167,6 +184,8 @@ export const adminApi = {
   subscriptions: () => get<SubscriptionInfo[]>('/subscriptions'),
   queues: () => get<QueueInfo[]>('/queues'),
   views: () => get<ViewInfo[]>('/admin/views'),
+  catalog: () => get<CatalogEntry[]>('/admin/catalog'),
+  createView: (body: CreateViewRequest) => postJson<ViewInfo>('/admin/views', body),
   configToml: () => getText('/admin/config'),
   explain: (topic: string, sql: string) =>
     postJson<ExplainResponse>('/admin/explain', { topic, sql }),
