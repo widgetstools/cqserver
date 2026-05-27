@@ -44,6 +44,10 @@ const CQ_URL = process.env.CQ_URL ?? 'tcp://127.0.0.1:9007';
 const TICK_INTERVAL_MS = Number(process.env.TICK_MS ?? 50);
 const TICK_PCT = Number(process.env.TICK_PCT ?? 0.30);
 const TRADES_PER_TICK = Number(process.env.TRADES_PER_TICK ?? 5);
+// Size of the generated positions universe. Default 480 (snappy demo with
+// a high tick rate); override e.g. `POSITIONS=40000` for a large SOW —
+// pair a big universe with a low TICK_PCT so the tick volume stays sane.
+const POSITION_COUNT = Number(process.env.POSITIONS ?? 480);
 const SEED_CHUNK = 200;
 const SEED_CONCURRENCY = 64;
 
@@ -294,7 +298,7 @@ async function main(): Promise<void> {
   const client = await Client.connect(CQ_URL);
 
   console.log('[atlas-publisher] generating universe ...');
-  const positions = generatePositions().map((p) => ({ ...p }));
+  const positions = generatePositions(POSITION_COUNT).map((p) => ({ ...p }));
   const trades = generateTrades(positions);
 
   console.log(
