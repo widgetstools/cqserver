@@ -23,6 +23,12 @@ pub struct ServerConfig {
     /// the view's SOW.
     #[serde(default)]
     pub views: Vec<ViewEntry>,
+    /// Path to the server-owned runtime-views file (admin-created
+    /// views). Defaults to `<config_dir>/runtime_views.toml` when
+    /// unset. Loaded + merged into `views` at boot so admin-created
+    /// views survive restart.
+    #[serde(default)]
+    pub runtime_views_path: Option<String>,
     #[serde(default)]
     pub queues: Vec<QueueEntry>,
     #[serde(default)]
@@ -676,6 +682,7 @@ impl Default for ServerConfig {
                 },
             ],
             views: Vec::new(),
+            runtime_views_path: None,
             queues: Vec::new(),
             txlog: TxLogConfig::default(),
             auth: AuthConfig::default(),

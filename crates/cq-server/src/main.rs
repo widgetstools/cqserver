@@ -80,10 +80,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // falls back to the historical `./config/cqserver.toml` lookup so
     // existing start-demo.sh / Makefiles keep working.
     let config_override = parse_config_arg();
-    let (server_config, config_dir, raw_config_toml) = match config_override {
+    let (mut server_config, config_dir, raw_config_toml) = match config_override {
         Some(path) => config::load_config_from_with_raw(&path)?,
         None => config::load_config_with_raw()?,
     };
+
+    // Resolve the runtime-views file (admin-created views) and merge
+    // it into the declared views BEFORE validation + the init_view
+    // loop, so persisted views are recreated on restart exactly like
+    // hand-authored ones.
+    let runtime_views_path: std::path::PathBuf = server_config
+        .runtime_views_path
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config_dir.join("runtime_views.toml"));
+    match config::load_runtime_views(&runtime_views_path) {
+        Ok(rt_views) => {
+            if !rt_views.is_empty() {
+                server_config.views.extend(rt_views);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: failed to load runtime views from {}: {e}",
+                runtime_views_path.display()
+            );
+        }
+    }
 
     // Install tracing sinks from `[logging]`. Errors opening
     // individual sink files are returned so we can warn about them
