@@ -15,37 +15,34 @@ import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 
 export function LivePnlCanvas() {
-  // Three server-side aggregates feed this tab:
+  // Server-side aggregates feed this tab:
   //   /v_pnl_by_sector      — Sector PnL ladder
-  //   /v_pnl_by_book        — Book contribution waterfall + KPI totals
+  //   /v_pnl_by_book        — Book contribution waterfall
   //   /v_compliance_counts  — Compliance breaches counter
+  //   /v_book_totals        — KPI grand totals (single-row aggregate)
   // The Positions grid itself stays on the raw /positions topic via
   // GridPanel's imperative binding (snapshot + delta stream).
-  //
-  // Grand totals are rolled up from /v_pnl_by_book's 8 rows on the
-  // client. cqserver's view runner stores rows by GROUP BY key, so a
-  // degenerate (no-GROUP-BY) totals view doesn't dedupe — instead we
-  // sum 8 already-aggregated rows here, which is presentation, not
-  // stream aggregation.
   const sectorSub = useFilteredSubscription('/v_pnl_by_sector', null);
   const bookSub = useFilteredSubscription('/v_pnl_by_book', null);
   const complianceSub = useFilteredSubscription('/v_compliance_counts', null);
+  // Server-side grand totals — a single-row degenerate-aggregate view.
+  // The KPI strip reads this row directly; no client-side summation.
+  const totalsSub = useFilteredSubscription('/v_book_totals', null);
 
   const colDefs = useMemo(() => buildColDefs(POSITION_COLUMNS), []);
   const visible = useMemo(() => defaultPositionView(), []);
 
   const kpis = useMemo<Kpi[]>(() => {
-    let gross = 0, net = 0, upnl = 0, rpnl = 0, day = 0, ytd = 0, var95 = 0, nPos = 0;
-    for (const r of bookSub.rows) {
-      gross += num(r.exposure_gross);
-      net   += num(r.market_value);
-      upnl  += num(r.unrealized_pnl);
-      rpnl  += num(r.realized_pnl);
-      day   += num(r.day_pnl);
-      ytd   += num(r.ytd_pnl);
-      var95 += num(r.var_95);
-      nPos  += num(r.n_positions);
-    }
+    // The totals view emits exactly one row holding the live grand totals.
+    const t = totalsSub.rows[0] ?? {};
+    const gross = num(t.exposure_gross);
+    const net   = num(t.market_value);
+    const upnl  = num(t.unrealized_pnl);
+    const rpnl  = num(t.realized_pnl);
+    const day   = num(t.day_pnl);
+    const ytd   = num(t.ytd_pnl);
+    const var95 = num(t.var_95);
+    const nPos  = num(t.n_positions);
     const breachRow = complianceSub.rows.find((r) => r.compliance_status === 'BREACH');
     const breaches = num(breachRow?.n_positions);
     return [
@@ -58,7 +55,7 @@ export function LivePnlCanvas() {
       { label: 'VaR (1d, 95%)',    value: var95,    kind: 'ccy',         sub: 'sum of pos VaR' },
       { label: 'Compliance Brchs', value: breaches, kind: 'count',       sub: 'BREACH status' },
     ];
-  }, [bookSub.rows, complianceSub.rows]);
+  }, [totalsSub.rows, complianceSub.rows]);
 
   // Server-side aggregate rows; sort + project to the {key,v} shape
   // the existing ladder/contribution SVGs already expect.
