@@ -48,7 +48,8 @@ type TopicName =
   | '/v_compliance_counts'
   | '/v_cross_asset_pivot'
   | '/v_heatmap_sector_region'
-  | '/v_trades_by_compliance';
+  | '/v_trades_by_compliance'
+  | '/v_book_totals';
 
 /** Stable row-id derivation per topic — must match the server's key. */
 const KEY_OF: Record<TopicName, (r: Row) => string> = {
@@ -67,6 +68,7 @@ const KEY_OF: Record<TopicName, (r: Row) => string> = {
   '/v_heatmap_sector_region': (r) =>
     `${r.issuer_sector ?? ''}|${r.issuer_region ?? ''}`,
   '/v_trades_by_compliance': (r) => String(r.compliance_status ?? ''),
+  '/v_book_totals': () => 'TOTAL',
 };
 
 class FilteredSub {
