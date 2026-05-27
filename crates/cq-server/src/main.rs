@@ -100,11 +100,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server_config.views.extend(rt_views);
             }
         }
+        // `load_runtime_views` returns Ok(empty) for an absent or blank
+        // file, so reaching this arm means the file EXISTS but failed to
+        // read/parse — i.e. it's corrupt. Continuing would silently drop
+        // every admin-created view on restart (data loss), so fail hard
+        // and let the operator fix or remove the file.
         Err(e) => {
-            eprintln!(
-                "warning: failed to load runtime views from {}: {e}",
+            return Err(format!(
+                "runtime-views file {} is present but could not be parsed: {e}; \
+                 refusing to start to avoid silently losing admin-created views",
                 runtime_views_path.display()
-            );
+            )
+            .into());
         }
     }
 
