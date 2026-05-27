@@ -62,6 +62,9 @@ pub struct AdminState {
     /// Path to the runtime-views file that `POST /admin/views` appends
     /// to so admin-created views survive restart.
     pub runtime_views_path: Arc<std::path::PathBuf>,
+    /// Serializes POST /admin/views so concurrent creates can't
+    /// lose-update the runtime-views file (read-modify-write).
+    pub view_create_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Captured replication topology for `/admin/replication`.
@@ -524,6 +527,8 @@ async fn create_view(
     State(s): State<AdminState>,
     Json(req): Json<CreateViewRequest>,
 ) -> impl IntoResponse {
+    let _guard = s.view_create_lock.lock().await;
+
     if req.name.trim().is_empty()
         || req.source.trim().is_empty()
         || req.sql.trim().is_empty()
@@ -536,9 +541,9 @@ async fn create_view(
     }
 
     let entry = crate::config::ViewEntry {
-        name: req.name.clone(),
-        source: req.source.clone(),
-        sql: req.sql.clone(),
+        name: req.name.trim().to_string(),
+        source: req.source.trim().to_string(),
+        sql: req.sql.trim().to_string(),
         initial_capacity: req.initial_capacity.unwrap_or(10_000),
         tap_capacity: req.tap_capacity.unwrap_or(1024),
     };
@@ -570,13 +575,11 @@ async fn create_view(
                 .into_response()
         }
         Err(e) => {
-            // `init_view` returns "view name `…` collides…" on a name
-            // clash; everything else (bad SQL, missing source) is a
-            // client error.
-            let code = if e.contains("collides") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
+            // Name clash maps to 409; everything else (bad SQL,
+            // missing source) is a 400 client error.
+            let code = match e {
+                crate::InitViewError::NameCollision(_) => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
             };
             (code, format!("create view failed: {e}")).into_response()
         }

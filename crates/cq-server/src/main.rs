@@ -356,6 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raw_config_toml: Arc::new(raw_config_toml),
         view_names: view_names.clone(),
         runtime_views_path: Arc::new(runtime_views_path.clone()),
+        view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     let admin_addr = server_config.admin_addr.clone();
 
@@ -851,26 +852,51 @@ fn init_topic(
 /// map alongside regular topics, attaches a tap on the source for
 /// re-aggregation wake-ups, spawns the view runner thread, and
 /// spawns the view topic's own evaluator so subscribers see deltas.
+/// Typed error from `init_view` so callers can distinguish a name
+/// collision (HTTP 409) from other failures (HTTP 400) without
+/// string-matching the message.
+#[derive(Debug)]
+pub(crate) enum InitViewError {
+    NameCollision(String),
+    SourceNotFound(String),
+    Build(String),
+}
+
+impl std::fmt::Display for InitViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InitViewError::NameCollision(m)
+            | InitViewError::SourceNotFound(m)
+            | InitViewError::Build(m) => write!(f, "{m}"),
+        }
+    }
+}
+
 pub(crate) fn init_view(
     cfg: &ViewEntry,
     topics: &Arc<DashMap<String, SharedTopic>>,
     registry: cq_transport::session::SessionRegistry,
-) -> Result<std::thread::JoinHandle<()>, String> {
+) -> Result<std::thread::JoinHandle<()>, InitViewError> {
     // P14 — view name and source name are both canonicalised so the
     // collision check and source lookup hit the same key the topic
     // registration used.
     let canonical_view = cq_core::topic::canonicalize_topic(&cfg.name);
     let canonical_source = cq_core::topic::canonicalize_topic(&cfg.source);
     if topics.contains_key(&canonical_view) {
-        return Err(format!(
+        return Err(InitViewError::NameCollision(format!(
             "view name `{}` collides with an existing topic",
             canonical_view
-        ));
+        )));
     }
     let source = topics
         .get(&canonical_source)
         .map(|e| e.value().clone())
-        .ok_or_else(|| format!("source topic `{}` not found", canonical_source))?;
+        .ok_or_else(|| {
+            InitViewError::SourceNotFound(format!(
+                "source topic `{}` not found",
+                canonical_source
+            ))
+        })?;
 
     // S20 — detect a JOIN clause on the view SQL. JOIN views go
     // through `build_view_topic_joined` (parses against the
@@ -878,7 +904,7 @@ pub(crate) fn init_view(
     // taps into a single refresh signal; un-joined views take the
     // single-source path as before.
     let join_topics = peek_join(&cfg.sql)
-        .map_err(|e| format!("parse view sql: {}", e))?;
+        .map_err(|e| InitViewError::Build(format!("parse view sql: {}", e)))?;
 
     let (view_topic, query, group_by_names, right_topic_opt): (
         cq_core::topic::Topic,
@@ -902,7 +928,7 @@ pub(crate) fn init_view(
             canonical_view.clone(),
             cfg.initial_capacity,
         )
-        .map_err(|e| format!("build joined view topic: {}", e))?;
+        .map_err(|e| InitViewError::Build(format!("build joined view topic: {}", e)))?;
         (vt, q, g, Some(rt))
     } else {
         let (vt, q, g) = View::build_view_topic(
@@ -911,7 +937,7 @@ pub(crate) fn init_view(
             canonical_view.clone(),
             cfg.initial_capacity,
         )
-        .map_err(|e| format!("build view topic: {}", e))?;
+        .map_err(|e| InitViewError::Build(format!("build view topic: {}", e)))?;
         (vt, q, g, None)
     };
     let view_topic_arc = Arc::new(view_topic);
@@ -936,7 +962,7 @@ pub(crate) fn init_view(
         group_by_names,
         right_topic_opt,
     )
-    .map_err(|e| format!("instantiate view: {}", e))?;
+    .map_err(|e| InitViewError::Build(format!("instantiate view: {}", e)))?;
 
     // The view's runner thread keeps the view SOW in sync with the
     // source(s); the view-topic evaluator dispatches deltas to view
