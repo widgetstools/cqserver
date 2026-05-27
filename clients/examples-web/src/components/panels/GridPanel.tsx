@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import React, { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import {
   AllCommunityModule,
@@ -121,7 +121,7 @@ function GridStatsBadge({
  * `ag-grid.css` / `ag-theme-quartz.css` imports — the v33+ API
  * generates all styling from the theme object's parameters.
  */
-export function GridPanel<T extends Record<string, unknown>>({
+function GridPanelInner<T extends Record<string, unknown>>({
   title,
   rows,
   colDefs,
@@ -322,3 +322,9 @@ export function GridPanel<T extends Record<string, unknown>>({
     </PanelChrome>
   );
 }
+
+// Memoized so a topic/liveSubscription-bound grid renders once (to seed
+// the SOW) and thereafter updates only via applyTransactionAsync — the
+// live tick counter lives in GridStatsBadge, not here. React.memo only
+// holds when callers pass STABLE props (notably getRowId); see ex01.
+export const GridPanel = React.memo(GridPanelInner) as typeof GridPanelInner;

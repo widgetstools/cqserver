@@ -14,6 +14,11 @@ import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 
+// Stable identity so React.memo on GridPanel holds — an inline
+// `getRowId={(r) => ...}` would be a fresh function each render and
+// defeat the memo, re-applying columnDefs on every parent re-render.
+const positionRowId = (r: Record<string, unknown>) => r.position_id as string;
+
 export function LivePnlCanvas() {
   // Server-side aggregates feed this tab:
   //   /v_pnl_by_sector      — Sector PnL ladder
@@ -134,7 +139,7 @@ export function LivePnlCanvas() {
           title="Positions · 23 of 203 cols"
           colDefs={colDefs}
           visible={visible}
-          getRowId={(r) => r.position_id as string}
+          getRowId={positionRowId}
           topic="positions"
         />
       ),
