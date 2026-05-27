@@ -98,6 +98,7 @@ pub async fn start_admin_server(
         .route("/admin/explain", post(explain_query))
         .route("/queues", get(get_queues))
         .route("/admin/views", get(get_views))
+        .route("/admin/catalog", get(get_catalog))
         .route("/admin/config", get(get_config_toml))
         .route("/admin/clients", get(get_clients))
         .route("/admin/add-column/:topic", post(add_column_endpoint))
@@ -195,6 +196,39 @@ async fn get_stats(State(s): State<AdminState>) -> impl IntoResponse {
 async fn get_topics(State(s): State<AdminState>) -> impl IntoResponse {
     let topics: Vec<_> = s.topics.iter().map(|e| e.value().stats()).collect();
     Json(serde_json::Value::Array(topics))
+}
+
+/// `GET /admin/catalog` — every topic + view with its column list and
+/// types. Feeds the admin "create view" screen and the query builder's
+/// schema/field catalog. `kind` distinguishes views (in `view_names`)
+/// from regular topics; both live in the same `topics` map.
+async fn get_catalog(State(s): State<AdminState>) -> impl IntoResponse {
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(s.topics.len());
+    for e in s.topics.iter() {
+        let name = e.key().clone();
+        let schema = e.value().schema();
+        let columns: Vec<serde_json::Value> = (0..schema.column_count())
+            .map(|i| {
+                serde_json::json!({
+                    "name": schema.column_name(i),
+                    // ColumnType derives Serialize with rename_all =
+                    // "lowercase" → "double" | "string" | ...
+                    "type": schema.column_type(i),
+                })
+            })
+            .collect();
+        let kind = if s.view_names.contains(&name) {
+            "view"
+        } else {
+            "topic"
+        };
+        out.push(serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "columns": columns,
+        }));
+    }
+    Json(serde_json::Value::Array(out))
 }
 
 /// Q11 — `POST /admin/add-column/{topic}?name=NAME&type=TYPE` —
@@ -648,6 +682,8 @@ mod tests {
                 listen: None,
             }),
             raw_config_toml: Arc::new(String::new()),
+            view_names: Arc::new(dashmap::DashSet::new()),
+            runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
         };
         Router::new()
             .route("/healthz", get(healthz))
@@ -716,6 +752,8 @@ mod tests {
                 listen: None,
             }),
             raw_config_toml: Arc::new(String::new()),
+            view_names: Arc::new(dashmap::DashSet::new()),
+            runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
         };
         Router::new()
             .route("/admin/shard-for/:topic", get(shard_for))
