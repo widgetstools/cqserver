@@ -99,8 +99,8 @@ fn build_joined_view(
     )
     .expect("build joined view");
     let view_topic_arc = Arc::new(view_topic);
-    let left_tap = positions.register_view_tap(1024);
-    let right_tap = right_topic.register_view_tap(1024);
+    let (_left_tap_id, left_tap) = positions.register_view_tap(1024);
+    let (_right_tap_id, right_tap) = right_topic.register_view_tap(1024);
     let view = View::new(
         positions,
         view_topic_arc.clone(),

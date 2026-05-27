@@ -173,7 +173,10 @@ pub struct Topic {
     /// pruned on the next write; the regular subscription path is
     /// unaffected. Bounded senders are used so a slow view runner
     /// can't unbounded-grow memory on a hot publisher.
-    view_taps: Mutex<Vec<Sender<MutationEvent>>>,
+    view_taps: Mutex<Vec<(u64, Sender<MutationEvent>)>>,
+    /// Monotonic id allocator for view taps; lets a specific tap be
+    /// dropped via `unregister_view_tap(id)`.
+    next_view_tap_id: std::sync::atomic::AtomicU64,
     txlog: Option<Arc<Mutex<TxLogWriter>>>,
     /// Monotonic sequence counter. Persistent topics seed this from the
     /// txlog's `max_sequence` on attach so that post-recovery numbering
@@ -245,6 +248,7 @@ impl Topic {
             mutation_tx,
             mutation_rx_holder: Mutex::new(Some(mutation_rx)),
             view_taps: Mutex::new(Vec::new()),
+            next_view_tap_id: std::sync::atomic::AtomicU64::new(0),
             txlog: None,
             next_sequence: AtomicU64::new(0),
             last_applied_sequence: AtomicU64::new(0),
@@ -525,10 +529,20 @@ impl Topic {
     /// every tick, so a dropped tap event just delays the next
     /// refresh by one tick of the next event the runner does
     /// observe.
-    pub fn register_view_tap(&self, cap: usize) -> Receiver<MutationEvent> {
+    pub fn register_view_tap(&self, cap: usize) -> (u64, Receiver<MutationEvent>) {
         let (tx, rx) = crossbeam_channel::bounded(cap);
-        self.view_taps.lock().push(tx);
-        rx
+        let id = self
+            .next_view_tap_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.view_taps.lock().push((id, tx));
+        (id, rx)
+    }
+
+    /// Drop the view-tap `Sender` registered under `id`; the matching
+    /// runner's `Receiver` then disconnects and its thread exits. No-op if
+    /// the id isn't present.
+    pub fn unregister_view_tap(&self, id: u64) {
+        self.view_taps.lock().retain(|(tid, _)| *tid != id);
     }
 
     /// Fan out one mutation event to every registered view tap.
@@ -541,7 +555,7 @@ impl Topic {
             return;
         }
         let topic_name = self.config.name.clone();
-        taps.retain(|tx| match tx.try_send(event.clone()) {
+        taps.retain(|(_, tx)| match tx.try_send(event.clone()) {
             Ok(()) => true,
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 metrics::counter!(
@@ -2645,5 +2659,47 @@ mod tests {
         let result = topic.query("SELECT * FROM t WHERE symbol = 'MSFT'").unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].get("price").unwrap(), 305.0);
+    }
+}
+
+#[cfg(test)]
+mod view_tap_tests {
+    use super::*;
+    use crate::schema::ColumnType;
+
+    fn make_topic() -> Topic {
+        let schema = Arc::new(Schema::from_strs(
+            &["symbol", "price", "quantity"],
+            &[ColumnType::String, ColumnType::Double, ColumnType::Long],
+        ));
+        let config = TopicConfig {
+            name: "/market-data".into(),
+            key_fields: vec!["symbol".into()],
+            persist: false,
+            conflation_ms: None,
+            index_columns: vec![],
+            expire_seconds: None,
+        };
+        Topic::new(config, schema, 100)
+    }
+
+    fn publish(topic: &Topic, symbol: &str, price: f64) {
+        let mut m = serde_json::Map::new();
+        m.insert("symbol".into(), symbol.into());
+        m.insert("price".into(), price.into());
+        m.insert("quantity".into(), 100i64.into());
+        topic.upsert_map(&m).expect("upsert");
+    }
+
+    #[test]
+    fn unregister_view_tap_drops_sender_and_disconnects_receiver() {
+        let topic = make_topic();
+        let (id, rx) = topic.register_view_tap(16);
+        publish(&topic, "AAPL", 150.0);
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok());
+
+        topic.unregister_view_tap(id);
+        publish(&topic, "MSFT", 300.0);
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
     }
 }

@@ -55,7 +55,7 @@ fn view_converges_under_concurrent_pressure() {
         View::build_view_topic(&src, view_sql, "/stress-view".into(), 256)
             .expect("build view");
     let view_topic_arc = Arc::new(view_topic);
-    let tap_rx = src.register_view_tap(8_192);
+    let (_tap_id, tap_rx) = src.register_view_tap(8_192);
     let view = View::new(
         src.clone(),
         view_topic_arc.clone(),

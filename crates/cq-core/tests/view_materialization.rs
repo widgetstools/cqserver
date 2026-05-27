@@ -54,7 +54,7 @@ fn build_view(
         View::build_view_topic(&source, sql, view_name.into(), 64)
             .expect("build view topic");
     let view_topic_arc = Arc::new(view_topic);
-    let tap_rx = source.register_view_tap(1024);
+    let (_tap_id, tap_rx) = source.register_view_tap(1024);
     let view = View::new(
         source.clone(),
         view_topic_arc.clone(),

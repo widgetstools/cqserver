@@ -950,10 +950,14 @@ pub(crate) fn init_view(
         .take_mutation_rx()
         .expect("freshly-created view topic must have an rx");
 
-    let left_tap = source.register_view_tap(cfg.tap_capacity);
+    let (left_tap_id, left_tap) = source.register_view_tap(cfg.tap_capacity);
     let right_tap = right_topic_opt
         .as_ref()
         .map(|r| r.register_view_tap(cfg.tap_capacity));
+    let (right_tap_id, right_tap_rx): (Option<u64>, Option<_>) = match right_tap {
+        Some((id, rx)) => (Some(id), Some(rx)),
+        None => (None, None),
+    };
 
     let view = View::new(
         source,
@@ -967,7 +971,7 @@ pub(crate) fn init_view(
     // The view's runner thread keeps the view SOW in sync with the
     // source(s); the view-topic evaluator dispatches deltas to view
     // subscribers. Both run for the process lifetime.
-    let _runner = match right_tap {
+    let _runner = match right_tap_rx {
         Some(rt) => spawn_view_runner_joined(view, left_tap, rt),
         None => spawn_view_runner(view, left_tap),
     };
