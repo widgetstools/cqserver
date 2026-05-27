@@ -768,6 +768,7 @@ mod tests {
             .route("/healthz", get(healthz))
             .route("/stats", get(get_stats))
             .route("/topics", get(get_topics))
+            .route("/admin/catalog", get(get_catalog))
             .route("/metrics", get(get_metrics))
             .with_state(state)
     }
@@ -811,6 +812,26 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].get("name").unwrap(), "/t");
+    }
+
+    #[tokio::test]
+    async fn catalog_returns_topic_with_columns() {
+        let app = router_with_one_topic();
+        let res = app
+            .oneshot(Request::get("/admin/catalog").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!v.is_empty(), "catalog should list the topic");
+        let entry = &v[0];
+        assert_eq!(entry["name"], "/t");
+        assert_eq!(entry["kind"], "topic");
+        let cols = entry["columns"].as_array().unwrap();
+        assert!(!cols.is_empty());
+        assert_eq!(cols[0]["name"], "symbol");
+        assert_eq!(cols[0]["type"], "string");
     }
 
     fn router_with_shards(shards: Vec<crate::config::ShardEntry>, self_url: &str) -> Router {

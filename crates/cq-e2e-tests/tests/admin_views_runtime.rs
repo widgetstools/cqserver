@@ -51,6 +51,22 @@ async fn catalog_lists_topics_and_views_with_columns() {
         .find(|e| e["name"] == "/v_by_sector")
         .expect("view present");
     assert_eq!(view["kind"], "view");
+    // The aggregation view selects `sector` and `n` — both must appear.
+    let view_cols: Vec<&str> = view["columns"]
+        .as_array()
+        .expect("view has columns array")
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(view_cols.contains(&"sector"), "view columns: {view_cols:?}");
+    // Exercise the column-type field on the topic side.
+    let mv_col = pos["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "mv")
+        .expect("mv column present");
+    assert_eq!(mv_col["type"], "double");
 }
 
 #[tokio::test]
