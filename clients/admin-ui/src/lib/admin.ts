@@ -186,6 +186,7 @@ export const adminApi = {
   views: () => get<ViewInfo[]>('/admin/views'),
   catalog: () => get<CatalogEntry[]>('/admin/catalog'),
   createView: (body: CreateViewRequest) => postJson<ViewInfo>('/admin/views', body),
+  deleteView: (name: string) => del(`/admin/views/${encodeURIComponent(name)}`),
   configToml: () => getText('/admin/config'),
   explain: (topic: string, sql: string) =>
     postJson<ExplainResponse>('/admin/explain', { topic, sql }),

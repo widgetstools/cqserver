@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
-import { ArrowUpRight, Eye, Plus, RefreshCw } from 'lucide-react';
+import { ArrowUpRight, Eye, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -19,6 +19,16 @@ export function ViewsPage() {
     queryKey: ['topics'],
     queryFn: adminApi.topics,
     refetchInterval: 5_000,
+  });
+
+  const qc = useQueryClient();
+  const del = useMutation({
+    mutationFn: (name: string) => adminApi.deleteView(name),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['views'] });
+      qc.invalidateQueries({ queryKey: ['catalog'] });
+      setSelected(null);
+    },
   });
 
   const list: ViewInfo[] = views.data ?? [];
@@ -113,7 +123,13 @@ export function ViewsPage() {
           {/* Detail */}
           <Card className="col-span-12 lg:col-span-7">
             {activeView ? (
-              <ViewDetail view={activeView} stats={topicByName.get(activeView.name)} />
+              <ViewDetail
+                view={activeView}
+                stats={topicByName.get(activeView.name)}
+                onDelete={() => del.mutate(activeView.name)}
+                deleting={del.isPending}
+                deleteError={del.isError ? (del.error as Error).message : null}
+              />
             ) : (
               <CardContent className="py-10 text-center text-[12px] text-muted-foreground">
                 Select a view on the left.
@@ -126,13 +142,31 @@ export function ViewsPage() {
   );
 }
 
-function ViewDetail({ view, stats }: { view: ViewInfo; stats: TopicInfo | undefined }) {
+function ViewDetail({
+  view,
+  stats,
+  onDelete,
+  deleting,
+  deleteError,
+}: {
+  view: ViewInfo;
+  stats: TopicInfo | undefined;
+  onDelete: () => void;
+  deleting: boolean;
+  deleteError: string | null;
+}) {
   return (
     <>
-      <CardHeader className="pb-2 border-b border-border">
+      <CardHeader className="pb-2 border-b border-border flex flex-row items-center justify-between gap-2">
         <CardTitle className="font-mono text-[13px] text-foreground normal-case tracking-normal">
           {view.name}
         </CardTitle>
+        <div className="flex items-center gap-2">
+          {deleteError ? <span className="text-[11px] text-err">{deleteError}</span> : null}
+          <Button variant="destructive" size="sm" onClick={onDelete} disabled={deleting}>
+            <Trash2 size={11} /> {deleting ? 'Deleting…' : 'Delete'}
+          </Button>
+        </div>
       </CardHeader>
       <CardContent className="pt-3">
         <dl className="grid grid-cols-4 gap-y-2 mb-4">
