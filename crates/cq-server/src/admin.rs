@@ -97,7 +97,7 @@ pub async fn start_admin_server(
         .route("/admin/shard-for/:topic", get(shard_for))
         .route("/admin/explain", post(explain_query))
         .route("/queues", get(get_queues))
-        .route("/admin/views", get(get_views))
+        .route("/admin/views", get(get_views).post(create_view))
         .route("/admin/catalog", get(get_catalog))
         .route("/admin/config", get(get_config_toml))
         .route("/admin/clients", get(get_clients))
@@ -502,6 +502,85 @@ async fn get_views(State(s): State<AdminState>) -> impl IntoResponse {
         })
         .collect();
     Json(serde_json::Value::Array(arr))
+}
+
+/// Body for `POST /admin/views`. `initial_capacity` / `tap_capacity`
+/// are optional; sensible defaults mirror the config defaults.
+#[derive(serde::Deserialize)]
+struct CreateViewRequest {
+    name: String,
+    source: String,
+    sql: String,
+    initial_capacity: Option<usize>,
+    tap_capacity: Option<usize>,
+}
+
+/// `POST /admin/views` — create a materialized view at runtime. Stands
+/// the view up live via `init_view` (which validates the SQL, the
+/// source topic, and the name), then persists it to the runtime-views
+/// file so it is recreated on restart. v1 does NOT support teardown:
+/// the runner/evaluator handle is detached.
+async fn create_view(
+    State(s): State<AdminState>,
+    Json(req): Json<CreateViewRequest>,
+) -> impl IntoResponse {
+    if req.name.trim().is_empty()
+        || req.source.trim().is_empty()
+        || req.sql.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "name, source, and sql are required",
+        )
+            .into_response();
+    }
+
+    let entry = crate::config::ViewEntry {
+        name: req.name.clone(),
+        source: req.source.clone(),
+        sql: req.sql.clone(),
+        initial_capacity: req.initial_capacity.unwrap_or(10_000),
+        tap_capacity: req.tap_capacity.unwrap_or(1024),
+    };
+
+    match crate::init_view(&entry, &s.topics, s.registry.clone()) {
+        Ok(_handle) => {
+            // v1: no teardown — detach the runner/evaluator handle.
+            let canonical = cq_core::topic::canonicalize_topic(&entry.name);
+            s.view_names.insert(canonical);
+            if let Err(e) = crate::config::persist_runtime_view(&s.runtime_views_path, &entry) {
+                // Live but not persisted — surface so the operator knows
+                // it won't survive restart.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("view created but persistence failed: {e}"),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "name": entry.name,
+                    "source": entry.source,
+                    "sql": entry.sql,
+                    "initial_capacity": entry.initial_capacity,
+                    "tap_capacity": entry.tap_capacity,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            // `init_view` returns "view name `…` collides…" on a name
+            // clash; everything else (bad SQL, missing source) is a
+            // client error.
+            let code = if e.contains("collides") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (code, format!("create view failed: {e}")).into_response()
+        }
+    }
 }
 
 /// U5: `GET /admin/config` — the running config's TOML text (with
