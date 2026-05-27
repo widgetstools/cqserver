@@ -595,15 +595,23 @@ async fn create_view(
 /// `DELETE /admin/views/{name}` — soft delete. Stops the view's runner
 /// (drops the source view-tap so the runner's receiver disconnects),
 /// removes the view from the live topic registry + catalog set + the
-/// persisted runtime-views file, so it disappears now and does not
-/// return on restart. The view's evaluator thread is NOT torn down (it
-/// holds the topic Arc and blocks on recv); it sits idle until the next
-/// restart. 404 if the name isn't a known view.
+/// persisted runtime-views file. The view's evaluator thread is NOT
+/// torn down (it holds the topic Arc and blocks on recv); it sits idle
+/// until the next restart. 404 if the name isn't a known view.
+///
+/// Restart semantics: a runtime-created view (in runtime_views.toml) is
+/// de-persisted and will NOT return on restart. A view hand-declared in
+/// cqserver.toml is removed live but reappears on the next restart (it's
+/// recreated from the main config, which this endpoint does not edit).
 async fn delete_view(
     State(s): State<AdminState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let canonical = cq_core::topic::canonicalize_topic(&name);
+    // Serialize against create_view: both do a read-modify-write of
+    // runtime_views.toml, so a concurrent create+delete must not
+    // interleave and lose an update to the persisted file.
+    let _guard = s.view_create_lock.lock().await;
     let Some((_, teardown)) = s.view_teardown.remove(&canonical) else {
         return (StatusCode::NOT_FOUND, format!("no such view: {canonical}")).into_response();
     };
