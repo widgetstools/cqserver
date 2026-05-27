@@ -11,6 +11,8 @@ import { fmtCcy, fmtSigned } from '@/lib/format';
 import { DOCS_BY_ID } from '@/docs';
 import { cn } from '@/lib/utils';
 
+const positionRowId = (r: Record<string, unknown>) => r.position_id as string;
+
 type Measure = 'market_value_usd' | 'unrealized_pnl_usd' | 'var_1d_95' | 'exposure_gross';
 
 const MEASURES: { id: Measure; label: string; signed: boolean }[] = [
@@ -252,7 +254,7 @@ ${drillFilter ? `WHERE ${drillFilter}` : '-- (no filter — full stream)'};
           title="Drill-through Positions"
           colDefs={colDefs}
           visible={visible}
-          getRowId={(r) => r.position_id as string}
+          getRowId={positionRowId}
           liveSubscription={drillSub}
         />
       ),

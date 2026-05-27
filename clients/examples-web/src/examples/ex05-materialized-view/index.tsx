@@ -11,6 +11,9 @@ import { DOCS_BY_ID } from '@/docs';
 import { fmtCcy, fmtPct, fmtSigned } from '@/lib/format';
 import type { ColDef } from 'ag-grid-community';
 
+const netExposureRowId = (r: Record<string, unknown>) =>
+  `${r.book_id ?? ''}|${r.book_name ?? ''}|${r.asset_class ?? ''}|${r.currency ?? ''}`;
+
 export function MaterializedViewCanvas() {
   // The view is a real cqserver topic — declared in cqserver.toml as
   // an aggregate over /positions, materialized incrementally on the
@@ -121,9 +124,7 @@ export function MaterializedViewCanvas() {
         <GridPanel
           title="View Output · net_exposure"
           colDefs={cols}
-          getRowId={(r) =>
-            `${r.book_id ?? ''}|${r.book_name ?? ''}|${r.asset_class ?? ''}|${r.currency ?? ''}`
-          }
+          getRowId={netExposureRowId}
           liveSubscription={viewSub}
         />
       ),

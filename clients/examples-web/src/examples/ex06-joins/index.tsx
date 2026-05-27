@@ -15,6 +15,10 @@ import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 import type { ColDef } from 'ag-grid-community';
 import { fmtBps, fmtCcy, fmtInt } from '@/lib/format';
 
+const positionRowId = (r: Record<string, unknown>) => r.position_id as string;
+const tradeRowId = (r: Record<string, unknown>) => r.trade_id as string;
+const complianceRowId = (r: Record<string, unknown>) => String(r.compliance_status ?? '');
+
 type JoinKind = 'equi' | 'broadcast' | 'asof';
 
 const JOIN_SQL: Record<JoinKind, string> = {
@@ -144,7 +148,7 @@ export function JoinsCanvas() {
           title="LHS · positions"
           colDefs={posDefs}
           visible={['position_id', 'book_name', 'symbol', 'asset_class', 'market_value_usd', 'compliance_status']}
-          getRowId={(r) => r.position_id as string}
+          getRowId={positionRowId}
           topic="positions"
         />
       ),
@@ -157,7 +161,7 @@ export function JoinsCanvas() {
           title="RHS · trades"
           colDefs={trdDefs}
           visible={['trade_id', 'position_id', 'side', 'quantity', 'price', 'notional_usd', 'status']}
-          getRowId={(r) => r.trade_id as string}
+          getRowId={tradeRowId}
           topic="trades"
         />
       ),
@@ -169,7 +173,7 @@ export function JoinsCanvas() {
         <GridPanel
           title={`Joined Result · ${joined.length} rows`}
           colDefs={joinedCols}
-          getRowId={(r) => String(r.compliance_status ?? '')}
+          getRowId={complianceRowId}
           liveSubscription={joinSub}
         />
       ),

@@ -10,6 +10,9 @@ import { DOCS_BY_ID } from '@/docs';
 import { fmtBps, fmtCcy, fmtInt } from '@/lib/format';
 import type { ColDef } from 'ag-grid-community';
 
+const venueAlgoRowId = (r: Record<string, unknown>) =>
+  `${r.execution_venue ?? ''}|${r.execution_algo ?? ''}`;
+
 export function SlippageCanvas() {
   // /v_slippage_venue_algo is a materialized view declared in
   // cqserver.toml — cqserver evaluates `GROUP BY (venue, algo)` over
@@ -59,7 +62,7 @@ export function SlippageCanvas() {
         <GridPanel
           title="Aggregate · venue × algo"
           colDefs={cols}
-          getRowId={(r) => `${r.execution_venue ?? ''}|${r.execution_algo ?? ''}`}
+          getRowId={venueAlgoRowId}
           liveSubscription={aggSub}
         />
       ),

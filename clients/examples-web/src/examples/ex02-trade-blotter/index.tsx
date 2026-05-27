@@ -15,6 +15,8 @@ import { buildColDefs, defaultTradeView } from '@/lib/grid-cols';
 import { BOOKS } from '@/lib/refdata';
 import { DOCS_BY_ID } from '@/docs';
 
+const tradeRowId = (r: Record<string, unknown>) => r.trade_id as string;
+
 type FilterId =
   | 'us'
   | 'eu'
@@ -263,7 +265,7 @@ LIMIT 500;`;
           title="Trade Tape · 21 of 203 cols"
           colDefs={colDefs}
           visible={visible}
-          getRowId={(r) => r.trade_id as string}
+          getRowId={tradeRowId}
           liveSubscription={tradesSub}
           tickTopic="trades"
         />
