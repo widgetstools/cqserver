@@ -1,6 +1,6 @@
 //! Server configuration loading.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -611,7 +611,7 @@ fn default_capacity() -> usize {
 /// source topic's schema and MUST be an aggregate query
 /// (`SELECT ... GROUP BY ...`). The view's schema is derived from the
 /// SELECT clause; its key fields default to the `GROUP BY` columns.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ViewEntry {
     /// Name of the view topic (must not collide with any `topics` entry).
     pub name: String,
@@ -877,5 +877,97 @@ websocket_path = "/cq/json"
         let cfg: super::ServerConfig = toml::from_str(&expanded).unwrap();
         assert_eq!(cfg.tcp_addr, "127.0.0.1:12345");
         assert_eq!(cfg.websocket_addr, "127.0.0.1:9008");
+    }
+}
+
+/// On-disk shape of the runtime-views file. A plain `[[views]]` array
+/// of `ViewEntry`, identical to the `views` section of cqserver.toml,
+/// but written/owned by the server (admin-created views) rather than
+/// hand-authored. Kept separate so programmatic rewrites never disturb
+/// the operator's cqserver.toml.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RuntimeViewsFile {
+    #[serde(default)]
+    pub views: Vec<ViewEntry>,
+}
+
+/// Read the runtime-views file. Returns an empty vec if the file is
+/// absent or blank (the common first-run case).
+pub fn load_runtime_views(
+    path: &std::path::Path,
+) -> Result<Vec<ViewEntry>, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: RuntimeViewsFile = toml::from_str(&raw)?;
+    Ok(parsed.views)
+}
+
+/// Append a view to the runtime-views file. Read-modify-write the whole
+/// file, then rename a temp file over the target so a crash mid-write
+/// never leaves a half-written config.
+pub fn persist_runtime_view(
+    path: &std::path::Path,
+    entry: &ViewEntry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut existing = load_runtime_views(path)?;
+    existing.push(entry.clone());
+    let file = RuntimeViewsFile { views: existing };
+    let toml_text = toml::to_string_pretty(&file)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml_text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod runtime_views_tests {
+    use super::*;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cq_rt_views_{}_{}.toml",
+            std::process::id(),
+            tag
+        ))
+    }
+
+    fn sample(name: &str) -> ViewEntry {
+        ViewEntry {
+            name: name.into(),
+            source: "/positions".into(),
+            sql: "SELECT sector, COUNT(*) AS n FROM t GROUP BY sector".into(),
+            initial_capacity: 10_000,
+            tap_capacity: 1024,
+        }
+    }
+
+    #[test]
+    fn load_missing_file_returns_empty() {
+        let p = temp_path("missing");
+        let _ = std::fs::remove_file(&p);
+        let views = load_runtime_views(&p).expect("load");
+        assert!(views.is_empty());
+    }
+
+    #[test]
+    fn persist_then_load_roundtrips() {
+        let p = temp_path("roundtrip");
+        let _ = std::fs::remove_file(&p);
+        persist_runtime_view(&p, &sample("/v_a")).expect("persist a");
+        persist_runtime_view(&p, &sample("/v_b")).expect("persist b");
+        let views = load_runtime_views(&p).expect("load");
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].name, "/v_a");
+        assert_eq!(views[1].name, "/v_b");
+        assert_eq!(views[0].source, "/positions");
+        let _ = std::fs::remove_file(&p);
     }
 }
