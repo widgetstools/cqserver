@@ -1,6 +1,6 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
-import { ArrowUpRight, Eye, RefreshCw } from 'lucide-react';
+import { ArrowUpRight, Eye, Plus, RefreshCw } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -61,12 +61,14 @@ export function ViewsPage() {
         </Button>
       </div>
 
+      <CreateViewForm />
+
       {list.length === 0 ? (
         <Card>
           <CardContent className="py-10 text-center text-[12px] text-muted-foreground">
             {views.isLoading
               ? 'Loading views…'
-              : 'No views configured. Declare a [[views]] block in cqserver.toml.'}
+              : 'No views yet. Use "New view" above to create one, or declare a [[views]] block in cqserver.toml.'}
           </CardContent>
         </Card>
       ) : (
@@ -167,6 +169,105 @@ function ViewDetail({ view, stats }: { view: ViewInfo; stats: TopicInfo | undefi
         </pre>
       </CardContent>
     </>
+  );
+}
+
+function CreateViewForm() {
+  const qc = useQueryClient();
+  const catalog = useQuery({
+    queryKey: ['catalog'],
+    queryFn: adminApi.catalog,
+    refetchInterval: 10_000,
+  });
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [source, setSource] = useState('');
+  const [sql, setSql] = useState('');
+
+  const sources = useMemo(
+    () =>
+      (catalog.data ?? [])
+        .filter((e) => e.kind === 'topic')
+        .map((e) => e.name)
+        .sort(),
+    [catalog.data],
+  );
+
+  const create = useMutation({
+    mutationFn: () => adminApi.createView({ name: name.trim(), source, sql }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['views'] });
+      qc.invalidateQueries({ queryKey: ['catalog'] });
+      setName('');
+      setSql('');
+    },
+  });
+
+  const canSubmit = !!name.trim() && !!source && !!sql.trim() && !create.isPending;
+  const inputCls =
+    'h-8 px-2 rounded-md border border-border bg-input font-mono text-[12.5px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring';
+
+  if (!open) {
+    return (
+      <Button variant="secondary" size="sm" className="mb-3" onClick={() => setOpen(true)}>
+        <Plus size={11} /> New view
+      </Button>
+    );
+  }
+
+  return (
+    <Card className="mb-3">
+      <CardHeader className="pb-2 border-b border-border flex flex-row items-center justify-between">
+        <CardTitle>Create view</CardTitle>
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </CardHeader>
+      <CardContent className="pt-3 space-y-2.5">
+        <div className="grid grid-cols-2 gap-2.5">
+          <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+            View name
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="/v_my_view"
+              className={inputCls}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+            Source topic
+            <select value={source} onChange={(e) => setSource(e.target.value)} className={inputCls}>
+              <option value="">Select a source…</option>
+              {sources.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+          SQL — aggregate query; FROM is interpreted as the source topic
+          <textarea
+            value={sql}
+            onChange={(e) => setSql(e.target.value)}
+            rows={5}
+            spellCheck={false}
+            placeholder={'SELECT issuer_sector, COUNT(*) AS n\nFROM positions\nGROUP BY issuer_sector'}
+            className="px-2 py-1.5 rounded-md border border-border bg-input font-mono text-[12px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+        </label>
+        <div className="flex items-center gap-2">
+          <Button size="sm" onClick={() => create.mutate()} disabled={!canSubmit}>
+            {create.isPending ? 'Creating…' : 'Create view'}
+          </Button>
+          {create.isError ? (
+            <span className="text-[11.5px] text-err">{(create.error as Error).message}</span>
+          ) : null}
+          {create.isSuccess ? <span className="text-[11.5px] text-ok">Created ✓</span> : null}
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
