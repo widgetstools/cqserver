@@ -203,6 +203,12 @@ function CreateViewForm() {
     },
   });
 
+  // Clear a settled "Created ✓" / error badge as soon as the user edits
+  // again, so stale feedback never lingers over a fresh draft.
+  const clearStale = () => {
+    if (create.isSuccess || create.isError) create.reset();
+  };
+
   const canSubmit = !!name.trim() && !!source && !!sql.trim() && !create.isPending;
   const inputCls =
     'h-8 px-2 rounded-md border border-border bg-input font-mono text-[12.5px] text-foreground focus:outline-none focus:ring-1 focus:ring-ring';
@@ -229,14 +235,24 @@ function CreateViewForm() {
             View name
             <input
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                clearStale();
+                setName(e.target.value);
+              }}
               placeholder="/v_my_view"
               className={inputCls}
             />
           </label>
           <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
             Source topic
-            <select value={source} onChange={(e) => setSource(e.target.value)} className={inputCls}>
+            <select
+              value={source}
+              onChange={(e) => {
+                clearStale();
+                setSource(e.target.value);
+              }}
+              className={inputCls}
+            >
               <option value="">Select a source…</option>
               {sources.map((s) => (
                 <option key={s} value={s}>
@@ -250,7 +266,10 @@ function CreateViewForm() {
           SQL — aggregate query; FROM is interpreted as the source topic
           <textarea
             value={sql}
-            onChange={(e) => setSql(e.target.value)}
+            onChange={(e) => {
+              clearStale();
+              setSql(e.target.value);
+            }}
             rows={5}
             spellCheck={false}
             placeholder={'SELECT issuer_sector, COUNT(*) AS n\nFROM positions\nGROUP BY issuer_sector'}
