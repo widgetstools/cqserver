@@ -178,6 +178,25 @@ sql = """
   GROUP BY book_id, book_name
 """
 
+# ── ex01: Grand-total KPI strip ────────────────────────────────────
+# Degenerate (no GROUP BY) aggregate over all positions — emits ONE
+# continuously-updated totals row. ex01's KPI strip reads this single
+# row instead of summing /v_pnl_by_book rows on the client.
+[[views]]
+name = "/v_book_totals"
+source = "/positions"
+sql = """
+  SELECT SUM(exposure_gross)      AS exposure_gross,
+         SUM(market_value_usd)    AS market_value,
+         SUM(unrealized_pnl_usd)  AS unrealized_pnl,
+         SUM(realized_pnl_usd)    AS realized_pnl,
+         SUM(day_pnl)             AS day_pnl,
+         SUM(ytd_pnl)             AS ytd_pnl,
+         SUM(var_1d_95)           AS var_95,
+         COUNT(*)                 AS n_positions
+  FROM positions
+"""
+
 # Compliance-status counter — one row per status bucket. The Live PnL
 # tab uses this for the "Compliance Breaches" KPI by looking up the
 # row where compliance_status = 'BREACH'.
