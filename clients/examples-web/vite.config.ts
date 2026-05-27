@@ -47,5 +47,17 @@ export default defineConfig({
   server: {
     port: 5175,
     strictPort: false,
+    proxy: {
+      // The query-builder schema catalog is served by cqserver's admin
+      // HTTP port (:8085), a different origin from this dev server
+      // (:5175). Proxy it same-origin under /cq-admin so the browser
+      // fetch needs no CORS. window.CQ_ADMIN_URL can override the base
+      // for standalone deploys (see src/lib/catalog.ts).
+      '/cq-admin': {
+        target: 'http://127.0.0.1:8085',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/cq-admin/, ''),
+      },
+    },
   },
 });
