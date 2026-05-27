@@ -77,6 +77,12 @@ impl Value {
             Value::Double(v) if !v.is_nan() => Some(*v),
             Value::Long(v) if *v != NULL_LONG => Some(*v as f64),
             Value::Int(v) if *v != NULL_INT => Some(*v as f64),
+            // R7 — timestamps coerce to their underlying i64 µs since
+            // epoch so AMPS-style time arithmetic (`WHERE ts > NOW() -
+            // 86400000000`) works through the NumExpr path. f64 has
+            // 53 bits of mantissa — plenty for any post-1970 µs value
+            // (1.7e18 max vs 9e15 mantissa range; safe for ~2255 CE).
+            Value::Timestamp(v) if *v != NULL_TIMESTAMP => Some(*v as f64),
             _ => None,
         }
     }

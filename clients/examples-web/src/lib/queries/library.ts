@@ -2,6 +2,22 @@
 // concrete cqserver feature against the positions + trades dataset.
 // The query builder example reads from this; users can edit + re-run
 // in place.
+//
+// AMPS dialect notes:
+//   * Times use NOW() returning microseconds since epoch. AMPS does
+//     not understand `INTERVAL '1 day'`, so "last N hours" is written
+//     `NOW() - <microseconds>` (1h = 3_600_000_000, 24h = 86_400_000_000).
+//   * Regex uses `MATCHES_REGEX(col, '<pattern>')`, not Postgres `~*`.
+//   * PIVOT is a FROM-clause modifier:
+//     `FROM topic PIVOT (SUM(v) FOR col IN ('a','b')) AS p`.
+//     There is no `PIVOT (col)` shorthand after GROUP BY.
+//   * Materialised views are configured in cqserver.toml (XML/TOML),
+//     not via DDL — there is no `CREATE [MATERIALIZED] VIEW`. The
+//     "view" examples below query existing pre-configured views.
+//   * Boolean filters use `col IS TRUE`/`col IS NOT TRUE` (SQL three-
+//     valued logic; NULL is neither true nor false).
+//   * JOIN uses `USING (...)` or `ON a.col = b.col` against real
+//     registered topics. There is no `[BROADCAST]` hint.
 
 export type QueryFeature = 'join' | 'filter' | 'agg' | 'pivot' | 'view' | 'window';
 
@@ -15,21 +31,21 @@ export interface QueryEntry {
   explain?: string;
 }
 
+const ONE_DAY_US = 86_400_000_000;
+const ONE_HOUR_US = 3_600_000_000;
+
 export const QUERIES: QueryEntry[] = [
   // ── JOINS ────────────────────────────────────────────────
   {
     id: 'jn-1',
     title: 'Equi-join: positions × trades',
     feature: 'join',
-    synopsis: 'Inner equi-join on position_id — the canonical relational case.',
-    sql: `SELECT p.position_id, p.symbol, p.book_name, p.market_value_usd,
-       t.trade_id, t.side, t.quantity AS trade_qty,
-       t.price, t.trade_ts
-FROM positions p
-JOIN trades t ON t.position_id = p.position_id
-ORDER BY t.trade_ts DESC
-LIMIT 500;`,
-    explain: 'HASH_JOIN positions × trades · build:positions · probe:trades · rows≈500',
+    synopsis: 'Inner equi-join on position_id — the canonical relational case. AMPS supports JOIN ... USING (col).',
+    sql: `SELECT position_id, book_name, market_value_usd, compliance_status,
+       trade_id, side, quantity, price
+FROM positions
+JOIN trades USING (position_id);`,
+    explain: 'HASH_JOIN positions × trades · USING (position_id) · runs server-side via execute_join_query',
   },
   {
     id: 'jn-2',
@@ -37,6 +53,7 @@ LIMIT 500;`,
     feature: 'join',
     synopsis: 'Two-key equi-join plus a side filter — broker tape.',
     sql: `SELECT p.book_name, t.broker, t.execution_algo,
+       COUNT(*)                       AS n_trades,
        SUM(t.notional_usd)            AS gross,
        SUM(t.total_fees_usd)          AS fees,
        AVG(t.slippage_arrival_bps)    AS avg_slip
@@ -50,14 +67,14 @@ HAVING COUNT(*) > 10;`,
   },
   {
     id: 'jn-3',
-    title: 'Broadcast join — reference issuers',
+    title: 'JOIN with securities reference',
     feature: 'join',
-    synopsis: 'Broadcast issuers across shards so the join is local.',
-    sql: `SELECT t.trade_id, t.symbol, t.notional_usd,
-       i.country, i.region, i.sector
-FROM trades t
-JOIN [BROADCAST] issuers i ON i.symbol = t.symbol;`,
-    explain: 'BROADCAST_JOIN · build:issuers(48 rows) · probe:trades · zero-copy',
+    synopsis: 'Enrich trades with the securities reference topic via USING (cusip).',
+    sql: `SELECT trade_id, symbol, notional_usd,
+       issuer, sector, currency
+FROM trades
+JOIN securities USING (cusip);`,
+    explain: 'HASH_JOIN trades × securities · USING (cusip)',
   },
   {
     id: 'jn-4',
@@ -75,13 +92,13 @@ ORDER BY t.trade_ts;`,
   },
   {
     id: 'jn-5',
-    title: 'LEFT join — trades with optional research note',
+    title: 'LEFT join — trades with optional issuer ref',
     feature: 'join',
-    synopsis: 'Outer join — most trades have no research_note_id; left join preserves them.',
-    sql: `SELECT t.trade_id, t.symbol, t.signal_id, t.signal_strength,
-       r.author, r.headline
+    synopsis: 'Outer join — preserves trades whose cusip is not yet in /securities.',
+    sql: `SELECT t.trade_id, t.symbol, t.notional_usd,
+       s.issuer, s.sector
 FROM trades t
-LEFT JOIN research_notes r ON r.note_id = t.research_note_id;`,
+LEFT JOIN securities s USING (cusip);`,
   },
 
   // ── FILTERS ──────────────────────────────────────────────
@@ -95,7 +112,7 @@ FROM positions
 WHERE compliance_status IN ('BREACH','WARNING')
   AND ABS(market_value_usd) > 5000000
   AND NOT (restricted_flag IS TRUE)
-ORDER BY ABS(market_value_usd) DESC;`,
+ORDER BY market_value_usd DESC;`,
   },
   {
     id: 'fl-2',
@@ -112,16 +129,16 @@ WHERE execution_venue IN ('NYSE','NASDAQ','BATS')
     id: 'fl-3',
     title: 'Regex match — issuer search',
     feature: 'filter',
-    synopsis: 'POSIX regex on issuer name.',
+    synopsis: 'AMPS-native MATCHES_REGEX(col, pattern). Case-insensitive via the (?i) flag.',
     sql: `SELECT position_id, issuer, symbol, currency
 FROM positions
-WHERE issuer ~* '^(JPMorgan|Goldman|Morgan Stanley)';`,
+WHERE MATCHES_REGEX(issuer, '(?i)^(JPMorgan|Goldman|Morgan Stanley)');`,
   },
   {
     id: 'fl-4',
     title: 'NULL-handling filter',
     feature: 'filter',
-    synopsis: 'IS NULL / COALESCE — the two correct ways to handle missing data.',
+    synopsis: 'IS TRUE / IS NOT NULL / COALESCE — the AMPS-native ways to handle missing data.',
     sql: `SELECT position_id, restricted_flag,
        COALESCE(restriction_reason, 'NONE') AS reason
 FROM positions
@@ -129,15 +146,14 @@ WHERE restricted_flag IS TRUE OR restriction_reason IS NOT NULL;`,
   },
   {
     id: 'fl-5',
-    title: 'Anti-join: positions with no trades today',
+    title: 'Anti-join: positions with no recent trades',
     feature: 'filter',
-    synopsis: 'NOT EXISTS — find positions untraded today.',
-    sql: `SELECT p.position_id, p.symbol, p.book_name, p.market_value_usd
-FROM positions p
+    synopsis: 'NOT EXISTS against /trades. Uses NOW() - microseconds (AMPS-native; no INTERVAL literal).',
+    sql: `SELECT position_id, symbol, book_name, market_value_usd
+FROM positions
 WHERE NOT EXISTS (
-  SELECT 1 FROM trades t
-  WHERE t.position_id = p.position_id
-    AND t.trade_ts > now() - INTERVAL '1 day'
+  SELECT 1 FROM trades
+  WHERE trade_ts > NOW() - ${ONE_DAY_US}
 );`,
   },
 
@@ -161,15 +177,13 @@ ORDER BY day_pnl DESC;`,
     id: 'ag-2',
     title: 'Percentile slippage by algo',
     feature: 'agg',
-    synopsis: 'PERCENTILE_CONT for execution quality reporting.',
+    synopsis: 'PERCENTILE_CONT(col, q) — AMPS two-arg form (column first, q in [0,1]).',
     sql: `SELECT execution_algo,
-       COUNT(*)                                            AS n,
-       AVG(slippage_arrival_bps)                           AS avg,
-       PERCENTILE_CONT(0.50) WITHIN GROUP
-         (ORDER BY ABS(slippage_arrival_bps))              AS p50,
-       PERCENTILE_CONT(0.95) WITHIN GROUP
-         (ORDER BY ABS(slippage_arrival_bps))              AS p95,
-       STDDEV(slippage_arrival_bps)                        AS std
+       COUNT(*)                                 AS n,
+       AVG(slippage_arrival_bps)                AS avg,
+       PERCENTILE_CONT(slippage_arrival_bps, 0.50) AS p50,
+       PERCENTILE_CONT(slippage_arrival_bps, 0.95) AS p95,
+       STDDEV(slippage_arrival_bps)             AS std
 FROM trades
 GROUP BY execution_algo;`,
   },
@@ -189,27 +203,28 @@ GROUP BY book_name;`,
     id: 'ag-4',
     title: 'Greatest contributors — top-N',
     feature: 'agg',
-    synopsis: 'TOP N + HAVING — surface the meaningful PnL drivers only.',
+    synopsis: 'TOP N + HAVING on the aggregate alias.',
     sql: `SELECT issuer_sector,
        SUM(unrealized_pnl_usd) AS sector_upnl,
        COUNT(*)                AS n
 FROM positions
 GROUP BY issuer_sector
-HAVING ABS(SUM(unrealized_pnl_usd)) > 100000
-ORDER BY ABS(sector_upnl) DESC
+HAVING SUM(unrealized_pnl_usd) > 100000
+ORDER BY sector_upnl DESC
 LIMIT 10;`,
   },
   {
     id: 'ag-5',
-    title: 'Weighted average price',
+    title: 'Weighted average price (VWAP)',
     feature: 'agg',
-    synopsis: 'Notional-weighted average — the right aggregator for fills.',
+    synopsis: 'Notional-weighted average — feed SUM(price*qty) and SUM(qty) as separate aggregates; the demo computes VWAP client-side from those columns.',
     sql: `SELECT symbol,
-       SUM(price * quantity_filled) / NULLIF(SUM(quantity_filled),0) AS vwap,
-       SUM(notional_usd) AS total_notional,
-       COUNT(*)          AS n_trades
+       SUM(price * quantity_filled) AS num,
+       SUM(quantity_filled)         AS den,
+       SUM(notional_usd)            AS total_notional,
+       COUNT(*)                     AS n_trades
 FROM trades
-WHERE trade_ts > now() - INTERVAL '1 day'
+WHERE trade_ts > NOW() - ${ONE_DAY_US}
 GROUP BY symbol
 HAVING SUM(quantity_filled) > 0;`,
   },
@@ -217,91 +232,57 @@ HAVING SUM(quantity_filled) > 0;`,
   // ── PIVOTS ───────────────────────────────────────────────
   {
     id: 'pv-1',
-    title: 'Pivot: asset class × currency',
+    title: 'Pivot: asset class × currency (static IN list)',
     feature: 'pivot',
-    synopsis: 'Two-dim pivot of MV — the cross-asset risk map.',
-    sql: `SELECT asset_class, currency, SUM(market_value_usd) AS mv
+    synopsis: 'AMPS PIVOT as a FROM-clause modifier with an explicit IN-list.',
+    sql: `SELECT *
 FROM positions
-GROUP BY asset_class, currency
-PIVOT (currency);`,
+PIVOT (SUM(market_value_usd) FOR currency IN ('USD', 'EUR', 'GBP', 'JPY')) AS p;`,
   },
   {
     id: 'pv-2',
-    title: 'Pivot: sector × region (intraday)',
+    title: 'Pivot: sector × region (dynamic IN ANY)',
     feature: 'pivot',
-    synopsis: 'The dataset powering the ticking heatmap example.',
-    sql: `SELECT issuer_sector, issuer_region,
-       SUM(market_value_usd * price_change_pct / 100)
-         / NULLIF(SUM(market_value_usd),0) * 100 AS intraday_pct
+    synopsis: 'Dynamic AMPS PIVOT — the executor discovers region values from the data.',
+    sql: `SELECT *
 FROM positions
-WHERE asset_class = 'EQUITY'
-GROUP BY issuer_sector, issuer_region
-PIVOT (issuer_region);`,
+PIVOT (SUM(market_value_usd) FOR issuer_region IN ANY) AS p
+WHERE asset_class = 'EQUITY';`,
   },
   {
     id: 'pv-3',
     title: 'Multi-measure pivot',
     feature: 'pivot',
-    synopsis: 'Two measures (mv, var) emitted side-by-side.',
-    sql: `SELECT book_name,
-       SUM(market_value_usd)   AS mv,
-       SUM(var_1d_95)          AS var,
-       SUM(dv01_usd)           AS dv01
+    synopsis: 'Two measures pivoted in one shot — AMPS supports comma-separated aggregate list.',
+    sql: `SELECT *
 FROM positions
-GROUP BY book_name, asset_class
-PIVOT (asset_class FOR mv, var, dv01);`,
+PIVOT (SUM(market_value_usd), SUM(var_1d_95) FOR asset_class IN ('EQUITY','RATES','CREDIT','FX')) AS p;`,
   },
 
   // ── VIEWS ────────────────────────────────────────────────
+  // AMPS materialised views are configured in cqserver.toml — there
+  // is no `CREATE VIEW` DDL. Below we query the pre-configured views
+  // shipped with the demo config.
   {
     id: 'vw-1',
-    title: 'View: live PnL summary',
+    title: 'View: live PnL by book',
     feature: 'view',
-    synopsis: 'Materialized view — server-side aggregation, incremental refresh.',
-    sql: `CREATE MATERIALIZED VIEW live_pnl AS
-SELECT book_id, book_name, trader_name, issuer_sector,
-       SUM(market_value_usd)   AS gross_mv,
-       SUM(unrealized_pnl_usd) AS unrealized,
-       SUM(realized_pnl_usd)   AS realized,
-       SUM(day_pnl)            AS day_pnl,
-       COUNT(*)                AS n_positions
-FROM positions
-GROUP BY book_id, book_name, trader_name, issuer_sector;`,
+    synopsis: 'Read from the pre-configured /v_pnl_by_book materialised view.',
+    sql: `SELECT * FROM v_pnl_by_book ORDER BY day_pnl DESC;`,
   },
   {
     id: 'vw-2',
     title: 'View: net exposure',
     feature: 'view',
-    synopsis: 'A view consumed by the materialized-view example.',
-    sql: `CREATE MATERIALIZED VIEW net_exposure AS
-SELECT book_id, book_name, asset_class, currency,
-       SUM(market_value_usd) AS net_mv_usd,
-       SUM(exposure_gross)   AS gross_exposure,
-       SUM(dv01_usd)         AS net_dv01,
-       SUM(var_1d_95)        AS sum_var,
-       MAX(risk_limit_utilization_pct) AS worst_util_pct,
-       COUNT(*)              AS n_positions
-FROM positions
-GROUP BY book_id, book_name, asset_class, currency;`,
+    synopsis: 'Read from /v_net_exposure — an aggregation view defined in cqserver.toml.',
+    sql: `SELECT * FROM v_net_exposure ORDER BY net_mv_usd DESC;`,
   },
   {
     id: 'vw-3',
-    title: 'Layered view — fees per book',
+    title: 'View: trades-by-compliance counts',
     feature: 'view',
-    synopsis: 'A view defined on top of another view.',
-    sql: `CREATE VIEW fees_per_book AS
-SELECT book_id,
-       SUM(commission)       AS commission,
-       SUM(total_fees_usd)   AS total_fees,
-       AVG(commission_bps)   AS avg_comm_bps
-FROM trades
-GROUP BY book_id;
-
-CREATE VIEW pnl_net_of_fees AS
-SELECT lp.book_name, lp.unrealized + lp.realized AS gross_pnl,
-       lp.unrealized + lp.realized - fpb.total_fees AS net_pnl
-FROM live_pnl lp
-JOIN fees_per_book fpb ON fpb.book_id = lp.book_id;`,
+    synopsis: 'Pre-aggregated view over /trades exposed as its own topic.',
+    sql: `SELECT * FROM v_trades_by_compliance;`,
   },
 
   // ── WINDOWS ──────────────────────────────────────────────
@@ -309,7 +290,7 @@ JOIN fees_per_book fpb ON fpb.book_id = lp.book_id;`,
     id: 'wn-1',
     title: 'Rolling 50-trade slippage',
     feature: 'window',
-    synopsis: 'Streaming ROWS BETWEEN — the canonical rolling average.',
+    synopsis: 'Streaming ROWS BETWEEN — the canonical rolling average (R9).',
     sql: `SELECT trade_ts, execution_algo, slippage_vwap_bps,
        AVG(slippage_vwap_bps) OVER (
          PARTITION BY execution_algo
@@ -321,12 +302,11 @@ ORDER BY trade_ts DESC;`,
   },
   {
     id: 'wn-2',
-    title: 'LAG — price change tape',
+    title: 'LAG — prior price tape',
     feature: 'window',
-    synopsis: 'Tape that includes the prior trade price for the same symbol.',
+    synopsis: 'LAG(price) per symbol, emitted alongside current price. The demo computes the delta client-side.',
     sql: `SELECT trade_ts, symbol, price,
-       LAG(price)  OVER (PARTITION BY symbol ORDER BY trade_ts) AS prev_price,
-       price - LAG(price) OVER (PARTITION BY symbol ORDER BY trade_ts) AS dp
+       LAG(price) OVER (PARTITION BY symbol ORDER BY trade_ts) AS prev_price
 FROM trades
 ORDER BY trade_ts DESC;`,
   },
@@ -334,20 +314,20 @@ ORDER BY trade_ts DESC;`,
     id: 'wn-3',
     title: 'RANK by book contribution',
     feature: 'window',
-    synopsis: 'Per-sector PnL rank across books.',
+    synopsis: 'RANK() OVER per sector — uses an inline derived table (R10).',
     sql: `SELECT book_name, issuer_sector, day_pnl,
        RANK() OVER (PARTITION BY issuer_sector ORDER BY day_pnl DESC) AS rk
 FROM (
   SELECT book_name, issuer_sector, SUM(day_pnl) AS day_pnl
   FROM positions
   GROUP BY book_name, issuer_sector
-) g;`,
+) AS g;`,
   },
   {
     id: 'wn-4',
     title: 'NTILE — slippage quartiles',
     feature: 'window',
-    synopsis: 'Bucket trades into 4 slippage tiers per algo.',
+    synopsis: 'Bucket trades into 4 slippage tiers per algo (R5).',
     sql: `SELECT trade_id, execution_algo, slippage_arrival_bps,
        NTILE(4) OVER (PARTITION BY execution_algo ORDER BY slippage_arrival_bps) AS tier
 FROM trades;`,
@@ -358,26 +338,24 @@ FROM trades;`,
     id: 'mx-1',
     title: 'Risk concentration: top-5 per book',
     feature: 'window',
-    synopsis: 'JOIN + RANK + WHERE = textbook top-N-per-group.',
+    synopsis: 'JOIN + RANK + WHERE = textbook top-N-per-group, via derived table (R10).',
     sql: `SELECT * FROM (
   SELECT book_name, symbol, market_value_usd,
-         ROW_NUMBER() OVER (PARTITION BY book_name ORDER BY ABS(market_value_usd) DESC) AS rn
+         ROW_NUMBER() OVER (PARTITION BY book_name ORDER BY market_value_usd DESC) AS rn
   FROM positions
-) WHERE rn <= 5;`,
+) AS r WHERE rn <= 5;`,
   },
   {
     id: 'mx-2',
     title: 'Net fees by venue, last 24h',
     feature: 'agg',
-    synopsis: 'Aggregation + recency filter.',
+    synopsis: 'Aggregation + recency filter using NOW() - microseconds (AMPS-native).',
     sql: `SELECT execution_venue,
-       COUNT(*)                 AS n_trades,
-       SUM(total_fees_usd)      AS total_fees,
-       SUM(notional_usd)        AS gross_notional,
-       SUM(total_fees_usd) / NULLIF(SUM(notional_usd),0) * 10000
-         AS effective_bps
+       COUNT(*)              AS n_trades,
+       SUM(total_fees_usd)   AS total_fees,
+       SUM(notional_usd)     AS gross_notional
 FROM trades
-WHERE trade_ts > now() - INTERVAL '24 hours'
+WHERE trade_ts > NOW() - ${ONE_DAY_US}
 GROUP BY execution_venue
 ORDER BY total_fees DESC;`,
   },
@@ -385,14 +363,14 @@ ORDER BY total_fees DESC;`,
     id: 'mx-3',
     title: 'Risk-limit breach report',
     feature: 'filter',
-    synopsis: 'JOIN + filter — surface every position above its limit.',
-    sql: `SELECT p.book_name, p.symbol, p.position_id,
-       p.market_value_usd, p.risk_limit_var, p.var_1d_95,
-       p.risk_limit_utilization_pct
-FROM positions p
-WHERE p.var_1d_95 > p.risk_limit_var
-   OR p.risk_limit_utilization_pct > 90
-ORDER BY p.risk_limit_utilization_pct DESC;`,
+    synopsis: 'Column-vs-column comparison — surface every position above its limit.',
+    sql: `SELECT book_name, symbol, position_id,
+       market_value_usd, risk_limit_var, var_1d_95,
+       risk_limit_utilization_pct
+FROM positions
+WHERE var_1d_95 > risk_limit_var
+   OR risk_limit_utilization_pct > 90
+ORDER BY risk_limit_utilization_pct DESC;`,
   },
 ];
 
@@ -404,3 +382,7 @@ export const QUERIES_BY_FEATURE: Record<QueryFeature, QueryEntry[]> = {
   view:   QUERIES.filter((q) => q.feature === 'view'),
   window: QUERIES.filter((q) => q.feature === 'window'),
 };
+
+// Silence unused warnings for the convenience constant that's not
+// referenced after string interpolation.
+void ONE_HOUR_US;

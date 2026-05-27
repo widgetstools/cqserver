@@ -1,0 +1,188 @@
+# Window functions added in Q7 — ROW_NUMBER, RANK, DENSE_RANK, LAG,
+# LEAD over an explicit PARTITION BY + ORDER BY. We pin every case
+# against DataFusion so any drift in tie-breaking, NULL handling, or
+# offset semantics surfaces.
+#
+# Reminder: ordering inside a partition is only deterministic when
+# `ORDER BY` is explicit. Without it, RANK / ROW_NUMBER pick an
+# arbitrary order and the case would be flaky against any engine.
+
+- name: row_number_partition_by_desk
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: px, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES",    px: 100.0 }
+    - { id: 2, desk: "RATES",    px: 200.0 }
+    - { id: 3, desk: "EQUITIES", px: 50.0 }
+    - { id: 4, desk: "RATES",    px: 150.0 }
+    - { id: 5, desk: "EQUITIES", px: 75.0 }
+  query: "SELECT desk, px, ROW_NUMBER() OVER (PARTITION BY desk ORDER BY px) AS rn FROM t ORDER BY desk, px"
+  expected_rows:
+    - { desk: "EQUITIES", px: 50.0,  rn: 1 }
+    - { desk: "EQUITIES", px: 75.0,  rn: 2 }
+    - { desk: "RATES",    px: 100.0, rn: 1 }
+    - { desk: "RATES",    px: 150.0, rn: 2 }
+    - { desk: "RATES",    px: 200.0, rn: 3 }
+  notes: |
+    Per-partition row numbers, ascending px. Outer ORDER BY is added
+    to give the harness a deterministic comparison order — the
+    harness uppercase-greps for "ORDER BY" and treats any case with
+    one (including OVER-clause ones) as an ordered-comparison case.
+
+- name: row_number_no_partition_global_rank
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 30 }
+    - { id: 2, v: 10 }
+    - { id: 3, v: 20 }
+  query: "SELECT id, v, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM t ORDER BY v"
+  expected_rows:
+    - { id: 2, v: 10, rn: 1 }
+    - { id: 3, v: 20, rn: 2 }
+    - { id: 1, v: 30, rn: 3 }
+  notes: |
+    Empty PARTITION BY → single global ordering.
+
+- name: rank_with_ties
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 100 }
+    - { id: 3, v: 200 }
+    - { id: 4, v: 300 }
+  query: "SELECT id, v, RANK() OVER (ORDER BY v) AS r FROM t ORDER BY id"
+  expected_rows:
+    - { id: 1, v: 100, r: 1 }
+    - { id: 2, v: 100, r: 1 }
+    - { id: 3, v: 200, r: 3 }
+    - { id: 4, v: 300, r: 4 }
+  notes: |
+    RANK leaves gaps after ties: 1, 1, 3, 4 (NOT 1, 1, 2, 3).
+
+- name: dense_rank_no_gaps
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 100 }
+    - { id: 3, v: 200 }
+    - { id: 4, v: 300 }
+  query: "SELECT id, v, DENSE_RANK() OVER (ORDER BY v) AS r FROM t ORDER BY id"
+  expected_rows:
+    - { id: 1, v: 100, r: 1 }
+    - { id: 2, v: 100, r: 1 }
+    - { id: 3, v: 200, r: 2 }
+    - { id: 4, v: 300, r: 3 }
+  notes: |
+    DENSE_RANK collapses ties without gaps: 1, 1, 2, 3.
+
+- name: rank_per_partition
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: px, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES",    px: 100.0 }
+    - { id: 2, desk: "RATES",    px: 100.0 }
+    - { id: 3, desk: "RATES",    px: 200.0 }
+    - { id: 4, desk: "EQUITIES", px: 50.0 }
+    - { id: 5, desk: "EQUITIES", px: 75.0 }
+  query: "SELECT desk, px, RANK() OVER (PARTITION BY desk ORDER BY px) AS r FROM t ORDER BY desk, px"
+  expected_rows:
+    - { desk: "EQUITIES", px: 50.0,  r: 1 }
+    - { desk: "EQUITIES", px: 75.0,  r: 2 }
+    - { desk: "RATES",    px: 100.0, r: 1 }
+    - { desk: "RATES",    px: 100.0, r: 1 }
+    - { desk: "RATES",    px: 200.0, r: 3 }
+  notes: |
+    Ranks reset to 1 at each partition boundary.
+
+- name: lag_default_offset_1
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: px, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES", px: 100.0 }
+    - { id: 2, desk: "RATES", px: 200.0 }
+    - { id: 3, desk: "RATES", px: 300.0 }
+  query: "SELECT id, px, LAG(px) OVER (PARTITION BY desk ORDER BY id) AS prev FROM t ORDER BY id"
+  expected_rows:
+    - { id: 1, px: 100.0 }
+    - { id: 2, px: 200.0, prev: 100.0 }
+    - { id: 3, px: 300.0, prev: 200.0 }
+  notes: |
+    First row of each partition has no previous → NULL.
+
+- name: lead_default_offset_1
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: px, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES", px: 100.0 }
+    - { id: 2, desk: "RATES", px: 200.0 }
+    - { id: 3, desk: "RATES", px: 300.0 }
+  query: "SELECT id, px, LEAD(px) OVER (PARTITION BY desk ORDER BY id) AS nxt FROM t ORDER BY id"
+  expected_rows:
+    - { id: 1, px: 100.0, nxt: 200.0 }
+    - { id: 2, px: 200.0, nxt: 300.0 }
+    - { id: 3, px: 300.0 }
+  notes: |
+    Last row of each partition has no next → NULL.
+
+- name: lag_offset_two
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30 }
+    - { id: 4, v: 40 }
+    - { id: 5, v: 50 }
+  query: "SELECT id, v, LAG(v, 2) OVER (ORDER BY id) AS lag2 FROM t ORDER BY id"
+  expected_rows:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30, lag2: 10 }
+    - { id: 4, v: 40, lag2: 20 }
+    - { id: 5, v: 50, lag2: 30 }
+  notes: |
+    LAG(v, 2): rows 1+2 have no value 2 back → NULL.
+
+- name: lead_offset_two
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 10 }
+    - { id: 2, v: 20 }
+    - { id: 3, v: 30 }
+    - { id: 4, v: 40 }
+    - { id: 5, v: 50 }
+  query: "SELECT id, v, LEAD(v, 2) OVER (ORDER BY id) AS lead2 FROM t ORDER BY id"
+  expected_rows:
+    - { id: 1, v: 10, lead2: 30 }
+    - { id: 2, v: 20, lead2: 40 }
+    - { id: 3, v: 30, lead2: 50 }
+    - { id: 4, v: 40 }
+    - { id: 5, v: 50 }
+  notes: |
+    LEAD(v, 2): last 2 rows have no value 2 ahead → NULL.

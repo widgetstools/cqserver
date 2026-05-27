@@ -516,7 +516,7 @@ up to the disk bandwidth ceiling.
 ### 6.2 The demo data loader
 
 The repo ships a working example in TypeScript at
-[`clients/ts/examples/load-fi-data.ts`](../clients/ts/examples/load-fi-data.ts).
+[`client-sdks/ts/examples/load-fi-data.ts`](../client-sdks/ts/examples/load-fi-data.ts).
 It reads pre-generated JSON files and publishes ~947K rows across
 seven topics in under a minute. Pattern:
 
@@ -1391,7 +1391,7 @@ let sub = c.sow_and_subscribe("/trades", None, None).await?;
 npm install @cqserver/client
 ```
 
-(Or `path` to the workspace `clients/ts/` during dev.)
+(Or `path` to the workspace `client-sdks/ts/` during dev.)
 
 ### 16.2 Full example (Node)
 
@@ -1433,7 +1433,7 @@ const c = await SharedWorkerClient.connect('ws://localhost:9008/cq/json');
 // each tab's subscriptions multiplex on top.
 ```
 
-See [`clients/ts/README.md`](../clients/ts/README.md) for the
+See [`client-sdks/ts/README.md`](../client-sdks/ts/README.md) for the
 SharedWorker pattern + browser-specific caveats.
 
 ### 16.5 Method reference (camelCase, matching the JS convention)
@@ -1462,7 +1462,7 @@ delta has `deltaType`, `data`, `sequence`, `subId` fields.
 ### 17.1 Installation
 
 ```sh
-cd clients/python
+cd client-sdks/python
 pip install -e .
 ```
 
@@ -1680,4 +1680,4 @@ keeps speaking the older dialect to older clients indefinitely.
 - [`docs/deploy/replica-reads.md`](deploy/replica-reads.md) — multi-host deployment guide
 - [`PRODUCTION_READINESS.md`](../PRODUCTION_READINESS.md) — gap analysis + roadmap
 - Worklogs at the repo root: `HIGH_SCALE_WORKLOG.md`, `REPLICA_READS_WORKLOG.md`, `QUERY_GUARDRAILS_WORKLOG.md`, `ADMIN_UI_WORKLOG.md`, `CLOUD_REPLICATION_TEST_WORKLOG.md`
-- SDK READMEs: [`clients/python/README.md`](../clients/python/README.md), [`clients/ts/README.md`](../clients/ts/README.md)
+- SDK READMEs: [`client-sdks/python/README.md`](../client-sdks/python/README.md), [`client-sdks/ts/README.md`](../client-sdks/ts/README.md)

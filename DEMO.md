@@ -44,15 +44,15 @@ conflation), `/trades` (persisted to txlog), `/positions` (50 ms conflation).
 
 ## 2. Generate the JSON data files (one-shot)
 
-From `clients/ts`:
+From `client-sdks/ts`:
 
 ```sh
-cd clients/ts
+cd client-sdks/ts
 npm install            # first time only
 npm run generate-fi-data
 ```
 
-This writes four files under `clients/ts/examples/data/`:
+This writes four files under `client-sdks/ts/examples/data/`:
 
 | File | Rows | Approx size |
 |---|---|---|
@@ -135,7 +135,7 @@ Expected output after the loader has run: 500 securities, ~100k trades,
 | Schema discovery | First publish on a topic locks the schema |
 | Persisted topic + replay | Restart server — `/trades` recovers from txlog |
 | Prometheus metrics | <http://localhost:8085/metrics> |
-| Cross-language clients | Same demo can drive from `clients/python` or `crates/cq-client` |
+| Cross-language clients | Same demo can drive from `client-sdks/python` or `crates/cq-client` |
 
 ## Troubleshooting
 

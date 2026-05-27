@@ -126,3 +126,156 @@ fn sort_by_desk(rows: &[RowMap]) -> Vec<RowMap> {
     });
     v
 }
+
+// ───── Diversification: edge cases + interactions ─────────────────
+
+/// Aliased column in HAVING — `HAVING SUM(t.qty) > N`. Verifies the
+/// alias rewrite reaches the HAVING expression (it's compiled
+/// separately from WHERE).
+#[tokio::test]
+async fn aliased_column_works_in_having() {
+    let topic = TopicSpec::new("/alias-having", "k").with_inline_columns([
+        ("k", "string"),
+        ("desk", "string"),
+        ("qty", "long"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    for (k, desk, qty) in [
+        ("a1", "RATES", 100_i64),
+        ("a2", "RATES", 50),
+        ("a3", "EQUITIES", 30),
+        ("a4", "FX", 10),
+    ] {
+        client
+            .publish("/alias-having", json!({ "k": k, "desk": desk, "qty": qty }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let rows = client
+        .sow_sql(
+            "/alias-having",
+            "SELECT t.desk, SUM(t.qty) AS s FROM t \
+             GROUP BY t.desk HAVING SUM(t.qty) > 25",
+        )
+        .await
+        .expect("aliased HAVING sow");
+    let names: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|r| r.get("desk").unwrap().as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains("RATES"));
+    assert!(names.contains("EQUITIES"));
+    assert!(!names.contains("FX"), "FX (sum=10) must be filtered");
+}
+
+/// Alias on a column that contains NULLs — the predicate `t.col IS
+/// NULL` and the projection `t.col` must both work uniformly.
+#[tokio::test]
+async fn aliased_refs_handle_null_columns() {
+    let topic = TopicSpec::new("/alias-null", "k").with_inline_columns([
+        ("k", "string"),
+        ("note", "string"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    client
+        .publish("/alias-null", json!({ "k": "k1", "note": "hello" }))
+        .await
+        .unwrap();
+    client
+        .publish("/alias-null", json!({ "k": "k2" })) // no note
+        .await
+        .unwrap();
+    client
+        .publish("/alias-null", json!({ "k": "k3", "note": null }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let nulls = client
+        .sow_sql("/alias-null", "SELECT t.k FROM t WHERE t.note IS NULL")
+        .await
+        .expect("aliased IS NULL sow");
+    let null_keys: std::collections::HashSet<String> = nulls
+        .iter()
+        .map(|r| r.get("k").unwrap().as_str().unwrap().to_string())
+        .collect();
+    assert!(null_keys.contains("k2") && null_keys.contains("k3"));
+    assert!(!null_keys.contains("k1"));
+
+    let non_null = client
+        .sow_sql(
+            "/alias-null",
+            "SELECT t.k, t.note FROM t WHERE t.note IS NOT NULL",
+        )
+        .await
+        .expect("aliased IS NOT NULL sow");
+    assert_eq!(non_null.len(), 1);
+    assert_eq!(non_null[0].get("k").unwrap().as_str().unwrap(), "k1");
+}
+
+/// Alias + WHERE on multiple aliased columns with AND/OR.
+#[tokio::test]
+async fn aliased_compound_predicate_matches_unaliased() {
+    let topic = TopicSpec::new("/alias-compound", "k").with_inline_columns([
+        ("k", "string"),
+        ("desk", "string"),
+        ("price", "double"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    for (k, desk, p) in [
+        ("c1", "RATES", 100.0),
+        ("c2", "RATES", 250.0),
+        ("c3", "EQUITIES", 50.0),
+        ("c4", "EQUITIES", 600.0),
+    ] {
+        client
+            .publish("/alias-compound", json!({ "k": k, "desk": desk, "price": p }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let aliased = client
+        .sow_sql(
+            "/alias-compound",
+            "SELECT t.k FROM t WHERE (t.desk = 'RATES' AND t.price > 200) \
+             OR (t.desk = 'EQUITIES' AND t.price < 100)",
+        )
+        .await
+        .expect("aliased compound sow");
+    let plain = client
+        .sow_sql(
+            "/alias-compound",
+            "SELECT k FROM t WHERE (desk = 'RATES' AND price > 200) \
+             OR (desk = 'EQUITIES' AND price < 100)",
+        )
+        .await
+        .expect("plain compound sow");
+    assert_eq!(sort_by_k(&aliased), sort_by_k(&plain));
+    assert_eq!(aliased.len(), 2, "c2 + c3 expected");
+}
+
+/// Empty topic → aliased query returns 0 rows with no error.
+#[tokio::test]
+async fn aliased_query_against_empty_topic_returns_no_rows() {
+    let topic = TopicSpec::new("/alias-empty", "k").with_inline_columns([
+        ("k", "string"),
+        ("v", "long"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    let rows = client
+        .sow_sql("/alias-empty", "SELECT t.k, t.v FROM t WHERE t.v > 0")
+        .await
+        .expect("empty-topic aliased sow");
+    assert!(rows.is_empty());
+}

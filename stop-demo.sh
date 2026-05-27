@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUN_DIR="$ROOT/.demo-run"
 
 # Ports the demo BINDS (anything listening here is presumed demo state).
-LISTEN_PORTS=(9007 9008 8085 5173)
+LISTEN_PORTS=(9007 9008 8085 5173 5175)
 # cqserver's TCP data port — any ESTABLISHED client here is a demo
 # client process (publisher, loader, etc.). We do NOT sweep clients of
 # 9008 because those are browser tabs.
@@ -61,7 +61,7 @@ client_pids=$(lsof -ti :"$CLIENT_PORT" -sTCP:ESTABLISHED 2>/dev/null | sort -u |
 # ── Phase 1: tracked PIDs from start-demo.sh ───────────────────
 if [ -d "$RUN_DIR" ]; then
   printf "${c_blue}▸ Phase 1: tracked processes${c_reset}\n"
-  for name in react-demo publisher server; do
+  for name in react-demo examples-web publisher server; do
     pidfile="$RUN_DIR/${name}.pid"
     if [ -f "$pidfile" ]; then
       pid=$(cat "$pidfile" 2>/dev/null || echo "")

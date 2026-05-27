@@ -77,3 +77,176 @@ async fn aggregating_subscription_e2e() {
     }
     assert!(saw_rates_150, "expected RATES total to update to 150 after the publish");
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// Aggregating subscription with COUNT(*) — verify count increments
+/// on new rows, decrements on deletes.
+#[tokio::test]
+async fn count_aggregate_subscription_tracks_row_count() {
+    let topic = TopicSpec::new("/agg-count", "k")
+        .with_inline_columns([("k", "string"), ("desk", "string")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    client
+        .publish("/agg-count", json!({ "k": "a", "desk": "X" }))
+        .await
+        .unwrap();
+    client
+        .publish("/agg-count", json!({ "k": "b", "desk": "X" }))
+        .await
+        .unwrap();
+
+    let mut sub = client
+        .sow_and_subscribe_sql(
+            "/agg-count",
+            "SELECT desk, COUNT(*) AS c FROM t GROUP BY desk",
+        )
+        .await
+        .unwrap();
+
+    // Snapshot: X → 2.
+    let mut snapshot_done = false;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next_delta()).await {
+            Ok(Some(d)) => {
+                if d.data.get("desk").and_then(Value::as_str) == Some("X")
+                    && d.data.get("c").and_then(Value::as_i64) == Some(2)
+                {
+                    snapshot_done = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(snapshot_done, "snapshot must show X=2");
+
+    // Add a 3rd X row → c becomes 3.
+    client
+        .publish("/agg-count", json!({ "k": "c", "desk": "X" }))
+        .await
+        .unwrap();
+
+    let mut saw_count_3 = false;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next_delta()).await {
+            Ok(Some(d)) => {
+                if d.data.get("desk").and_then(Value::as_str) == Some("X")
+                    && d.data.get("c").and_then(Value::as_i64) == Some(3)
+                {
+                    saw_count_3 = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_count_3, "expected X count to advance to 3");
+}
+
+/// MIN/MAX aggregate subscription — verify the deltas track the
+/// minimum/maximum across updates.
+#[tokio::test]
+async fn min_max_aggregate_subscription_tracks_extremes() {
+    let topic = TopicSpec::new("/agg-mm", "k")
+        .with_inline_columns([("k", "string"), ("desk", "string"), ("px", "double")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    client
+        .publish("/agg-mm", json!({ "k": "a", "desk": "RATES", "px": 100.0 }))
+        .await
+        .unwrap();
+    client
+        .publish("/agg-mm", json!({ "k": "b", "desk": "RATES", "px": 200.0 }))
+        .await
+        .unwrap();
+
+    let mut sub = client
+        .sow_and_subscribe_sql(
+            "/agg-mm",
+            "SELECT desk, MIN(px) AS lo, MAX(px) AS hi FROM t GROUP BY desk",
+        )
+        .await
+        .unwrap();
+
+    // Snapshot — RATES lo=100, hi=200.
+    let mut got_snap = false;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next_delta()).await {
+            Ok(Some(d)) => {
+                let lo = d.data.get("lo").and_then(Value::as_f64);
+                let hi = d.data.get("hi").and_then(Value::as_f64);
+                if lo == Some(100.0) && hi == Some(200.0) {
+                    got_snap = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(got_snap, "snapshot RATES lo=100, hi=200");
+
+    // New row pushes hi → 300.
+    client
+        .publish("/agg-mm", json!({ "k": "c", "desk": "RATES", "px": 300.0 }))
+        .await
+        .unwrap();
+
+    let mut saw_300 = false;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next_delta()).await {
+            Ok(Some(d)) => {
+                if d.data.get("hi").and_then(Value::as_f64) == Some(300.0) {
+                    saw_300 = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_300, "expected hi to advance to 300");
+}
+
+/// Aggregate sub with no rows initially — should emit snapshot end
+/// with no rows; then deltas as rows arrive.
+#[tokio::test]
+async fn aggregate_sub_empty_topic_then_first_publish() {
+    let topic = TopicSpec::new("/agg-late", "k")
+        .with_inline_columns([("k", "string"), ("g", "string"), ("v", "long")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    let mut sub = client
+        .sow_and_subscribe_sql(
+            "/agg-late",
+            "SELECT g, SUM(v) AS s FROM t GROUP BY g",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // First publish — should produce an Add delta for group "A".
+    client
+        .publish("/agg-late", json!({ "k": "k1", "g": "A", "v": 42 }))
+        .await
+        .unwrap();
+
+    let mut saw_a_42 = false;
+    for _ in 0..3 {
+        match tokio::time::timeout(Duration::from_millis(700), sub.next_delta()).await {
+            Ok(Some(d)) => {
+                if d.data.get("g").and_then(Value::as_str) == Some("A")
+                    && d.data.get("s").and_then(Value::as_i64) == Some(42)
+                {
+                    saw_a_42 = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_a_42, "expected first-publish to create group A with s=42");
+}

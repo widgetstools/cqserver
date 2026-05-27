@@ -30,7 +30,11 @@ const now = Date.UTC(2026, 4, 22, 14, 0, 0); // fixed clock → deterministic ts
 
 function pad(n: number, w: number) { return n.toString().padStart(w, '0'); }
 function dateStr(ts: number) { return new Date(ts).toISOString().slice(0, 10); }
-function dateTimeStr(ts: number) { return new Date(ts).toISOString().replace('Z', ''); }
+// Canonical RFC 3339 with trailing `Z` — required by cqserver's native
+// timestamp type so the JSON-string parse keeps the UTC anchor explicit.
+// The trailing-Z-strip used in earlier versions was a workaround for a
+// legacy schema that treated *_ts columns as plain strings.
+function dateTimeStr(ts: number) { return new Date(ts).toISOString(); }
 
 function priceForAsset(rng: Rng, ac: string): number {
   switch (ac) {
@@ -261,6 +265,8 @@ export function generatePositions(count = 480, seed = 0x42abcd): Position[] {
       market_value: mvLocal,
       market_value_local: mvLocal,
       market_value_usd: mvUsd,
+      mv_x_pct: mvUsd * (((lastLocal - prevClose) / prevClose) * 100),
+      mv_abs: Math.abs(mvUsd),
       cost_basis: costBasisLocal,
       cost_basis_local: costBasisLocal,
       cost_basis_usd: costBasisUsd,

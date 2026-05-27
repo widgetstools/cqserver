@@ -194,6 +194,37 @@ pub enum CompiledPredicate {
     IsNotNull {
         col: usize,
     },
+    /// R12 — `<bool-col> IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE`.
+    /// `IS TRUE` is `value == true` (NULL is NOT true), `IS NOT TRUE`
+    /// is `value != true OR NULL` (matches NULL too). Same for FALSE.
+    /// This mirrors SQL three-valued logic.
+    IsBool {
+        col: usize,
+        want_true: bool,
+        negated: bool,
+    },
+
+    /// R2 — Generic numeric-expression comparison. Used by anything
+    /// the simpler `EqLong/GtDouble/...` variants can't cover:
+    ///   - Scalar functions: `WHERE ABS(col) > N`, `ROUND(x, 2) >= K`
+    ///   - WHERE-side arithmetic: `WHERE a + b > 100`
+    ///   - Two-column comparison: `WHERE col1 > col2`
+    /// The RHS is always reduced to an f64 at compile time (literal
+    /// or constant-folded expression); the LHS NumExpr is walked
+    /// per-row.
+    CompareNum {
+        expr: NumExpr,
+        op: NumCmpOp,
+        value: f64,
+    },
+
+    /// R2 — `NumExpr BETWEEN low AND high`. Inclusive on both sides
+    /// to match SQL semantics.
+    BetweenNum {
+        expr: NumExpr,
+        low: f64,
+        high: f64,
+    },
 
     // ---- Combinators ----
     And(Box<CompiledPredicate>, Box<CompiledPredicate>),
@@ -260,8 +291,12 @@ impl CompiledPredicate {
             | LikeStringFn { col, .. }
             | LengthCmp { col, .. }
             | IsNull { col }
-            | IsNotNull { col } => out.push(*col),
+            | IsNotNull { col }
+            | IsBool { col, .. } => out.push(*col),
             EqStringExpr { expr, .. } | NeqStringExpr { expr, .. } | LikeStringExpr { expr, .. } => {
+                expr.referenced_columns(out);
+            }
+            CompareNum { expr, .. } | BetweenNum { expr, .. } => {
                 expr.referenced_columns(out);
             }
             And(a, b) | Or(a, b) => {
@@ -387,6 +422,142 @@ impl NumCmpOp {
             NumCmpOp::Le => lhs <= rhs,
             NumCmpOp::Gt => lhs > rhs,
             NumCmpOp::Ge => lhs >= rhs,
+        }
+    }
+
+    /// R2 — f64 comparison used by the scalar-expression predicate.
+    /// NaN never satisfies any comparison (mirrors SQL three-valued
+    /// logic: NULL ≠ anything, including itself).
+    fn apply_f64(&self, lhs: f64, rhs: f64) -> bool {
+        if lhs.is_nan() || rhs.is_nan() {
+            return false;
+        }
+        match self {
+            NumCmpOp::Eq => lhs == rhs,
+            NumCmpOp::Neq => lhs != rhs,
+            NumCmpOp::Lt => lhs < rhs,
+            NumCmpOp::Le => lhs <= rhs,
+            NumCmpOp::Gt => lhs > rhs,
+            NumCmpOp::Ge => lhs >= rhs,
+        }
+    }
+}
+
+/// R2 — Mini AST for numeric expressions in WHERE / HAVING clauses.
+/// Mirrors `StringExpr` in shape. Used by `CompareNum` /
+/// `BetweenNum` to evaluate `ABS(col)`, `ROUND(col, 2)`, `a + b`,
+/// `col1 - col2`, etc. against each row. Every leaf is either a
+/// column read (coerced to f64 via the store's `value_as_f64`) or a
+/// literal; intermediate ops are pure f64 arithmetic.
+///
+/// Why f64 throughout: AMPS evaluates scalar arithmetic in
+/// double-precision regardless of the column's storage type. Mixing
+/// Long + Double in `WHERE qty * price > N` is the common case;
+/// promoting everything to f64 matches AMPS's behaviour and
+/// sidesteps a combinatorial expansion of typed variants.
+#[derive(Debug, Clone)]
+pub enum NumExpr {
+    Col(usize),
+    Lit(f64),
+    Add(Box<NumExpr>, Box<NumExpr>),
+    Sub(Box<NumExpr>, Box<NumExpr>),
+    Mul(Box<NumExpr>, Box<NumExpr>),
+    Div(Box<NumExpr>, Box<NumExpr>),
+    Neg(Box<NumExpr>),
+    Abs(Box<NumExpr>),
+    Round(Box<NumExpr>),
+    Floor(Box<NumExpr>),
+    Ceil(Box<NumExpr>),
+    /// R4 — `COALESCE(a, b, …)`: first non-NaN argument. Empty list
+    /// rejected at parse time.
+    Coalesce(Vec<NumExpr>),
+    /// R4 — `NULLIF(a, b)`: NaN when a == b, else a. The "guard
+    /// against division by zero" pattern: `SUM(x) / NULLIF(SUM(y), 0)`.
+    NullIf(Box<NumExpr>, Box<NumExpr>),
+    /// R7 — `NOW()`: current wall-clock time in microseconds since
+    /// the UNIX epoch, evaluated ONCE at compile time. AMPS's
+    /// time-window queries (`WHERE ts > NOW() - 86400000000` for
+    /// "last 24h") use this together with NumExpr arithmetic. The
+    /// constant frozen at compile time matches AMPS's "snapshot
+    /// clock" semantics — every row in one SOW sees the same NOW.
+    NowMicros(i64),
+}
+
+impl NumExpr {
+    /// Walk the expression and append every referenced column index
+    /// to `out`. Used by `collect_referenced` + view evaluators.
+    pub fn referenced_columns(&self, out: &mut Vec<usize>) {
+        match self {
+            NumExpr::Col(c) => out.push(*c),
+            NumExpr::Lit(_) => {}
+            NumExpr::Add(a, b) | NumExpr::Sub(a, b) | NumExpr::Mul(a, b) | NumExpr::Div(a, b) => {
+                a.referenced_columns(out);
+                b.referenced_columns(out);
+            }
+            NumExpr::Neg(x)
+            | NumExpr::Abs(x)
+            | NumExpr::Round(x)
+            | NumExpr::Floor(x)
+            | NumExpr::Ceil(x) => x.referenced_columns(out),
+            NumExpr::Coalesce(parts) => {
+                for p in parts {
+                    p.referenced_columns(out);
+                }
+            }
+            NumExpr::NullIf(a, b) => {
+                a.referenced_columns(out);
+                b.referenced_columns(out);
+            }
+            NumExpr::NowMicros(_) => {}
+        }
+    }
+
+    /// Evaluate against the store at `row`. Returns NaN for any
+    /// operand that's NULL (so downstream comparisons via
+    /// `NumCmpOp::apply_f64` correctly produce false — matching
+    /// AMPS's "NULL propagates" semantics for arithmetic).
+    pub fn eval(&self, store: &ColumnStore, row: u32) -> f64 {
+        match self {
+            NumExpr::Col(c) => {
+                let v = store.get(*c, row);
+                v.as_f64().unwrap_or(f64::NAN)
+            }
+            NumExpr::Lit(v) => *v,
+            NumExpr::Add(a, b) => a.eval(store, row) + b.eval(store, row),
+            NumExpr::Sub(a, b) => a.eval(store, row) - b.eval(store, row),
+            NumExpr::Mul(a, b) => a.eval(store, row) * b.eval(store, row),
+            NumExpr::Div(a, b) => {
+                let rhs = b.eval(store, row);
+                if rhs == 0.0 {
+                    f64::NAN
+                } else {
+                    a.eval(store, row) / rhs
+                }
+            }
+            NumExpr::Neg(x) => -x.eval(store, row),
+            NumExpr::Abs(x) => x.eval(store, row).abs(),
+            NumExpr::Round(x) => x.eval(store, row).round(),
+            NumExpr::Floor(x) => x.eval(store, row).floor(),
+            NumExpr::Ceil(x) => x.eval(store, row).ceil(),
+            NumExpr::Coalesce(parts) => {
+                for p in parts {
+                    let v = p.eval(store, row);
+                    if !v.is_nan() {
+                        return v;
+                    }
+                }
+                f64::NAN
+            }
+            NumExpr::NullIf(a, b) => {
+                let av = a.eval(store, row);
+                let bv = b.eval(store, row);
+                if !av.is_nan() && !bv.is_nan() && av == bv {
+                    f64::NAN
+                } else {
+                    av
+                }
+            }
+            NumExpr::NowMicros(t) => *t as f64,
         }
     }
 }
@@ -609,6 +780,27 @@ impl CompiledPredicate {
                     ColumnType::Bytes => !store.get(*col, row).is_null(),
                 }
             }
+            // R12 — IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE.
+            CompiledPredicate::IsBool { col, want_true, negated } => {
+                let matches_target = match store.get_bool(*col, row) {
+                    Some(v) => v == *want_true,
+                    // SQL three-valued logic: NULL is neither true nor
+                    // false. `IS TRUE` of NULL is false; `IS NOT TRUE`
+                    // of NULL is true (the negated branch handles it).
+                    None => false,
+                };
+                if *negated { !matches_target } else { matches_target }
+            }
+
+            // R2 — generic NumExpr comparison + BETWEEN.
+            CompiledPredicate::CompareNum { expr, op, value } => {
+                let v = expr.eval(store, row);
+                op.apply_f64(v, *value)
+            }
+            CompiledPredicate::BetweenNum { expr, low, high } => {
+                let v = expr.eval(store, row);
+                !v.is_nan() && v >= *low && v <= *high
+            }
 
             // ---- Combinators ----
             CompiledPredicate::And(left, right) => {
@@ -774,6 +966,26 @@ pub fn compile_expr(
             Ok(CompiledPredicate::IsNotNull { col })
         }
 
+        // R12 — `<bool-col> IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE`.
+        // Per SQL three-valued logic, IS TRUE matches only true (NULL
+        // and FALSE both fail); IS NOT TRUE matches false OR NULL.
+        Expr::IsTrue(inner) => {
+            let col = resolve_column(inner, schema)?;
+            Ok(CompiledPredicate::IsBool { col, want_true: true, negated: false })
+        }
+        Expr::IsNotTrue(inner) => {
+            let col = resolve_column(inner, schema)?;
+            Ok(CompiledPredicate::IsBool { col, want_true: true, negated: true })
+        }
+        Expr::IsFalse(inner) => {
+            let col = resolve_column(inner, schema)?;
+            Ok(CompiledPredicate::IsBool { col, want_true: false, negated: false })
+        }
+        Expr::IsNotFalse(inner) => {
+            let col = resolve_column(inner, schema)?;
+            Ok(CompiledPredicate::IsBool { col, want_true: false, negated: true })
+        }
+
         Expr::Like {
             negated,
             expr: col_expr,
@@ -881,6 +1093,25 @@ pub fn compile_expr(
             low,
             high,
         } => {
+            // R2 — when LHS isn't a bare column (function call,
+            // arithmetic, etc.), fall through to BetweenNum which
+            // evaluates the NumExpr per row.
+            if !matches!(col_expr.as_ref(), Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                if let Some(num_lhs) = try_compile_num_expr(col_expr, schema) {
+                    let low_f = extract_f64(low)?;
+                    let high_f = extract_f64(high)?;
+                    let pred = CompiledPredicate::BetweenNum {
+                        expr: num_lhs,
+                        low: low_f,
+                        high: high_f,
+                    };
+                    return Ok(if *negated {
+                        CompiledPredicate::Not(Box::new(pred))
+                    } else {
+                        pred
+                    });
+                }
+            }
             let col = resolve_column(col_expr, schema)?;
             let col_type = schema.column_type(col);
             let pred = match col_type {
@@ -1056,6 +1287,95 @@ fn compile_comparison(
             op: cmp_op,
             value: n,
         });
+    }
+
+    // R2 — try compiling LHS as a NumExpr (scalar function / arithmetic
+    // over columns). This is what unlocks AMPS-style filters like
+    // `WHERE ABS(slippage) > 5`, `WHERE a + b > 100`, `WHERE col1 >
+    // col2`. The bare-column-vs-literal path below remains the fast
+    // path for the common case; we only enter the NumExpr branch when
+    // LHS is structured.
+    if !matches!(left, sqlparser::ast::Expr::Identifier(_)) {
+        if let Some(num_lhs) = try_compile_num_expr(left, schema) {
+            let cmp_op = match op {
+                BinaryOperator::Eq => NumCmpOp::Eq,
+                BinaryOperator::NotEq => NumCmpOp::Neq,
+                BinaryOperator::Lt => NumCmpOp::Lt,
+                BinaryOperator::LtEq => NumCmpOp::Le,
+                BinaryOperator::Gt => NumCmpOp::Gt,
+                BinaryOperator::GtEq => NumCmpOp::Ge,
+                _ => {
+                    return Err(PredicateError::UnsupportedOperator(format!(
+                        "{:?} not supported on numeric expressions",
+                        op
+                    )));
+                }
+            };
+            // RHS — accept either a literal OR another NumExpr (col vs
+            // col). For NumExpr-vs-NumExpr we fold by subtracting and
+            // comparing the difference to 0.
+            if let Ok(value) = extract_f64(right) {
+                return Ok(CompiledPredicate::CompareNum {
+                    expr: num_lhs,
+                    op: cmp_op,
+                    value,
+                });
+            }
+            if let Some(num_rhs) = try_compile_num_expr(right, schema) {
+                return Ok(CompiledPredicate::CompareNum {
+                    expr: NumExpr::Sub(Box::new(num_lhs), Box::new(num_rhs)),
+                    op: cmp_op,
+                    value: 0.0,
+                });
+            }
+        }
+    }
+
+    // R2 (mirror) — bare-column LHS but NumExpr-shaped RHS: `WHERE
+    // col1 > col2 + 5` or `WHERE qty > NULLIF(...)`. The col-vs-col
+    // case where both sides resolve to bare columns of the SAME type
+    // still goes through the typed fast path; only mixed shapes land
+    // here.
+    if matches!(left, sqlparser::ast::Expr::Identifier(_))
+        && !matches!(right, sqlparser::ast::Expr::Value(_))
+    {
+        if let (Some(num_lhs), Some(num_rhs)) = (
+            try_compile_num_expr(left, schema),
+            try_compile_num_expr(right, schema),
+        ) {
+            // Only take this branch if RHS is actually structured
+            // (function / arithmetic / column ref) — a pure literal
+            // RHS belongs to the typed fast path below.
+            let rhs_is_structured = !matches!(
+                right,
+                sqlparser::ast::Expr::Value(_)
+                    | sqlparser::ast::Expr::UnaryOp {
+                        op: sqlparser::ast::UnaryOperator::Minus,
+                        expr: _,
+                    }
+            ) || matches!(right, sqlparser::ast::Expr::BinaryOp { .. });
+            if rhs_is_structured {
+                let cmp_op = match op {
+                    BinaryOperator::Eq => NumCmpOp::Eq,
+                    BinaryOperator::NotEq => NumCmpOp::Neq,
+                    BinaryOperator::Lt => NumCmpOp::Lt,
+                    BinaryOperator::LtEq => NumCmpOp::Le,
+                    BinaryOperator::Gt => NumCmpOp::Gt,
+                    BinaryOperator::GtEq => NumCmpOp::Ge,
+                    _ => {
+                        return Err(PredicateError::UnsupportedOperator(format!(
+                            "{:?} not supported on numeric expressions",
+                            op
+                        )));
+                    }
+                };
+                return Ok(CompiledPredicate::CompareNum {
+                    expr: NumExpr::Sub(Box::new(num_lhs), Box::new(num_rhs)),
+                    op: cmp_op,
+                    value: 0.0,
+                });
+            }
+        }
     }
 
     let col = resolve_column(left, schema)?;
@@ -1391,7 +1711,182 @@ fn resolve_column(
     }
 }
 
-/// Extract a string value from a SQL literal.
+/// R2 — try to compile a SQL expression as a numeric expression
+/// (column read / literal / arithmetic / scalar function). Returns
+/// `None` if the expression isn't num-shaped (e.g. a string literal,
+/// a string column) so the caller can fall back to its other paths.
+///
+/// Supported:
+///   - Bare column reference on a numeric column (Long / Int / Double)
+///   - Numeric literal (integer or float)
+///   - Unary `-` and `+`
+///   - Binary `+ - * /` (any combination of NumExprs)
+///   - `ABS(x)`, `ROUND(x)`, `FLOOR(x)`, `CEIL(x)`
+///   - Parenthesised expressions
+///
+/// Why use a try-compile (return Option) instead of an error: the
+/// caller (compile_comparison) needs to fall back to the
+/// string-fn / bare-column paths if the LHS isn't num-shaped. An
+/// error would mask those legitimate paths.
+pub(crate) fn try_compile_num_expr(
+    expr: &sqlparser::ast::Expr,
+    schema: &Schema,
+) -> Option<NumExpr> {
+    use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan};
+    match expr {
+        Expr::Nested(inner) => try_compile_num_expr(inner, schema),
+        Expr::Identifier(id) => {
+            let col = schema.index_of(&id.value)?;
+            match schema.column_type(col) {
+                ColumnType::Long
+                | ColumnType::Int
+                | ColumnType::Double
+                | ColumnType::Timestamp => Some(NumExpr::Col(col)),
+                _ => None,
+            }
+        }
+        Expr::CompoundIdentifier(parts) => {
+            // P1's qualified-ref rewriter strips alias prefixes before
+            // we get here, so any compound identifier that survives is
+            // either a single-part fallback or something we can't
+            // resolve.
+            if parts.len() == 1 {
+                let col = schema.index_of(&parts[0].value)?;
+                match schema.column_type(col) {
+                    ColumnType::Long | ColumnType::Int | ColumnType::Double => Some(NumExpr::Col(col)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            Value::Number(s, _) => s.parse::<f64>().ok().map(NumExpr::Lit),
+            _ => None,
+        },
+        Expr::UnaryOp { op, expr: inner } => match op {
+            UnaryOperator::Minus => {
+                Some(NumExpr::Neg(Box::new(try_compile_num_expr(inner, schema)?)))
+            }
+            UnaryOperator::Plus => try_compile_num_expr(inner, schema),
+            _ => None,
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let ctor: fn(Box<NumExpr>, Box<NumExpr>) -> NumExpr = match op {
+                BinaryOperator::Plus => |a, b| NumExpr::Add(a, b),
+                BinaryOperator::Minus => |a, b| NumExpr::Sub(a, b),
+                BinaryOperator::Multiply => |a, b| NumExpr::Mul(a, b),
+                BinaryOperator::Divide => |a, b| NumExpr::Div(a, b),
+                _ => return None,
+            };
+            let l = try_compile_num_expr(left, schema)?;
+            let r = try_compile_num_expr(right, schema)?;
+            Some(ctor(Box::new(l), Box::new(r)))
+        }
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_uppercase();
+            let args = match &f.args {
+                sqlparser::ast::FunctionArguments::List(list) => &list.args,
+                _ => return None,
+            };
+            // R7 — NOW() takes zero arguments and returns the
+            // current time in microseconds since UNIX epoch.
+            // Evaluated AT COMPILE TIME so the resulting predicate
+            // has a stable reference clock.
+            if name == "NOW" && args.is_empty() {
+                let micros = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0);
+                return Some(NumExpr::NowMicros(micros));
+            }
+            // R4 — multi-arg variants (COALESCE / NULLIF) first.
+            if matches!(name.as_str(), "COALESCE" | "NULLIF") {
+                return try_compile_multi_arg_num_fn(f, schema);
+            }
+            // Single-arg numeric scalar functions (ABS / ROUND).
+            if args.len() != 1 {
+                return None;
+            }
+            let arg_expr = match &args[0] {
+                sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(e),
+                ) => e,
+                _ => return None,
+            };
+            let inner = try_compile_num_expr(arg_expr, schema)?;
+            match name.as_str() {
+                "ABS" => Some(NumExpr::Abs(Box::new(inner))),
+                "ROUND" => Some(NumExpr::Round(Box::new(inner))),
+                _ => None,
+            }
+        }
+        // sqlparser 0.56 promotes FLOOR/CEIL/CEILING to dedicated
+        // AST variants rather than generic Function nodes, so we
+        // dispatch on them separately. `field` is the (rarely-used)
+        // `FLOOR(x TO MONTH)` ANSI extension — ignored for now;
+        // returning None for non-empty field would silently fall back
+        // to the bare-column path and produce a confusing error.
+        Expr::Floor { expr, .. } => Some(NumExpr::Floor(Box::new(
+            try_compile_num_expr(expr, schema)?,
+        ))),
+        Expr::Ceil { expr, .. } => Some(NumExpr::Ceil(Box::new(
+            try_compile_num_expr(expr, schema)?,
+        ))),
+        _ => None,
+    }
+}
+
+/// R4 — multi-arg numeric scalar functions (COALESCE / NULLIF).
+/// Called by `try_compile_num_expr`'s function arm before the
+/// single-arg gate. Returns None for unrecognised names so the
+/// outer caller can fall back to its other paths.
+fn try_compile_multi_arg_num_fn(
+    f: &sqlparser::ast::Function,
+    schema: &Schema,
+) -> Option<NumExpr> {
+    let name = f.name.to_string().to_ascii_uppercase();
+    let args = match &f.args {
+        sqlparser::ast::FunctionArguments::List(list) => &list.args,
+        _ => return None,
+    };
+    let arg_exprs = args
+        .iter()
+        .map(|a| match a {
+            sqlparser::ast::FunctionArg::Unnamed(
+                sqlparser::ast::FunctionArgExpr::Expr(e),
+            ) => Some(e),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match name.as_str() {
+        "COALESCE" => {
+            if arg_exprs.is_empty() {
+                return None;
+            }
+            let parts = arg_exprs
+                .iter()
+                .map(|e| try_compile_num_expr(e, schema))
+                .collect::<Option<Vec<_>>>()?;
+            Some(NumExpr::Coalesce(parts))
+        }
+        "NULLIF" => {
+            if arg_exprs.len() != 2 {
+                return None;
+            }
+            let a = try_compile_num_expr(arg_exprs[0], schema)?;
+            let b = try_compile_num_expr(arg_exprs[1], schema)?;
+            Some(NumExpr::NullIf(Box::new(a), Box::new(b)))
+        }
+        _ => None,
+    }
+}
+
+/// Extract a string value from a SQL literal. Handles a unary minus
+/// in front of a number literal (`-44`) by prepending `-` to the
+/// stringified number; sqlparser models that as `UnaryOp { Minus, ... }`
+/// rather than a signed `Number`, and downstream parsers (`extract_i64`,
+/// `extract_f64`) handle the leading sign natively.
 pub(crate) fn extract_string_value(expr: &sqlparser::ast::Expr) -> Result<String, PredicateError> {
     match expr {
         sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan { value, .. }) => match value {
@@ -1400,6 +1895,14 @@ pub(crate) fn extract_string_value(expr: &sqlparser::ast::Expr) -> Result<String
             sqlparser::ast::Value::Number(s, _) => Ok(s.clone()),
             _ => Err(PredicateError::InvalidLiteral(format!("{:?}", value))),
         },
+        sqlparser::ast::Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr: inner,
+        } => Ok(format!("-{}", extract_string_value(inner)?)),
+        sqlparser::ast::Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Plus,
+            expr: inner,
+        } => extract_string_value(inner),
         _ => Err(PredicateError::InvalidLiteral(format!("{:?}", expr))),
     }
 }

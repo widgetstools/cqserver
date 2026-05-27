@@ -112,3 +112,160 @@ async fn row_filter_restricts_alice_to_rates_desk() {
         "alice + (desk='EQUITIES' AND desk='RATES') should be empty, got {alice_rows:?}"
     );
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// Row filter combined with client-supplied filter — narrows further, never widens.
+#[tokio::test]
+async fn row_filter_intersects_with_client_filter() {
+    let topic = TopicSpec::new("/ent-narrow", "k").with_inline_columns([
+        ("k", "string"),
+        ("desk", "string"),
+        ("price", "double"),
+    ]);
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: Vec::new(),
+            auth: Some(AuthOpts {
+                users: vec![
+                    UserSpec {
+                        username: "alice".into(),
+                        password_hash: bcrypt_hash("pw"),
+                        entitlements: vec!["*:*".into()],
+                        row_filter: Some("desk = 'RATES'".into()),
+                    },
+                    UserSpec {
+                        username: "publisher".into(),
+                        password_hash: bcrypt_hash("pw"),
+                        entitlements: vec!["*:*".into()],
+                        row_filter: None,
+                    },
+                ],
+                jwt: None,
+            }),
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+
+    let publisher = Client::connect(&server.tcp_url()).await.unwrap();
+    publisher.logon("publisher", "pw").await.unwrap();
+    for (k, desk, p) in [
+        ("T1", "RATES", 50.0),
+        ("T2", "RATES", 150.0),
+        ("T3", "RATES", 250.0),
+        ("T4", "EQUITIES", 999.0),
+    ] {
+        publisher
+            .publish("/ent-narrow", json!({ "k": k, "desk": desk, "price": p }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let alice = Client::connect(&server.tcp_url()).await.unwrap();
+    alice.logon("alice", "pw").await.unwrap();
+    // Client filter further restricts to price > 100.
+    let rows = alice
+        .sow("/ent-narrow", Some("price > 100"))
+        .await
+        .unwrap();
+    let mut keys: Vec<String> = rows
+        .iter()
+        .map(|r| r.get("k").unwrap().as_str().unwrap().to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["T2", "T3"]);
+}
+
+/// Row filter that filters ALL rows for the user — empty result, no error.
+#[tokio::test]
+async fn row_filter_matching_no_rows_is_empty() {
+    let topic = TopicSpec::new("/ent-empty", "k")
+        .with_inline_columns([("k", "string"), ("desk", "string")]);
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: Vec::new(),
+            auth: Some(AuthOpts {
+                users: vec![
+                    UserSpec {
+                        username: "u".into(),
+                        password_hash: bcrypt_hash("pw"),
+                        entitlements: vec!["*:*".into()],
+                        row_filter: Some("desk = 'NONEXISTENT'".into()),
+                    },
+                ],
+                jwt: None,
+            }),
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+
+    let admin = Client::connect(&server.tcp_url()).await.unwrap();
+    admin.logon("u", "pw").await.unwrap();
+    admin
+        .publish("/ent-empty", json!({ "k": "a", "desk": "RATES" }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let rows = admin.sow("/ent-empty", None).await.unwrap();
+    assert!(rows.is_empty(),
+            "row filter matched no real desks, but got {rows:?}");
+}
+
+/// Wrong password → logon errors; no published data leaks.
+#[tokio::test]
+async fn bad_password_rejects_logon() {
+    use cq_client::ClientError;
+    let topic = TopicSpec::new("/ent-bad", "k")
+        .with_inline_columns([("k", "string")]);
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: Vec::new(),
+            auth: Some(AuthOpts {
+                users: vec![UserSpec {
+                    username: "u".into(),
+                    password_hash: bcrypt_hash("correct"),
+                    entitlements: vec!["*:*".into()],
+                    row_filter: None,
+                }],
+                jwt: None,
+            }),
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+    let c = Client::connect(&server.tcp_url()).await.unwrap();
+    let r = c.logon("u", "wrong-password").await;
+    assert!(matches!(r, Err(ClientError::Server(_))), "got {r:?}");
+
+    // Subsequent operations without successful logon should fail.
+    let r2 = c.publish("/ent-bad", json!({ "k": "x" })).await;
+    assert!(r2.is_err(), "operations after failed auth must error: {r2:?}");
+}

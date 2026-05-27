@@ -10,11 +10,30 @@ import path from 'node:path';
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
-    alias: { '@': path.resolve(__dirname, './src') },
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+      // Resolve the cqserver TS SDK to its compiled dist so the browser
+      // store and the Node publisher use exactly the same client code.
+      // Stops at the WS transport in the browser; the TCP transport
+      // (transport-node.js) is only dynamically imported when a tcp://
+      // URL is passed to Client.connect, which never happens here.
+      '@cqserver/client': path.resolve(__dirname, '../../client-sdks/ts/dist/index.js'),
+    },
   },
   build: {
     chunkSizeWarningLimit: 900,
     rollupOptions: {
+      // The SDK's `transport-node.js` imports `node:net`, `node:tls`,
+      // `node:buffer` at module top-level. It's only reachable via a
+      // dynamic import behind `Client.connect("tcp://...")` — never
+      // exercised from the browser. Externalise the node: builtins so
+      // Rollup stops trying to bundle them; the dynamic import itself
+      // is unreachable in browser code paths, so the missing runtime
+      // is never invoked.
+      external: (id) =>
+        id.startsWith('node:') ||
+        id === '../../client-sdks/ts/dist/transport-node.js' ||
+        id.endsWith('/transport-node.js'),
       output: {
         manualChunks: (id) => {
           if (id.includes('node_modules/ag-grid')) return 'ag-grid';

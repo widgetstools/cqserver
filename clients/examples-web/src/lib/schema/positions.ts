@@ -132,6 +132,10 @@ export const POSITION_COLUMNS: PositionColumn[] = [
   { field: 'market_value', label: 'MV', type: 'ccy', group: 'qty_value', signed: true },
   { field: 'market_value_local', label: 'MV Loc', type: 'ccy', group: 'qty_value', signed: true },
   { field: 'market_value_usd', label: 'MV USD', type: 'ccy', group: 'qty_value', signed: true },
+  // Pre-shaped numerator + denominator for MV-weighted aggregates
+  // (consumed by /v_heatmap_sector_region). Not displayed by default.
+  { field: 'mv_x_pct', label: 'MV·Δ%', type: 'ccy', group: 'qty_value', signed: true },
+  { field: 'mv_abs', label: 'MV abs', type: 'ccy', group: 'qty_value' },
   { field: 'cost_basis', label: 'Cost Basis', type: 'ccy', group: 'qty_value' },
   { field: 'cost_basis_local', label: 'CB Loc', type: 'ccy', group: 'qty_value' },
   { field: 'cost_basis_usd', label: 'CB USD', type: 'ccy', group: 'qty_value' },

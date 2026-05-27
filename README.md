@@ -108,7 +108,7 @@ echo '{"c":"sow_and_subscribe","cid":"s1","t":"/trades","f":"qty > 50"}' \
 Or use one of the client SDKs:
 
 ```ts
-// clients/ts
+// client-sdks/ts
 import { CqClient } from '@cqserver/client';
 const c = new CqClient('ws://127.0.0.1:9008/cq/json');
 await c.connect();

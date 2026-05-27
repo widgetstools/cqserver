@@ -16,7 +16,10 @@
     "allowImportingTsExtensions": false,
     "noEmit": true,
     "baseUrl": ".",
-    "paths": { "@/*": ["src/*"] },
+    "paths": {
+      "@/*": ["src/*"],
+      "@cqserver/client": ["../../client-sdks/ts/dist/index.d.ts"]
+    },
     "types": ["vite/client"]
   },
   "include": ["src"]

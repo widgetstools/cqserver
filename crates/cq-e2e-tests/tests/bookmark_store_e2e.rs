@@ -140,3 +140,81 @@ async fn second_client_resumes_from_persisted_bookmark() {
         );
     }
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// LocalBookmarkStore should persist across process drops + reloads,
+/// preserving multiple topics' high-waters independently.
+#[tokio::test]
+async fn local_bookmark_store_persists_multiple_topics() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bm_path = tmp.path().join("bookmarks.json");
+
+    let store = LocalBookmarkStore::load(&bm_path).expect("load empty");
+    store.record("/topic-a", 100);
+    store.record("/topic-b", 250);
+    // record(0) is a no-op (the docstring says so) — verify.
+    store.record("/topic-c", 0);
+    store.persist().expect("persist");
+
+    // Reload from disk.
+    let store2 = LocalBookmarkStore::load(&bm_path).expect("reload");
+    assert_eq!(store2.get("/topic-a"), Some(100));
+    assert_eq!(store2.get("/topic-b"), Some(250));
+    assert_eq!(store2.get("/topic-c"), None, "record(0) is a no-op");
+    assert_eq!(store2.get("/topic-d"), None, "unknown topic returns None");
+
+    // Monotonic: record a smaller value, must not regress.
+    store2.record("/topic-a", 50);
+    assert_eq!(store2.get("/topic-a"), Some(100), "must not regress");
+    // Recording a larger value advances.
+    store2.record("/topic-a", 200);
+    assert_eq!(store2.get("/topic-a"), Some(200));
+}
+
+/// Bookmark store on a fresh path returns no entries — file doesn't
+/// need to exist for `load()` to succeed.
+#[tokio::test]
+async fn local_bookmark_store_handles_missing_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing = tmp.path().join("does/not/exist.json");
+    let store = LocalBookmarkStore::load(&missing).expect("load on missing path");
+    assert!(store.get("/anything").is_none());
+}
+
+/// Subscribing without setting a bookmark store works — bookmark
+/// tracking is optional, not required.
+#[tokio::test]
+async fn subscribe_without_bookmark_store_works() {
+    let topic = TopicSpec::new("/bm-no-store", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")])
+        .with_persist();
+    let server = start_server(vec![topic]).await;
+    let producer = Client::connect(&server.tcp_url()).await.unwrap();
+
+    let client = Client::connect(&server.tcp_url()).await.unwrap();
+    // Note: NO set_bookmark_store call.
+    let mut sub = client
+        .sow_and_subscribe("/bm-no-store", None, None)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for i in 0..3 {
+        producer
+            .publish("/bm-no-store", json!({ "k": format!("k{i}"), "v": i }))
+            .await
+            .unwrap();
+    }
+
+    let mut count = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while count < 3 && std::time::Instant::now() < deadline {
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(400), sub.next_delta()).await {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(count, 3);
+}

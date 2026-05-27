@@ -327,6 +327,14 @@ impl SecondaryIndex {
         hi: Option<RangeKey>,
     ) -> Option<RoaringBitmap> {
         let inner = self.range_by_col.get(&col)?;
+        // BTreeMap::range panics when start > end. SQL `BETWEEN x AND y`
+        // with x > y is a valid query that should match zero rows, NOT
+        // crash the server. Detect the inverted range and short-circuit.
+        if let (Some(l), Some(h)) = (&lo, &hi) {
+            if l > h {
+                return Some(RoaringBitmap::new());
+            }
+        }
         let mut out = RoaringBitmap::new();
         let iter: Box<dyn Iterator<Item = (&RangeKey, &RoaringBitmap)>> = match (&lo, &hi) {
             (Some(l), Some(h)) => Box::new(inner.range(l.clone()..=h.clone())),

@@ -190,11 +190,47 @@ impl SegmentReader {
         let expected_crc = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
 
         if frame_len > MAX_ENTRY_SIZE {
+            // Trailing garbage in the active segment (e.g. filesystem
+            // padding after a power-loss, or a torn write that
+            // happened to land on bytes that decode to an impossibly
+            // large length) can fail this check. Treating it as
+            // torn-tail EOF mirrors the "Partial" arm above and lets
+            // recovery surface every COMPLETE record before the
+            // garbage. Sealed (non-active) segments cannot legitimately
+            // contain bad lengths — surface the error to the caller.
+            if is_active_segment {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    offset = self.offset,
+                    frame_len,
+                    max = MAX_ENTRY_SIZE,
+                    "Oversized frame length in active segment — treating as torn-tail EOF"
+                );
+                return Ok(None);
+            }
             return Err(TxLogError::EntryTooLarge {
                 offset: self.offset,
                 len: frame_len,
                 max: MAX_ENTRY_SIZE,
             });
+        }
+
+        // A real entry always has a positive body (header carries
+        // sequence + topic length + key length + payload length all
+        // > 0 each). A `frame_len = 0` decoded from the wire is
+        // unambiguously garbage (e.g. zero-padded sectors after a
+        // power-loss truncated the live segment). Treat as torn-tail
+        // EOF on the active segment.
+        if frame_len == 0 {
+            if is_active_segment {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    offset = self.offset,
+                    "Zero-length frame in active segment — treating as torn-tail EOF"
+                );
+                return Ok(None);
+            }
+            return Err(TxLogError::ChecksumMismatch { offset: self.offset });
         }
 
         let mut body = vec![0u8; frame_len];
@@ -210,6 +246,13 @@ impl SegmentReader {
 
         let actual_crc = crc32fast::hash(&body);
         if actual_crc != expected_crc {
+            // CRC mismatch on a plausibly-sized frame is ambiguous:
+            // it could be torn-tail garbage OR mid-log data
+            // corruption. We surface as an error rather than swallow,
+            // because the latter is a real data-integrity violation
+            // and the former is caught by the oversized + zero-length
+            // guards above (which match the actual shapes trailing
+            // garbage takes on a torn write).
             return Err(TxLogError::ChecksumMismatch {
                 offset: self.offset,
             });

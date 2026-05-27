@@ -1,0 +1,165 @@
+# HAVING (post-aggregate filter, P3) and OFFSET (post-LIMIT skip,
+# P4). HAVING in particular has subtle interactions with GROUP BY
+# alias scoping and aggregate-vs-grouped expressions; OFFSET combined
+# with LIMIT and ORDER BY is where most pagination bugs hide.
+
+- name: having_sum_gt
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: qty, type: long }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES",    qty: 100 }
+    - { id: 2, desk: "EQUITIES", qty: 200 }
+    - { id: 3, desk: "RATES",    qty: 60 }
+    - { id: 4, desk: "FX",       qty: 75 }
+    - { id: 5, desk: "RATES",    qty: 25 }
+    - { id: 6, desk: "EQUITIES", qty: 10 }
+  query: "SELECT desk, SUM(qty) AS s FROM t GROUP BY desk HAVING SUM(qty) > 100"
+  expected_rows:
+    - { desk: "RATES",    s: 185 }
+    - { desk: "EQUITIES", s: 210 }
+  notes: |
+    FX (s=75) is filtered out. RATES (185) and EQUITIES (210) survive.
+
+- name: having_count_eq
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES" }
+    - { id: 2, desk: "RATES" }
+    - { id: 3, desk: "EQUITIES" }
+    - { id: 4, desk: "FX" }
+    - { id: 5, desk: "FX" }
+    - { id: 6, desk: "RATES" }
+  query: "SELECT desk, COUNT(*) AS c FROM t GROUP BY desk HAVING COUNT(*) = 2"
+  expected_rows:
+    - { desk: "FX", c: 2 }
+  notes: |
+    Only FX has exactly 2 rows.
+
+- name: having_with_avg
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: px, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES",    px: 100.0 }
+    - { id: 2, desk: "RATES",    px: 110.0 }
+    - { id: 3, desk: "RATES",    px: 90.0 }
+    - { id: 4, desk: "EQUITIES", px: 50.0 }
+    - { id: 5, desk: "EQUITIES", px: 60.0 }
+    - { id: 6, desk: "FX",       px: 5.0 }
+  query: "SELECT desk, AVG(px) AS a FROM t GROUP BY desk HAVING AVG(px) >= 50"
+  expected_rows:
+    - { desk: "RATES",    a: 100.0 }
+    - { desk: "EQUITIES", a: 55.0 }
+  notes: |
+    FX (avg=5) drops; RATES (100) and EQUITIES (55) remain.
+
+- name: having_min_max
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+    - { name: px, type: double }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES",    px: 10.0 }
+    - { id: 2, desk: "RATES",    px: 50.0 }
+    - { id: 3, desk: "EQUITIES", px: 20.0 }
+    - { id: 4, desk: "EQUITIES", px: 30.0 }
+    - { id: 5, desk: "FX",       px: 5.0 }
+    - { id: 6, desk: "FX",       px: 8.0 }
+  query: "SELECT desk, MIN(px) AS lo, MAX(px) AS hi FROM t GROUP BY desk HAVING MAX(px) > 15"
+  expected_rows:
+    - { desk: "RATES",    lo: 10.0, hi: 50.0 }
+    - { desk: "EQUITIES", lo: 20.0, hi: 30.0 }
+  notes: |
+    FX (max=8) drops.
+
+- name: having_no_groups_match
+  schema:
+    - { name: id, type: long }
+    - { name: desk, type: string }
+  key: id
+  publishes:
+    - { id: 1, desk: "RATES" }
+    - { id: 2, desk: "EQUITIES" }
+    - { id: 3, desk: "FX" }
+  query: "SELECT desk, COUNT(*) AS c FROM t GROUP BY desk HAVING COUNT(*) > 5"
+  expected_rows: []
+  notes: |
+    Every group has c=1; none exceeds 5 → empty result set.
+
+# ─── OFFSET ───────────────────────────────────────────────────────
+
+- name: offset_with_limit_skips_first
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 200 }
+    - { id: 3, v: 300 }
+    - { id: 4, v: 400 }
+    - { id: 5, v: 500 }
+  query: "SELECT id, v FROM t ORDER BY id LIMIT 2 OFFSET 2"
+  expected_rows:
+    - { id: 3, v: 300 }
+    - { id: 4, v: 400 }
+  notes: |
+    OFFSET 2 skips ids 1+2; LIMIT 2 takes ids 3+4.
+
+- name: offset_alone_no_limit
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 200 }
+    - { id: 3, v: 300 }
+    - { id: 4, v: 400 }
+    - { id: 5, v: 500 }
+  query: "SELECT id, v FROM t ORDER BY id OFFSET 3"
+  expected_rows:
+    - { id: 4, v: 400 }
+    - { id: 5, v: 500 }
+  notes: |
+    OFFSET without LIMIT skips first N and returns the rest.
+
+- name: offset_beyond_row_count_empty
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 200 }
+    - { id: 3, v: 300 }
+  query: "SELECT id, v FROM t ORDER BY id LIMIT 5 OFFSET 10"
+  expected_rows: []
+  notes: |
+    OFFSET past end → empty set (no error).
+
+- name: offset_zero_is_identity
+  schema:
+    - { name: id, type: long }
+    - { name: v, type: long }
+  key: id
+  publishes:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 200 }
+    - { id: 3, v: 300 }
+  query: "SELECT id, v FROM t ORDER BY id LIMIT 10 OFFSET 0"
+  expected_rows:
+    - { id: 1, v: 100 }
+    - { id: 2, v: 200 }
+    - { id: 3, v: 300 }
+  notes: |
+    OFFSET 0 must equal no-offset behavior.

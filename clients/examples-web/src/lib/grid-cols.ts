@@ -4,7 +4,7 @@
 import type { ColDef, ValueFormatterParams, CellClassParams } from 'ag-grid-community';
 import type { PositionColumn } from './schema/positions';
 import type { TradeColumn } from './schema/trades';
-import { fmtDec, fmtInt, fmtCcy, fmtPct, fmtBps, fmtSigned, fmtTime } from './format';
+import { fmtDec, fmtInt, fmtCcy, fmtPct, fmtBps, fmtSigned, fmtTime, fmtDate } from './format';
 
 type AnyCol = PositionColumn | TradeColumn;
 
@@ -22,7 +22,9 @@ function formatterFor(type: AnyCol['type'], signed: boolean | undefined) {
       case 'rate':      return fmtDec(v as number, 4);
       case 'bool':      return v ? '●' : '○';
       case 'datetime':  return fmtTime(v as string);
-      case 'date':      return v as string;
+      // Native cqserver timestamp comes back as `2026-05-25T00:00:00.000000Z`
+      // for date-only columns; `fmtDate` slices to `2026-05-25`.
+      case 'date':      return fmtDate(v as string);
       default:          return String(v);
     }
   };
@@ -36,6 +38,17 @@ function cellClassFor(type: AnyCol['type'], signed: boolean | undefined): (p: Ce
     if (signed && typeof p.value === 'number') {
       if (p.value > 0) classes.push('num-pos');
       else if (p.value < 0) classes.push('num-neg');
+    }
+    if (type === 'bool') {
+      // Native cqserver bool now arrives as a real boolean. Color the
+      // ● / ○ glyph so true / false reads at a glance: teal for true,
+      // muted for false / null. Center-aligned for the narrow column.
+      classes.push('tabular-cell text-center');
+      if (p.value === true) classes.push('num-pos');
+      else if (p.value === false) classes.push('num-neg');
+    }
+    if (type === 'date' || type === 'datetime') {
+      classes.push('tabular-cell');
     }
     return classes.join(' ');
   };

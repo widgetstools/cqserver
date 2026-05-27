@@ -6,104 +6,70 @@ import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Badge } from '@/components/ui/badge';
-import { getPositions, getTrades } from '@/lib/data-gen';
 import { POSITION_COLUMNS } from '@/lib/schema/positions';
 import { TRADE_COLUMNS } from '@/lib/schema/trades';
 import { buildColDefs } from '@/lib/grid-cols';
 import { QUERIES } from '@/lib/queries/library';
 import { DOCS_BY_ID } from '@/docs';
+import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
+import type { ColDef } from 'ag-grid-community';
+import { fmtBps, fmtCcy, fmtInt } from '@/lib/format';
 
 type JoinKind = 'equi' | 'broadcast' | 'asof';
 
 const JOIN_SQL: Record<JoinKind, string> = {
-  equi: QUERIES.find((q) => q.id === 'jn-1')!.sql,
+  equi: `-- Wire-form (declared in cqserver.toml as /v_trades_by_compliance)
+SELECT compliance_status,
+       COUNT(*)                  AS n_trades,
+       SUM(total_fees_usd)       AS total_fees,
+       AVG(slippage_arrival_bps) AS avg_slip_arr
+FROM trades JOIN positions USING (position_id)
+GROUP BY compliance_status;`,
   broadcast: QUERIES.find((q) => q.id === 'jn-3')!.sql,
   asof: QUERIES.find((q) => q.id === 'jn-4')!.sql,
 };
 
 const JOIN_LABEL: Record<JoinKind, string> = {
-  equi: 'EQUI · positions × trades',
+  equi: 'EQUI · trades × positions',
   broadcast: 'BROADCAST · trades × issuers',
   asof: 'AS OF · trades at trade_ts',
 };
 
-// Simulate each join in JS so the user sees the resulting shape.
-function joinEqui(positions: Record<string, unknown>[], trades: Record<string, unknown>[]) {
-  const pIx = new Map(positions.map((p) => [p.position_id as string, p]));
-  return trades.slice(0, 800).map((t) => {
-    const p = pIx.get(t.position_id as string);
-    return {
-      trade_id: t.trade_id,
-      symbol: t.symbol,
-      side: t.side,
-      trade_qty: t.quantity,
-      price: t.price,
-      notional_usd: t.notional_usd,
-      pos_book_name: p?.book_name,
-      pos_mv_usd: p?.market_value_usd,
-      pos_compliance: p?.compliance_status,
-    };
-  });
-}
-
-function joinBroadcast(trades: Record<string, unknown>[]) {
-  // For the broadcast demo, fake an issuers table from refdata.
-  return trades.slice(0, 800).map((t) => ({
-    trade_id: t.trade_id,
-    symbol: t.symbol,
-    notional_usd: t.notional_usd,
-    iss_country: t.issuer_country,
-    iss_region: t.issuer_region,
-    iss_sector: t.issuer_sector,
-  }));
-}
-
-function joinAsOf(positions: Record<string, unknown>[], trades: Record<string, unknown>[]) {
-  const pIx = new Map(positions.map((p) => [p.position_id as string, p]));
-  return trades.slice(0, 800)
-    .filter((t) => t.status === 'FILLED')
-    .map((t) => {
-      const p = pIx.get(t.position_id as string);
-      return {
-        trade_id: t.trade_id,
-        trade_ts: t.trade_ts,
-        symbol: t.symbol,
-        pos_mv_at_trade: p?.market_value_usd,
-        pos_lim_pct: p?.risk_limit_utilization_pct,
-      };
-    });
-}
-
 export function JoinsCanvas() {
-  const positions = useMemo(() => getPositions() as Record<string, unknown>[], []);
-  const trades = useMemo(() => getTrades() as Record<string, unknown>[], []);
+  // /v_trades_by_compliance is cqserver's JOIN view — `trades JOIN
+  // positions USING (position_id)` aggregated by the position-side
+  // `compliance_status` column. The view runner recomputes whenever
+  // either side mutates, and republishes only the affected groups.
+  const joinSub = useFilteredSubscription('/v_trades_by_compliance', null);
+
+  // LHS / RHS samples for the source-side grids. We sample the raw
+  // streams via a server-side LIMIT-equivalent: open with no filter,
+  // GridPanel binds via topic= so they tick live.
   const [kind, setKind] = useState<JoinKind>('equi');
 
   const posDefs = useMemo(() => buildColDefs(POSITION_COLUMNS), []);
   const trdDefs = useMemo(() => buildColDefs(TRADE_COLUMNS), []);
 
-  const joined = useMemo(() => {
-    switch (kind) {
-      case 'equi': return joinEqui(positions, trades);
-      case 'broadcast': return joinBroadcast(trades);
-      case 'asof': return joinAsOf(positions, trades);
-    }
-  }, [kind, positions, trades]);
+  const joined = joinSub.rows;
 
-  const joinedCols = useMemo(() => {
-    if (!joined.length) return [];
-    return Object.keys(joined[0]!).map((k) => ({
-      field: k,
-      headerName: k.toUpperCase().replace(/_/g, ' '),
-      width: 130,
-      valueFormatter: (p: { value: unknown }) => {
-        const v = p.value;
-        if (typeof v === 'number') return v.toLocaleString('en-US', { maximumFractionDigits: 2 });
-        return v == null ? '—' : String(v);
-      },
-      cellClass: (p: { value: unknown }) => typeof p.value === 'number' ? 'tabular-cell text-right' : '',
-    }));
-  }, [joined]);
+  const joinedCols = useMemo<ColDef[]>(() => [
+    { field: 'compliance_status', headerName: 'Compliance', width: 140 },
+    {
+      field: 'n_trades', headerName: 'N Trades', width: 110,
+      valueFormatter: (p) => fmtInt(p.value as number),
+      cellClass: 'tabular-cell text-right',
+    },
+    {
+      field: 'total_fees', headerName: 'Total Fees USD', width: 160,
+      valueFormatter: (p) => fmtCcy(p.value as number),
+      cellClass: 'tabular-cell text-right',
+    },
+    {
+      field: 'avg_slip_arr', headerName: 'Avg Slip Arr', width: 140,
+      valueFormatter: (p) => fmtBps(p.value as number, 2),
+      cellClass: (p) => `tabular-cell text-right ${(p.value as number) > 0 ? 'num-neg' : (p.value as number) < 0 ? 'num-pos' : ''}`,
+    },
+  ], []);
 
   const panels: DockPanelSpec[] = [
     {
@@ -135,6 +101,9 @@ export function JoinsCanvas() {
     {
       id: 'props',
       title: 'Join Properties',
+      // Pinned to the right edge so the metadata strip stays adjacent
+      // to the SQL/help docs strip and the main grid keeps full width.
+      pin: 'right',
       render: () => (
         <PanelChrome title={`Join Properties · ${kind.toUpperCase()}`}>
           <div className="p-4 text-[12px] space-y-3">
@@ -172,10 +141,11 @@ export function JoinsCanvas() {
       title: 'LHS · positions',
       render: () => (
         <GridPanel
-          title="LHS · positions (sample of 500)"
-          rows={positions.slice(0, 500)}
+          title="LHS · positions"
           colDefs={posDefs}
           visible={['position_id', 'book_name', 'symbol', 'asset_class', 'market_value_usd', 'compliance_status']}
+          getRowId={(r) => r.position_id as string}
+          topic="positions"
         />
       ),
     },
@@ -184,10 +154,11 @@ export function JoinsCanvas() {
       title: 'RHS · trades',
       render: () => (
         <GridPanel
-          title="RHS · trades (sample of 800)"
-          rows={trades.slice(0, 800)}
+          title="RHS · trades"
           colDefs={trdDefs}
           visible={['trade_id', 'position_id', 'side', 'quantity', 'price', 'notional_usd', 'status']}
+          getRowId={(r) => r.trade_id as string}
+          topic="trades"
         />
       ),
     },
@@ -197,8 +168,9 @@ export function JoinsCanvas() {
       render: () => (
         <GridPanel
           title={`Joined Result · ${joined.length} rows`}
-          rows={joined as Record<string, unknown>[]}
           colDefs={joinedCols}
+          getRowId={(r) => String(r.compliance_status ?? '')}
+          liveSubscription={joinSub}
         />
       ),
     },

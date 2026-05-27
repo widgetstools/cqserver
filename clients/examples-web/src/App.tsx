@@ -6,6 +6,11 @@ import { ContextBar } from '@/components/atlas/ContextBar';
 import { EXAMPLES, exampleById } from '@/examples/registry';
 import type { ExampleId } from '@/examples/shared';
 import { ExampleCanvas } from '@/examples/ExampleCanvas';
+import { FEATURE_META, orderFeatures } from '@/lib/features';
+// Side-effect import: opens the cqserver WebSocket and starts streaming
+// positions / trades / securities / fi-market-data into the live store
+// before any example needs them.
+import '@/lib/cq-store';
 
 /**
  * App shell — header, slim tab strip, single-row context band,
@@ -27,12 +32,34 @@ export function App() {
           <TabsPrimitive.Root value={active} onValueChange={(v) => setActive(v as ExampleId)} className="flex-1 flex flex-col min-h-0">
             <div className="atlas-tabstrip-wrap">
               <TabsPrimitive.List className="atlas-tabstrip">
-                {EXAMPLES.map((e) => (
-                  <TabsPrimitive.Trigger key={e.id} value={e.id} className="atlas-tab">
-                    <span className="atlas-tab-serial">{e.serial}</span>
-                    <span className="atlas-tab-label">{e.shortLabel}</span>
-                  </TabsPrimitive.Trigger>
-                ))}
+                {EXAMPLES.map((e) => {
+                  const features = orderFeatures(e.features);
+                  const isLive = e.features.includes('stream');
+                  return (
+                    <TabsPrimitive.Trigger key={e.id} value={e.id} className="atlas-tab">
+                      <span className="atlas-tab-top">
+                        <span className="atlas-tab-serial">{e.serial}</span>
+                        <span className="atlas-tab-label">{e.shortLabel}</span>
+                      </span>
+                      <span className="atlas-tab-features">
+                        {features.map((f) => {
+                          const meta = FEATURE_META[f];
+                          return (
+                            <span
+                              key={f}
+                              className="atlas-tab-feature"
+                              style={{ ['--feature-color' as never]: meta.colorVar }}
+                              title={`${meta.name} — ${meta.blurb}`}
+                            >
+                              {meta.glyph}
+                            </span>
+                          );
+                        })}
+                      </span>
+                      {isLive && <span className="atlas-tab-live" aria-hidden />}
+                    </TabsPrimitive.Trigger>
+                  );
+                })}
               </TabsPrimitive.List>
             </div>
 

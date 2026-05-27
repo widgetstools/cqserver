@@ -39,6 +39,14 @@ pub struct ParsedQuery {
     pub predicate: CompiledPredicate,
     /// ORDER BY: (column_index, ascending).
     pub order_by: Vec<(usize, bool)>,
+    /// R1 — parallel to `order_by`. When `Some(alias)`, the ORDER BY
+    /// entry references a SELECT-list alias (typically an aggregate or
+    /// computed-column output) rather than a base schema column. The
+    /// aggregate sort path keys on this string against the synthesized
+    /// row map; the `usize` in `order_by` is meaningless in that case
+    /// (kept as a placeholder so the existing tuple shape doesn't
+    /// break callers that haven't been updated yet).
+    pub order_by_aliases: Vec<Option<String>>,
     /// LIMIT clause.
     pub limit: Option<usize>,
     /// P4 — OFFSET clause. Skips the first `offset` rows of the
@@ -113,6 +121,16 @@ pub enum ScalarExpr {
     Mul(Box<ScalarExpr>, Box<ScalarExpr>),
     Div(Box<ScalarExpr>, Box<ScalarExpr>),
     Neg(Box<ScalarExpr>),
+    /// R4 — `COALESCE(a, b, c, …)`. Returns the first arg whose
+    /// evaluation isn't `Value::Null`. Polymorphic — works on both
+    /// string and numeric columns. Empty list = always null
+    /// (rejected at parse time, so empty here is unreachable in
+    /// practice).
+    Coalesce(Vec<ScalarExpr>),
+    /// R4 — `NULLIF(a, b)`. Returns null when `a == b`, else `a`.
+    /// Equality is value-aware: NaN-vs-NaN is false (matching SQL
+    /// `=` semantics on floats).
+    NullIf(Box<ScalarExpr>, Box<ScalarExpr>),
 }
 
 impl ScalarExpr {
@@ -141,7 +159,43 @@ impl ScalarExpr {
                 Some(x) => Value::Double(-x),
                 None => Value::Null,
             },
+            ScalarExpr::Coalesce(args) => {
+                for arg in args {
+                    let v = arg.eval(row);
+                    if !v.is_null() {
+                        return v;
+                    }
+                }
+                Value::Null
+            }
+            ScalarExpr::NullIf(a, b) => {
+                let av = a.eval(row);
+                let bv = b.eval(row);
+                if values_equal_for_nullif(&av, &bv) {
+                    Value::Null
+                } else {
+                    av
+                }
+            }
         }
+    }
+}
+
+/// R4 — equality predicate for `NULLIF(a, b)`. Compares two Values
+/// for SQL `=` semantics: NULL ≠ NULL ≠ anything, NaN ≠ NaN, numeric
+/// types cross-compare via f64 coercion, strings are byte-exact.
+fn values_equal_for_nullif(a: &Value, b: &Value) -> bool {
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    if let (Some(av), Some(bv)) = (value_as_f64(a), value_as_f64(b)) {
+        // NaN ≠ NaN matches SQL `=` semantics on floats.
+        return !av.is_nan() && !bv.is_nan() && av == bv;
+    }
+    match (a, b) {
+        (Value::String(Some(s1)), Value::String(Some(s2))) => s1 == s2,
+        (Value::Bool(Some(b1)), Value::Bool(Some(b2))) => b1 == b2,
+        _ => false,
     }
 }
 
@@ -179,10 +233,57 @@ pub enum WindowFn {
     DenseRank,
     /// `LAG(col, offset, default)` — value from the row `offset` back
     /// in the partition's sorted order. `default` is emitted when
-    /// the lookup falls off the partition's leading edge.
-    Lag { col: usize, offset: usize },
+    /// the lookup falls off the partition's leading edge. R5 adds
+    /// the optional `default` as a string-serialised JSON value
+    /// (None = use SQL NULL, the pre-R5 default).
+    Lag {
+        col: usize,
+        offset: usize,
+        default: Option<serde_json::Value>,
+    },
     /// `LEAD(col, offset, default)` — same but forward.
-    Lead { col: usize, offset: usize },
+    Lead {
+        col: usize,
+        offset: usize,
+        default: Option<serde_json::Value>,
+    },
+    /// R5 — `NTILE(n)` — assigns each row in the partition to one
+    /// of `n` buckets (1..=n), distributing rows as evenly as
+    /// possible. AMPS exposes this for percentile-bucket reports.
+    /// The bucket value `n` must be a positive integer literal at
+    /// compile time; this matches AMPS's restriction (no variable
+    /// bucket count per row).
+    Ntile { buckets: usize },
+    /// R9 — `<agg>(col) OVER (... ROWS BETWEEN k PRECEDING AND
+    /// CURRENT ROW)` — rolling aggregate over a row-based frame.
+    /// AMPS uses this for "rolling N-trade slippage average" and
+    /// similar streaming-window patterns. Today we support the
+    /// canonical "N preceding through current row" frame; the more
+    /// general unbounded / following variants are documented as a
+    /// follow-up.
+    ///
+    /// `agg` is one of SUM, AVG, MIN, MAX, COUNT. `col` is the
+    /// numeric input column. `frame_preceding` is the number of
+    /// rows in the trailing window (CURRENT ROW always included);
+    /// a `frame_preceding = 49` gives a 50-row rolling window.
+    FrameAgg {
+        agg: FrameAggKind,
+        col: usize,
+        frame_preceding: usize,
+    },
+}
+
+/// R9 — aggregate kind for OVER (...) frames. A small subset of
+/// `AggFn` — only the rolling-sane ones (STDDEV/PERCENTILE need
+/// the full window's data, which the frame model already provides,
+/// but they're a follow-up to keep this PR bounded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAggKind {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count,
 }
 
 /// P3 — compiled HAVING expression. Evaluated against a finalised
@@ -526,8 +627,15 @@ impl AggFn {
 #[derive(Debug, Clone)]
 pub struct AggregateSpec {
     pub func: AggFn,
-    /// `None` only for COUNT(*); else the input column index.
+    /// `None` for `COUNT(*)` and for R3 expression-input aggregates
+    /// (where the input comes from `expr` instead of a column read).
     pub col: Option<usize>,
+    /// R3 — when `Some`, the aggregate's input is the per-row
+    /// evaluation of this NumExpr rather than a direct column read.
+    /// Takes precedence over `col` in the executor. Used for
+    /// `SUM(a * b)`, `AVG(ABS(x))`, `MAX(qty * price)` etc. AMPS-style
+    /// aggregations the demo library reaches for.
+    pub expr: Option<crate::predicate::NumExpr>,
     /// Output key in the result row (e.g. `"SUM(price)"` or the
     /// user-supplied alias `"total"`).
     pub alias: String,
@@ -1122,8 +1230,9 @@ fn parse_select(
         CompiledPredicate::True
     };
 
-    // --- ORDER BY ---
-    let order_by = parse_order_by(&query.order_by, schema)?;
+    // --- ORDER BY --- (R1: alias-aware)
+    let (order_by, order_by_aliases) =
+        parse_order_by(&query.order_by, schema, &select.projection)?;
 
     // --- LIMIT + OFFSET (P4) ---
     let (limit, offset) = match query.limit_clause.as_ref() {
@@ -1143,6 +1252,7 @@ fn parse_select(
         projection,
         predicate,
         order_by,
+        order_by_aliases,
         limit,
         aggregates,
         group_by,
@@ -1461,6 +1571,7 @@ fn parse_pivot_query(
         projection: Vec::new(),
         predicate,
         order_by: Vec::new(),
+        order_by_aliases: Vec::new(),
         limit: None,
         aggregates: Vec::new(),
         group_by: Vec::new(),
@@ -1581,6 +1692,7 @@ fn parse_unpivot_query(
         projection: Vec::new(),
         predicate,
         order_by: Vec::new(),
+        order_by_aliases: Vec::new(),
         limit: None,
         aggregates: Vec::new(),
         group_by: Vec::new(),
@@ -1689,6 +1801,15 @@ fn extract_expr(item: &SelectItem) -> Option<&Expr> {
 
 fn is_aggregate_function_call(expr: &Expr) -> bool {
     if let Expr::Function(f) = expr {
+        // R9 — window-function calls have `over: Some(...)` and are
+        // NOT plain aggregates; they're handled by the window path
+        // (try_compile_window). Detecting them here as aggregates
+        // would push the whole query into the aggregate executor
+        // and trigger the misleading "column must appear in GROUP BY"
+        // error for SELECT columns that aren't grouped.
+        if f.over.is_some() {
+            return false;
+        }
         let name = f.name.to_string().to_ascii_uppercase();
         matches!(
             name.as_str(),
@@ -1776,6 +1897,7 @@ fn parse_aggregate_call(
         return Ok(Some(AggregateSpec {
             func: AggFn::CountDistinct,
             col: Some(col_idx),
+            expr: None,
             alias: alias.map(str::to_string).unwrap_or(default_alias),
             percentile_q: None,
         }));
@@ -1850,6 +1972,7 @@ fn parse_aggregate_call(
         return Ok(Some(AggregateSpec {
             func: AggFn::PercentileCont,
             col: Some(col_idx),
+            expr: None,
             alias: alias.map(str::to_string).unwrap_or(default_alias),
             percentile_q: Some(q),
         }));
@@ -1862,7 +1985,7 @@ fn parse_aggregate_call(
         )));
     }
 
-    let (col, default_alias) = match &arg_list.args[0] {
+    let (col, expr, default_alias) = match &arg_list.args[0] {
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
             // Only COUNT(*) is meaningful with `*`.
             if func != AggFn::Count {
@@ -1870,12 +1993,27 @@ fn parse_aggregate_call(
                     "{name}(*) is not allowed; only COUNT(*) supports wildcards"
                 )));
             }
-            (None, format!("{}(*)", func.label()))
+            (None, None, format!("{}(*)", func.label()))
         }
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-            let col_idx = resolve_select_column(e, schema)?;
-            let col_name = schema.column_name(col_idx).to_string();
-            (Some(col_idx), format!("{}({})", func.label(), col_name))
+            // Try the fast path first: a bare column reference. Pre-R3
+            // this was the only shape we accepted.
+            if let Ok(col_idx) = resolve_select_column(e, schema) {
+                let col_name = schema.column_name(col_idx).to_string();
+                (Some(col_idx), None, format!("{}({})", func.label(), col_name))
+            } else if let Some(num_expr) =
+                crate::predicate::try_compile_num_expr(e, schema)
+            {
+                // R3 — fall back to the NumExpr path: `SUM(a * b)`,
+                // `AVG(ABS(x))`, `MAX(ROUND(rate, 2))`, etc. We
+                // record `col = None` so the executor knows to
+                // evaluate the expr per row.
+                (None, Some(num_expr), format!("{}(<expr>)", func.label()))
+            } else {
+                return Err(QueryError::ParseError(format!(
+                    "{name}: argument must be a column or numeric expression"
+                )));
+            }
         }
         other => {
             return Err(QueryError::ParseError(format!(
@@ -1887,6 +2025,7 @@ fn parse_aggregate_call(
     Ok(Some(AggregateSpec {
         func,
         col,
+        expr,
         alias: alias.map(str::to_string).unwrap_or(default_alias),
         percentile_q: None,
     }))
@@ -1968,16 +2107,147 @@ fn try_compile_window(
         None => return Ok(None),
     };
     let name = f.name.to_string().to_ascii_uppercase();
+    // R9 — aggregate-OVER-window: SUM/AVG/MIN/MAX/COUNT with a
+    // `ROWS BETWEEN k PRECEDING AND CURRENT ROW` frame.
+    if matches!(name.as_str(), "SUM" | "AVG" | "MIN" | "MAX" | "COUNT") {
+        let agg = match name.as_str() {
+            "SUM" => FrameAggKind::Sum,
+            "AVG" => FrameAggKind::Avg,
+            "MIN" => FrameAggKind::Min,
+            "MAX" => FrameAggKind::Max,
+            "COUNT" => FrameAggKind::Count,
+            _ => unreachable!(),
+        };
+        let arg_list = match &f.args {
+            FunctionArguments::List(l) => l,
+            _ => {
+                return Err(QueryError::ParseError(format!(
+                    "{name} OVER (...) requires (col) arg"
+                )));
+            }
+        };
+        if arg_list.args.len() != 1 {
+            return Err(QueryError::ParseError(format!(
+                "{name} OVER (...) expects exactly one column argument, got {}",
+                arg_list.args.len()
+            )));
+        }
+        let col_expr = match &arg_list.args[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+            // COUNT(*) — emit a placeholder column index; the
+            // executor counts all rows in the frame regardless of
+            // the value.
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if agg == FrameAggKind::Count => {
+                let kind = WindowFn::FrameAgg {
+                    agg: FrameAggKind::Count,
+                    col: 0,
+                    frame_preceding: extract_frame_preceding(spec)?,
+                };
+                let default_alias = "COUNT(*)".to_string();
+                return Ok(Some(WindowColumn {
+                    alias: alias_override.map(str::to_string).unwrap_or(default_alias),
+                    partition_by: spec
+                        .partition_by
+                        .iter()
+                        .map(|p| resolve_select_column(p, schema))
+                        .collect::<Result<_, _>>()?,
+                    order_by: spec
+                        .order_by
+                        .iter()
+                        .map(|ob| {
+                            Ok::<_, QueryError>((
+                                resolve_select_column(&ob.expr, schema)?,
+                                ob.options.asc.unwrap_or(true),
+                            ))
+                        })
+                        .collect::<Result<_, _>>()?,
+                    kind,
+                }));
+            }
+            other => {
+                return Err(QueryError::ParseError(format!(
+                    "{name} OVER (...): arg must be a column ref, got {other:?}"
+                )));
+            }
+        };
+        let col = resolve_select_column(col_expr, schema)?;
+        let frame_preceding = extract_frame_preceding(spec)?;
+        let kind = WindowFn::FrameAgg {
+            agg,
+            col,
+            frame_preceding,
+        };
+        let default_alias = format!("{name}_OVER");
+        return Ok(Some(WindowColumn {
+            alias: alias_override.map(str::to_string).unwrap_or(default_alias),
+            partition_by: spec
+                .partition_by
+                .iter()
+                .map(|p| resolve_select_column(p, schema))
+                .collect::<Result<_, _>>()?,
+            order_by: spec
+                .order_by
+                .iter()
+                .map(|ob| {
+                    Ok::<_, QueryError>((
+                        resolve_select_column(&ob.expr, schema)?,
+                        ob.options.asc.unwrap_or(true),
+                    ))
+                })
+                .collect::<Result<_, _>>()?,
+            kind,
+        }));
+    }
     let kind = match name.as_str() {
         "ROW_NUMBER" => WindowFn::RowNumber,
         "RANK" => WindowFn::Rank,
         "DENSE_RANK" => WindowFn::DenseRank,
+        // R5 — NTILE(n) — partition rows into `n` buckets.
+        "NTILE" => {
+            let arg_list = match &f.args {
+                FunctionArguments::List(l) => l,
+                _ => return Err(QueryError::ParseError("NTILE() requires (n)".into())),
+            };
+            if arg_list.args.len() != 1 {
+                return Err(QueryError::ParseError(format!(
+                    "NTILE expects exactly one argument (bucket count), got {}",
+                    arg_list.args.len()
+                )));
+            }
+            let n_expr = match &arg_list.args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                _ => return Err(QueryError::ParseError(
+                    "NTILE: bucket count must be a numeric literal".into(),
+                )),
+            };
+            let buckets = match n_expr {
+                Expr::Value(v) => match &v.value {
+                    sqlparser::ast::Value::Number(n, _) => n.parse::<usize>().map_err(|_| {
+                        QueryError::ParseError(format!(
+                            "NTILE: bucket count must be a positive integer, got '{n}'"
+                        ))
+                    })?,
+                    _ => return Err(QueryError::ParseError(
+                        "NTILE: bucket count must be a numeric literal".into(),
+                    )),
+                },
+                _ => return Err(QueryError::ParseError(
+                    "NTILE: bucket count must be a numeric literal".into(),
+                )),
+            };
+            if buckets == 0 {
+                return Err(QueryError::ParseError(
+                    "NTILE: bucket count must be > 0".into(),
+                ));
+            }
+            WindowFn::Ntile { buckets }
+        }
         "LAG" | "LEAD" => {
             let arg_list = match &f.args {
                 FunctionArguments::List(l) => l,
                 _ => {
                     return Err(QueryError::ParseError(format!(
-                        "{name}() requires (col [, offset]) args"
+                        "{name}() requires (col [, offset [, default]]) args"
                     )))
                 }
             };
@@ -2011,14 +2281,72 @@ fn try_compile_window(
             } else {
                 1
             };
+            // R5 — optional 3rd arg: default value emitted when the
+            // lookup falls off the partition's leading/trailing edge.
+            // Accept numeric / string / bool literals (the most common
+            // AMPS-style defaults: `LAG(price, 1, 0)`, `LAG(side, 1, 'NONE')`).
+            let default = if arg_list.args.len() >= 3 {
+                match &arg_list.args[2] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v))) => {
+                        Some(match &v.value {
+                            sqlparser::ast::Value::Number(n, _) => {
+                                if let Ok(i) = n.parse::<i64>() {
+                                    serde_json::Value::from(i)
+                                } else if let Ok(f) = n.parse::<f64>() {
+                                    serde_json::json!(f)
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            }
+                            sqlparser::ast::Value::SingleQuotedString(s) => {
+                                serde_json::Value::from(s.clone())
+                            }
+                            sqlparser::ast::Value::Boolean(b) => serde_json::Value::from(*b),
+                            other => {
+                                return Err(QueryError::ParseError(format!(
+                                    "{name}: default must be a literal, got {other:?}"
+                                )));
+                            }
+                        })
+                    }
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::UnaryOp {
+                        op: sqlparser::ast::UnaryOperator::Minus,
+                        expr,
+                    })) => {
+                        // Negative numeric literal — sqlparser wraps `-1` as UnaryOp.
+                        if let Expr::Value(v) = expr.as_ref() {
+                            if let sqlparser::ast::Value::Number(n, _) = &v.value {
+                                if let Ok(i) = n.parse::<i64>() {
+                                    Some(serde_json::Value::from(-i))
+                                } else if let Ok(f) = n.parse::<f64>() {
+                                    Some(serde_json::json!(-f))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                return Err(QueryError::ParseError(format!(
+                                    "{name}: default must be a literal"
+                                )));
+                            }
+                        } else {
+                            return Err(QueryError::ParseError(format!(
+                                "{name}: default must be a literal"
+                            )));
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             match name.as_str() {
-                "LAG" => WindowFn::Lag { col, offset },
-                _ => WindowFn::Lead { col, offset },
+                "LAG" => WindowFn::Lag { col, offset, default },
+                _ => WindowFn::Lead { col, offset, default },
             }
         }
         _ => {
             return Err(QueryError::ParseError(format!(
-                "window function {name}() not supported; use ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD"
+                "window function {name}() not supported; use ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/NTILE"
             )));
         }
     };
@@ -2067,6 +2395,17 @@ fn try_compile_scalar_expr(
             Ok(Some(compile_scalar(expr, schema)?))
         }
         Expr::Nested(inner) => try_compile_scalar_expr(inner, schema),
+        // R4 — recognise COALESCE / NULLIF in SELECT so the
+        // computed-column path picks them up before the
+        // resolve-as-column fallback rejects them.
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_uppercase();
+            if matches!(name.as_str(), "COALESCE" | "NULLIF") {
+                Ok(Some(compile_scalar(expr, schema)?))
+            } else {
+                Ok(None)
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -2110,6 +2449,73 @@ fn compile_scalar(expr: &Expr, schema: &Schema) -> Result<ScalarExpr, QueryError
             Ok(ScalarExpr::Neg(Box::new(compile_scalar(expr, schema)?)))
         }
         Expr::Nested(inner) => compile_scalar(inner, schema),
+        // R4 — COALESCE(a, b, ...) and NULLIF(a, b) as scalar
+        // expressions in SELECT (and inside arithmetic). Both AMPS
+        // and most SQL dialects expose them as standard functions.
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_uppercase();
+            let args = match &f.args {
+                sqlparser::ast::FunctionArguments::List(l) => &l.args,
+                _ => {
+                    return Err(QueryError::ParseError(format!(
+                        "unsupported expression in scalar context: {expr:?}"
+                    )));
+                }
+            };
+            match name.as_str() {
+                "COALESCE" => {
+                    if args.is_empty() {
+                        return Err(QueryError::ParseError(
+                            "COALESCE requires at least one argument".into(),
+                        ));
+                    }
+                    let mut parts = Vec::with_capacity(args.len());
+                    for a in args {
+                        let e = match a {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => e,
+                            _ => {
+                                return Err(QueryError::ParseError(
+                                    "COALESCE: arguments must be expressions".into(),
+                                ));
+                            }
+                        };
+                        parts.push(compile_scalar(e, schema)?);
+                    }
+                    Ok(ScalarExpr::Coalesce(parts))
+                }
+                "NULLIF" => {
+                    if args.len() != 2 {
+                        return Err(QueryError::ParseError(format!(
+                            "NULLIF expects exactly two arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let mut compiled = Vec::with_capacity(2);
+                    for a in args {
+                        let e = match a {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => e,
+                            _ => {
+                                return Err(QueryError::ParseError(
+                                    "NULLIF: arguments must be expressions".into(),
+                                ));
+                            }
+                        };
+                        compiled.push(compile_scalar(e, schema)?);
+                    }
+                    let mut it = compiled.into_iter();
+                    let a = it.next().unwrap();
+                    let b = it.next().unwrap();
+                    Ok(ScalarExpr::NullIf(Box::new(a), Box::new(b)))
+                }
+                _ => Err(QueryError::ParseError(format!(
+                    "unsupported function in scalar context: {name}"
+                ))),
+            }
+        }
         _ => Err(QueryError::ParseError(format!(
             "unsupported expression in scalar context: {expr:?}"
         ))),
@@ -2138,25 +2544,125 @@ fn resolve_select_column(expr: &Expr, schema: &Schema) -> Result<usize, QueryErr
     }
 }
 
+/// R9 — extract the `frame_preceding` count from a window spec's
+/// frame clause. Supports `ROWS BETWEEN N PRECEDING AND CURRENT ROW`
+/// (the AMPS-style rolling-N form) and `UNBOUNDED PRECEDING AND
+/// CURRENT ROW` (cumulative). Other shapes are rejected.
+fn extract_frame_preceding(
+    spec: &sqlparser::ast::WindowSpec,
+) -> Result<usize, QueryError> {
+    use sqlparser::ast::{WindowFrameBound, WindowFrameUnits};
+    let frame = match &spec.window_frame {
+        Some(f) => f,
+        // Default frame per ANSI when ORDER BY is present:
+        // `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+        // Model as "whole partition up to here".
+        None => return Ok(usize::MAX),
+    };
+    if !matches!(frame.units, WindowFrameUnits::Rows) {
+        return Err(QueryError::ParseError(
+            "OVER frame: only ROWS units supported (RANGE/GROUPS not yet)".into(),
+        ));
+    }
+    let preceding = match &frame.start_bound {
+        WindowFrameBound::Preceding(None) => usize::MAX, // UNBOUNDED PRECEDING
+        WindowFrameBound::Preceding(Some(n_expr)) => {
+            extract_usize_literal(n_expr).ok_or_else(|| {
+                QueryError::ParseError(
+                    "OVER frame: PRECEDING count must be a numeric literal".into(),
+                )
+            })?
+        }
+        WindowFrameBound::CurrentRow => 0,
+        WindowFrameBound::Following(_) => {
+            return Err(QueryError::ParseError(
+                "OVER frame: start bound cannot be FOLLOWING".into(),
+            ));
+        }
+    };
+    if let Some(end) = &frame.end_bound {
+        match end {
+            WindowFrameBound::CurrentRow => {}
+            _ => {
+                return Err(QueryError::ParseError(
+                    "OVER frame: end bound must be CURRENT ROW (FOLLOWING is a follow-up)".into(),
+                ));
+            }
+        }
+    }
+    Ok(preceding)
+}
+
+/// R1 — collect SELECT-list aliases so ORDER BY can reference them
+/// by name. Returns Some(alias_string) for aggregate / computed-column
+/// outputs whose alias does NOT match a base column name (those would
+/// already resolve via `resolve_select_column`). For aliases that DO
+/// shadow a base column, callers should prefer the alias entry so
+/// downstream sort uses the synthesized value, not the raw column.
+fn collect_select_aliases(
+    items: &[sqlparser::ast::SelectItem],
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for it in items {
+        if let sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } = it {
+            out.insert(alias.value.clone());
+        }
+    }
+    out
+}
+
+/// R1 — ORDER BY parser, alias-aware. The aggregate executor's sort
+/// path keys output rows by SELECT-list alias, so an `ORDER BY <alias>`
+/// where `<alias>` names an aggregate (`SUM(qty) AS total`) or
+/// computed column (`a + b AS s`) resolves cleanly. The non-aggregate
+/// sort path still needs a base column index; for that we re-resolve
+/// the alias's underlying expression against the schema.
+///
+/// Returned shape: parallel vectors so we don't break every caller of
+/// `query.order_by`. The alias vector is consulted ONLY by the
+/// aggregate sort path (line ~3090); the non-aggregate path uses the
+/// column index in the tuple.
 fn parse_order_by(
     order_by: &Option<sqlparser::ast::OrderBy>,
     schema: &Schema,
-) -> Result<Vec<(usize, bool)>, QueryError> {
+    select_items: &[sqlparser::ast::SelectItem],
+) -> Result<(Vec<(usize, bool)>, Vec<Option<String>>), QueryError> {
     let order_by = match order_by {
         Some(ob) => ob,
-        None => return Ok(Vec::new()),
+        None => return Ok((Vec::new(), Vec::new())),
     };
     let exprs = match &order_by.kind {
-        OrderByKind::All { .. } => return Ok(Vec::new()),
+        OrderByKind::All { .. } => return Ok((Vec::new(), Vec::new())),
         OrderByKind::Expressions(exprs) => exprs,
     };
+    let aliases = collect_select_aliases(select_items);
     let mut result = Vec::new();
+    let mut alias_result = Vec::new();
     for item in exprs {
-        let col = resolve_select_column(&item.expr, schema)?;
         let asc = item.options.asc.unwrap_or(true);
-        result.push((col, asc));
+        // Try base-column resolution first — this preserves the
+        // pre-R1 fast path for ORDER BY <base-col>.
+        let by_col = resolve_select_column(&item.expr, schema);
+        if let Ok(col) = by_col {
+            result.push((col, asc));
+            alias_result.push(None);
+            continue;
+        }
+        // R1 — accept ORDER BY on a SELECT-list alias when the expr
+        // is a bare identifier (the by_col error otherwise re-throws).
+        if let Expr::Identifier(id) = &item.expr {
+            if aliases.contains(&id.value) {
+                // Column index is a placeholder — only the alias is
+                // consulted in the aggregate sort path.
+                result.push((0, asc));
+                alias_result.push(Some(id.value.clone()));
+                continue;
+            }
+        }
+        // Surface the original "unknown column" error.
+        return Err(by_col.unwrap_err());
     }
-    Ok(result)
+    Ok((result, alias_result))
 }
 
 /// Candidate-row source for a query: either an index bitmap (fast
@@ -2547,26 +3053,137 @@ fn apply_window(
                         .insert(wc.alias.clone(), serde_json::Value::from(last_rank));
                 }
             }
-            WindowFn::Lag { col, offset } => {
+            WindowFn::Lag { col, offset, default } => {
                 for (pos, &out_idx) in partition.iter().enumerate() {
                     let val = if pos >= *offset {
                         let src = source_rows[partition[pos - offset]];
                         store.get(*col, src).to_json()
                     } else {
-                        serde_json::Value::Null
+                        // R5 — fall off leading edge: emit `default` if
+                        // provided, else SQL NULL.
+                        default.clone().unwrap_or(serde_json::Value::Null)
                     };
                     rows[out_idx].insert(wc.alias.clone(), val);
                 }
             }
-            WindowFn::Lead { col, offset } => {
+            WindowFn::Lead { col, offset, default } => {
                 for (pos, &out_idx) in partition.iter().enumerate() {
                     let val = if pos + offset < partition.len() {
                         let src = source_rows[partition[pos + offset]];
                         store.get(*col, src).to_json()
                     } else {
-                        serde_json::Value::Null
+                        default.clone().unwrap_or(serde_json::Value::Null)
                     };
                     rows[out_idx].insert(wc.alias.clone(), val);
+                }
+            }
+            // R9 — aggregate over a row-based frame. For each row at
+            // position `pos`, take the trailing window [pos - k, pos]
+            // (clamped to partition start) and apply the aggregate.
+            // Complexity: O(N * frame_size) per partition — fine for
+            // the typical "rolling 50-trade" form; large frames over
+            // huge partitions would benefit from a sliding-sum
+            // optimisation (deferred).
+            WindowFn::FrameAgg { agg, col, frame_preceding } => {
+                for (pos, &out_idx) in partition.iter().enumerate() {
+                    let start = if *frame_preceding == usize::MAX {
+                        0
+                    } else {
+                        pos.saturating_sub(*frame_preceding)
+                    };
+                    let end = pos + 1; // exclusive — include current row
+                    let mut sum: f64 = 0.0;
+                    let mut min: f64 = f64::INFINITY;
+                    let mut max: f64 = f64::NEG_INFINITY;
+                    let mut count: u64 = 0;
+                    for &row_idx in &partition[start..end] {
+                        let src = source_rows[row_idx];
+                        if let Some(v) = store.get(*col, src).as_f64() {
+                            sum += v;
+                            if v < min {
+                                min = v;
+                            }
+                            if v > max {
+                                max = v;
+                            }
+                            count += 1;
+                        } else if *agg == FrameAggKind::Count {
+                            // COUNT(*) — count every row regardless
+                            // of value. The Count + Wildcard parse
+                            // path sets col to a placeholder (0),
+                            // and we still want to count nulls. Use
+                            // the loop count instead: just include
+                            // every row.
+                            count += 1;
+                        }
+                    }
+                    let val = match agg {
+                        FrameAggKind::Sum => {
+                            if count == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(sum)
+                            }
+                        }
+                        FrameAggKind::Avg => {
+                            if count == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(sum / count as f64)
+                            }
+                        }
+                        FrameAggKind::Min => {
+                            if count == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(min)
+                            }
+                        }
+                        FrameAggKind::Max => {
+                            if count == 0 {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(max)
+                            }
+                        }
+                        FrameAggKind::Count => {
+                            // COUNT(col) skips nulls naturally via
+                            // the as_f64 gate above; COUNT(*) was
+                            // handled by the else-if branch.
+                            serde_json::json!(count)
+                        }
+                    };
+                    rows[out_idx].insert(wc.alias.clone(), val);
+                }
+            }
+            // R5 — NTILE(n): distribute partition rows into `n`
+            // buckets, putting the first ceil(N/n) rows in bucket 1,
+            // next ceil((N - filled)/(n-1)) in bucket 2, etc. This is
+            // the standard "evenly-distributed buckets, larger ones
+            // first" semantics matched by Postgres and AMPS.
+            WindowFn::Ntile { buckets } => {
+                let n = partition.len();
+                let bs = *buckets;
+                if n == 0 || bs == 0 {
+                    continue;
+                }
+                let base = n / bs;
+                let extras = n % bs;
+                let mut idx = 0usize;
+                for bucket in 1..=bs {
+                    // First `extras` buckets get one extra row.
+                    let size = base + if bucket <= extras { 1 } else { 0 };
+                    for _ in 0..size {
+                        if idx >= partition.len() {
+                            break;
+                        }
+                        let out_idx = partition[idx];
+                        rows[out_idx].insert(
+                            wc.alias.clone(),
+                            serde_json::Value::from(bucket as u64),
+                        );
+                        idx += 1;
+                    }
                 }
             }
         }
@@ -2991,10 +3608,19 @@ fn execute_aggregate_query(
         .collect();
 
     // Pre-compute aggregate input column types (or None for COUNT(*)).
+    // R3 — expression-input aggregates (`SUM(a*b)`) always produce
+    // Double, since `NumExpr::eval` is pure f64. We surface that as
+    // `Some(Double)` so AggState picks the float-accumulator variant.
     let agg_col_types: Vec<Option<crate::schema::ColumnType>> = query
         .aggregates
         .iter()
-        .map(|a| a.col.map(|c| schema.column_type(c)))
+        .map(|a| {
+            if a.expr.is_some() {
+                Some(crate::schema::ColumnType::Double)
+            } else {
+                a.col.map(|c| schema.column_type(c))
+            }
+        })
         .collect();
 
     // (group-key tuple) → Vec<AggState> with one slot per aggregate.
@@ -3024,8 +3650,21 @@ fn execute_aggregate_query(
                 .map(|(i, a)| AggState::init_with_q(a.func, agg_col_types[i], a.percentile_q))
                 .collect()
         });
-        // Update every aggregate.
+        // Update every aggregate. R3 — when the spec carries an
+        // `expr`, evaluate it and feed the resulting f64 as a Double
+        // value. NaN propagates through `Value::Double(NaN)` and
+        // `AggState` treats it as null per its existing NaN handling.
         for (i, spec) in query.aggregates.iter().enumerate() {
+            if let Some(num_expr) = &spec.expr {
+                let v = num_expr.eval(store, row);
+                if v.is_nan() {
+                    states[i].update(None);
+                } else {
+                    let val = crate::store::Value::Double(v);
+                    states[i].update(Some(&val));
+                }
+                continue;
+            }
             match spec.col {
                 None => states[i].update(None), // COUNT(*)
                 Some(c) => {
@@ -3081,18 +3720,25 @@ fn execute_aggregate_query(
     }
 
     // ORDER BY for aggregate queries operates on the output column
-    // names (group cols or aggregate aliases). We support it only for
-    // group-by columns for now — sorting by an aggregate alias would
-    // require parsing it as a non-column reference, which the current
-    // `parse_order_by` doesn't allow. Aggregate ORDER BY can be added
-    // later; falling back to insertion order is consistent with most
-    // OLAP engines' default.
+    // names (group cols or aggregate / computed-column aliases). R1
+    // added `order_by_aliases` as a parallel side-channel: when the
+    // entry has Some(alias), we look up the synthesized output by
+    // that alias name (which is what an aggregate row stores under,
+    // e.g. `day_pnl` for `SUM(day_pnl) AS day_pnl`). Otherwise we
+    // fall back to the schema column name pointed to by `col`.
     if !query.order_by.is_empty() {
+        let aliases = &query.order_by_aliases;
         rows.sort_by(|a, b| {
-            for &(col, asc) in &query.order_by {
-                let name = schema.column_name(col);
-                let av = a.get(name);
-                let bv = b.get(name);
+            for (i, &(col, asc)) in query.order_by.iter().enumerate() {
+                let key_owned;
+                let key: &str = if let Some(Some(alias)) = aliases.get(i) {
+                    alias.as_str()
+                } else {
+                    key_owned = schema.column_name(col).to_string();
+                    &key_owned
+                };
+                let av = a.get(key);
+                let bv = b.get(key);
                 let ord = compare_json_values(av, bv);
                 let ord = if asc { ord } else { ord.reverse() };
                 if ord != Ordering::Equal {

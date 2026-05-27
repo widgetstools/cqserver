@@ -8,6 +8,7 @@
 use cq_client::Client;
 use cq_e2e_tests::{start_server, TopicSpec};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 #[tokio::test]
 async fn range_index_between_query_e2e() {
@@ -96,4 +97,143 @@ async fn range_index_greater_than_e2e() {
         .collect();
     vs.sort();
     assert_eq!(vs, vec![26, 27, 28, 29, 30]);
+}
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// BETWEEN with a range covering NO existing values → empty result
+/// (out-of-band low+high, valid ordering).
+#[tokio::test]
+async fn range_index_between_out_of_band_is_empty() {
+    let topic = TopicSpec::new("/range-oob", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")])
+        .with_index_columns(["v"]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for i in 1..=10_i64 {
+        client
+            .publish("/range-oob", json!({ "k": format!("k{i}"), "v": i }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rows = client
+        .sow_sql("/range-oob", "SELECT k FROM t WHERE v BETWEEN 1000 AND 2000")
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+/// BETWEEN where low == high → exactly one row.
+#[tokio::test]
+async fn range_index_between_single_value_returns_one_row() {
+    let topic = TopicSpec::new("/range-single", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")])
+        .with_index_columns(["v"]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for i in 1..=10_i64 {
+        client
+            .publish("/range-single", json!({ "k": format!("k{i}"), "v": i }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rows = client
+        .sow_sql("/range-single", "SELECT k FROM t WHERE v BETWEEN 5 AND 5")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("k").unwrap().as_str().unwrap(), "k5");
+}
+
+/// Inverted-BETWEEN regression — `WHERE v BETWEEN high AND low` on
+/// an indexed column used to panic the server with "snapshot task
+/// join failed" (BTreeMap::range panics when start > end). The fix
+/// in `sec_index::rows_in_range` short-circuits to an empty bitmap.
+/// This test pins the contract: the query returns empty, not crash.
+#[tokio::test]
+async fn range_index_inverted_between_returns_empty_not_panic() {
+    let topic = TopicSpec::new("/range-inv", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")])
+        .with_index_columns(["v"]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for i in 1..=10_i64 {
+        client
+            .publish("/range-inv", json!({ "k": format!("k{i}"), "v": i }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inverted range — must return empty (and not stall / crash).
+    let rows = client
+        .sow_sql("/range-inv", "SELECT k FROM t WHERE v BETWEEN 100 AND 50")
+        .await
+        .expect("inverted BETWEEN must not stall or error");
+    assert!(rows.is_empty());
+
+    // Server is still healthy — a normal query works after.
+    let healthy = client
+        .sow_sql("/range-inv", "SELECT k FROM t WHERE v BETWEEN 3 AND 5")
+        .await
+        .unwrap();
+    assert_eq!(healthy.len(), 3);
+}
+
+/// Same regression on a Double-typed indexed column.
+#[tokio::test]
+async fn range_index_inverted_between_double_returns_empty() {
+    let topic = TopicSpec::new("/range-inv-d", "k")
+        .with_inline_columns([("k", "string"), ("price", "double")])
+        .with_index_columns(["price"]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for i in 1..=5_i64 {
+        client
+            .publish(
+                "/range-inv-d",
+                json!({ "k": format!("k{i}"), "price": i as f64 * 10.0 }),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let rows = client
+        .sow_sql(
+            "/range-inv-d",
+            "SELECT k FROM t WHERE price BETWEEN 50.0 AND 10.0",
+        )
+        .await
+        .expect("inverted-double BETWEEN must not stall");
+    assert!(rows.is_empty());
+}
+
+/// `<` (strict less) on indexed column — boundary value excluded.
+#[tokio::test]
+async fn range_index_strict_less_excludes_boundary() {
+    let topic = TopicSpec::new("/range-strict", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")])
+        .with_index_columns(["v"]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for i in 1..=5_i64 {
+        client
+            .publish("/range-strict", json!({ "k": format!("k{i}"), "v": i }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rows = client
+        .sow_sql("/range-strict", "SELECT k, v FROM t WHERE v < 3")
+        .await
+        .unwrap();
+    let mut vs: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get("v").unwrap().as_i64().unwrap())
+        .collect();
+    vs.sort();
+    assert_eq!(vs, vec![1, 2]);
 }

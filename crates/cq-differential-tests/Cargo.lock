@@ -425,7 +425,10 @@ checksum = "7e36cc9d416881d2e24f9a963be5fb1cd90966419ac844274161d10488b3e825"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "serde",
+ "wasm-bindgen",
  "windows-targets",
 ]
 
@@ -519,15 +522,19 @@ name = "cq-core"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "base64",
+ "chrono",
  "compact_str",
  "cq-txlog",
  "crossbeam-channel",
  "dashmap",
+ "itoa",
  "loom",
  "metrics",
  "parking_lot",
  "regex",
  "roaring",
+ "ryu",
  "serde",
  "serde_json",
  "sqlparser 0.56.0",

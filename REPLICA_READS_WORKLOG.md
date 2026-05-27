@@ -144,7 +144,7 @@ deserves its own session with its own test plan.
 
 ### S2c — TypeScript client mirror — ⏳ deferred to a follow-up session
 
-Mirror `connectAny(urls)` in `clients/ts/src/cq-client.ts`. Same
+Mirror `connectAny(urls)` in `client-sdks/ts/src/cq-client.ts`. Same
 random-order initial-connect semantics. Tests with jest + mock
 servers. Done after S2b so we can choose whether to also mirror
 the reconnect behaviour.

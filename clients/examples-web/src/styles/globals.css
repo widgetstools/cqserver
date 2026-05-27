@@ -1,9 +1,15 @@
 @import "tailwindcss";
+/* Fonts are loaded via the Google Fonts <link> in index.html — the
+ * design system spec uses Google's hosting and the @fontsource-variable
+ * package registers JetBrains Mono under the "JetBrains Mono Variable"
+ * family, which doesn't match `--sf-font-mono`. These @fontsource
+ * inter imports remain as a local fallback (no network → still get
+ * Inter); the 800-weight needs to come from Google because @fontsource
+ * doesn't expose an 800 face on this version. */
 @import "@fontsource/inter/400.css";
 @import "@fontsource/inter/500.css";
 @import "@fontsource/inter/600.css";
 @import "@fontsource/inter/700.css";
-@import "@fontsource-variable/jetbrains-mono";
 
 /*
  * cqserver Atlas — design system
@@ -123,15 +129,27 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   font-feature-settings: 'tnum' 1, 'zero' 1, 'ss01' 1;
 }
 
-/* ── TAB STRIP — slim, single row ──────────────────────────────
- * Tabs collapse to `serial + shortLabel`. Active gets mint-teal
- * serial color + 2px teal underline; inactive stays muted with
- * hover-reveal of the label. No icons, no all-caps — minimum
- * visual chrome over a navigation device used hundreds of times.
+/* ── TAB STRIP — two-line console row ──────────────────────────
+ *
+ * Each tab is a stacked cell:
+ *   line 1 (top, baseline aligned): serial + short label
+ *   line 2 (under):                 feature chips, one per primitive
+ *
+ * A faint vertical hairline between tabs gives the strip a console-
+ * register feel (Bloomberg / TT). Active state: subtle chrome wash +
+ * thicker teal underline + brighter serial. Streaming examples get a
+ * pulsing live dot in the top-right corner so the user can see at a
+ * glance which tabs are "alive" right now.
+ *
+ * The whole row sits at 56px to fit two readable lines without
+ * crowding 13px Inter on line 1. Horizontal scroll is preserved so
+ * narrow screens still get the strip without wrapping.
  */
 .atlas-tabstrip-wrap {
+  position: relative;
   border-bottom: 1px solid var(--sf-border);
-  background: hsl(var(--card));
+  background:
+    linear-gradient(to bottom, hsl(var(--card)) 0%, var(--sf-chrome) 100%);
   overflow-x: auto;
   scrollbar-width: none;
   flex-shrink: 0;
@@ -143,66 +161,147 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   align-items: stretch;
   gap: 0;
   border: 0;
-  padding: 0 4px;
-  height: 32px;
+  padding: 0;
+  height: 56px;
+  min-width: 100%;
 }
 
 .atlas-tab {
   position: relative;
   display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 32px;
-  padding: 0 12px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 4px;
+  height: 56px;
+  padding: 0 16px;
   background: transparent;
   border: 0;
+  border-right: 1px solid transparent;
   border-bottom: 2px solid transparent;
-  font-size: 11.5px;
-  font-weight: 400;
-  color: var(--sf-t-2);
   cursor: pointer;
   white-space: nowrap;
-  letter-spacing: -0.002em;
-  transition: color 120ms ease;
+  text-align: left;
+  transition:
+    color 140ms ease,
+    background 180ms ease,
+    border-color 140ms ease;
+}
+.atlas-tab + .atlas-tab {
+  border-left: 1px solid var(--sf-border-1);
+  margin-left: -1px;
 }
 .atlas-tab::after { display: none; }
-.atlas-tab:hover { color: var(--sf-t-1); }
+.atlas-tab:hover {
+  background: var(--sf-row-hover);
+}
 .atlas-tab:hover .atlas-tab-serial { color: var(--sf-t-1); }
+.atlas-tab:hover .atlas-tab-label { color: var(--sf-t-0); }
 .atlas-tab[data-state="active"] {
-  color: var(--sf-t-0);
+  background: var(--sf-row-sel);
   border-bottom-color: var(--sf-teal);
+  border-right-color: transparent;
 }
 .atlas-tab[data-state="active"] .atlas-tab-serial {
   color: var(--sf-teal);
 }
+.atlas-tab[data-state="active"] .atlas-tab-label {
+  color: var(--sf-t-0);
+  font-weight: 600;
+}
 
+.atlas-tab-top {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 9px;
+}
 .atlas-tab-serial {
   font-family: var(--sf-font-mono);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   font-variant-numeric: tabular-nums;
   color: var(--sf-t-3);
-  transition: color 120ms ease;
+  transition: color 140ms ease;
 }
 .atlas-tab-label {
   font-family: var(--sf-font-sans);
-  font-size: 11.5px;
-  font-weight: 400;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--sf-t-1);
+  letter-spacing: -0.005em;
+  transition: color 140ms ease;
 }
 
-/* ── CONTEXT BAR — single 32px row that names the active example
- *    Replaces the previous 120px hero rubric.
+.atlas-tab-features {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 14px;
+}
+.atlas-tab-feature {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 2px;
+  font-family: var(--sf-font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0;
+  background: color-mix(in srgb, var(--feature-color, var(--sf-t-3)) 18%, transparent);
+  color: var(--feature-color, var(--sf-t-2));
+  border: 1px solid color-mix(in srgb, var(--feature-color, transparent) 35%, transparent);
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.atlas-tab[data-state="active"] .atlas-tab-feature {
+  background: color-mix(in srgb, var(--feature-color, var(--sf-t-3)) 28%, transparent);
+  border-color: color-mix(in srgb, var(--feature-color, transparent) 55%, transparent);
+}
+
+.atlas-tab-live {
+  position: absolute;
+  top: 8px;
+  right: 9px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--feature-stream);
+  box-shadow: 0 0 0 0 var(--sf-teal-ring);
+  animation: atlas-live-pulse 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* ── CONTEXT BAR — example header strip ──────────────────────────
+ *
+ * 52px tall, three columns:
+ *   LEFT   — the giant serial number (display mono) + the title and
+ *            a one-line synopsis below it. Reads like the lede of a
+ *            magazine article: "EX.04 / Ticking Heatmap / sub-line".
+ *   MIDDLE — the feature pills, one per primitive. Each carries a
+ *            small letter glyph + the feature name. Hover reveals the
+ *            blurb in the title attribute.
+ *   RIGHT  — telemetry: pulsing LIVE indicator, tick rate read off
+ *            the cqserver store, cqserver wire path (/heatmap).
+ *
+ * The 3px teal accent rail on the left edge is retained — it's the
+ * Stockflux signature and ties the context bar to the active tab's
+ * underline.
  */
 .atlas-context {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 14px;
-  height: 32px;
-  padding: 0 16px 0 18px;
+  gap: 18px;
+  min-height: 52px;
+  padding: 8px 18px 8px 22px;
   border-bottom: 1px solid var(--sf-border);
-  background: hsl(var(--card));
+  background:
+    linear-gradient(to right,
+      var(--sf-chrome) 0%,
+      var(--sf-bg) 60%,
+      var(--sf-chrome) 100%);
   flex-shrink: 0;
 }
 .atlas-context::before {
@@ -210,60 +309,98 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   position: absolute;
   left: 0; top: 0; bottom: 0;
   width: 3px;
-  background: var(--sf-teal);
-  box-shadow: 0 0 6px var(--sf-teal-soft);
+  background: linear-gradient(
+    to bottom,
+    transparent 0%,
+    var(--sf-teal) 12%,
+    var(--sf-teal) 88%,
+    transparent 100%);
+  box-shadow: 0 0 8px var(--sf-teal-soft);
 }
 
+.atlas-context-lede {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.atlas-context-eyebrow {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 9px;
+}
 .atlas-context-serial {
   font-family: var(--sf-font-mono);
-  font-size: 11.5px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
   color: var(--sf-teal);
-  letter-spacing: 0.04em;
+  letter-spacing: 0.16em;
   font-variant-numeric: tabular-nums;
+}
+.atlas-context-clause {
+  font-family: var(--sf-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sf-t-3);
 }
 .atlas-context-title {
   margin: 0;
   font-family: var(--sf-font-sans);
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--sf-t-0);
-  letter-spacing: -0.01em;
+  letter-spacing: -0.012em;
+  line-height: 1.15;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* Feature pills in the middle column. */
 .atlas-context-tags {
   display: inline-flex;
   align-items: center;
-  gap: 11px;
+  gap: 6px;
   flex-shrink: 0;
+  flex-wrap: nowrap;
 }
 .atlas-context-tag {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-family: var(--sf-font-mono);
-  font-size: 9.5px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--sf-t-2);
+  height: 22px;
+  padding: 0 8px 0 6px;
+  border-radius: 11px;
+  border: 1px solid color-mix(in srgb, var(--feature-color, transparent) 35%, transparent);
+  background: color-mix(in srgb, var(--feature-color, transparent) 12%, transparent);
+  font-family: var(--sf-font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.005em;
+  color: var(--feature-color, var(--sf-t-1));
+  cursor: default;
+  transition: background 140ms ease, transform 140ms ease;
 }
-.atlas-context-tag::before {
-  content: '';
-  width: 5px; height: 5px;
+.atlas-context-tag:hover {
+  background: color-mix(in srgb, var(--feature-color, transparent) 22%, transparent);
+  transform: translateY(-1px);
+}
+.atlas-context-tag-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
-  background: currentColor;
+  background: color-mix(in srgb, var(--feature-color, var(--sf-t-3)) 28%, transparent);
+  font-family: var(--sf-font-mono);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0;
+  color: var(--feature-color, var(--sf-t-1));
 }
-.atlas-context-tag[data-kind="join"]   { color: #6cc4d5; }
-.atlas-context-tag[data-kind="view"]   { color: #b59cf0; }
-.atlas-context-tag[data-kind="filter"] { color: var(--sf-warn); }
-.atlas-context-tag[data-kind="agg"]    { color: var(--sf-up); }
-.atlas-context-tag[data-kind="pivot"]  { color: var(--sf-down-hi); }
-.atlas-context-tag[data-kind="stream"] { color: var(--sf-teal); }
-.atlas-context-tag[data-kind="window"] { color: var(--sf-info); }
 
 .atlas-context-right {
   margin-left: auto;
@@ -272,13 +409,43 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   gap: 14px;
   flex-shrink: 0;
 }
+.atlas-context-stats {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 14px;
+  font-family: var(--sf-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.atlas-context-stat {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  line-height: 1;
+}
+.atlas-context-stat-value {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--sf-t-0);
+}
+.atlas-context-stat-label {
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--sf-t-3);
+}
+.atlas-context-stat-value--accent { color: var(--sf-teal); }
 
 .atlas-context-path {
   font-family: var(--sf-font-mono);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 500;
   color: var(--sf-t-3);
-  letter-spacing: 0.03em;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--sf-t-3) 10%, transparent);
 }
 
 /* Pulsing LIVE pill — appears only when the example streams. */
@@ -340,14 +507,20 @@ h1, h2, h3, h4, h5, h6 { letter-spacing: -0.02em; }
   border-color: var(--sf-t-0);
   box-shadow: 0 0 0 1px var(--sf-t-0);
 }
-/* Diverging scale wired to trading semantics: up = teal, down = rose */
-.heatmap-cell[data-bucket="-3"] { background-color: var(--sf-down);     color: #fff5f5; }
-.heatmap-cell[data-bucket="-2"] { background-color: var(--sf-down-hi);  color: #fff; }
-.heatmap-cell[data-bucket="-1"] { background-color: var(--sf-down-soft); color: var(--sf-t-0); }
-.heatmap-cell[data-bucket="0"]  { background-color: var(--sf-bg-2);     color: var(--sf-t-2); }
-.heatmap-cell[data-bucket="1"]  { background-color: var(--sf-up-soft);  color: var(--sf-t-0); }
-.heatmap-cell[data-bucket="2"]  { background-color: var(--sf-up-hi);    color: #0a1814; }
-.heatmap-cell[data-bucket="3"]  { background-color: var(--sf-up);       color: #0a1814; }
+/*
+ * Diverging scale: each cell carries colour. The previous palette
+ * routed bucket-0 to `--sf-bg-2`, which is the page background — that
+ * read as black in dark mode and white in light mode, breaking the
+ * gradient visually. The seven buckets now run a proper red → green
+ * ramp pulled from the `--hm-*` tokens so they swap with the theme.
+ */
+.heatmap-cell[data-bucket="-3"] { background-color: var(--hm-down-3); color: var(--hm-down-text-strong); }
+.heatmap-cell[data-bucket="-2"] { background-color: var(--hm-down-2); color: var(--hm-down-text-mid); }
+.heatmap-cell[data-bucket="-1"] { background-color: var(--hm-down-1); color: var(--hm-down-text-soft); }
+.heatmap-cell[data-bucket="0"]  { background-color: var(--hm-zero);   color: var(--hm-zero-text); }
+.heatmap-cell[data-bucket="1"]  { background-color: var(--hm-up-1);   color: var(--hm-up-text-soft); }
+.heatmap-cell[data-bucket="2"]  { background-color: var(--hm-up-2);   color: var(--hm-up-text-mid); }
+.heatmap-cell[data-bucket="3"]  { background-color: var(--hm-up-3);   color: var(--hm-up-text-strong); }
 
 @keyframes hm-flash {
   0%   { box-shadow: inset 0 0 0 2px var(--sf-teal); }

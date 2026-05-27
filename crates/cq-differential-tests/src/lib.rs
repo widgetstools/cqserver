@@ -79,6 +79,8 @@ impl ColumnDef {
             "double" => Ok(ColumnType::Double),
             "long" => Ok(ColumnType::Long),
             "int" => Ok(ColumnType::Int),
+            "bool" | "boolean" => Ok(ColumnType::Bool),
+            "timestamp" | "datetime" | "ts" => Ok(ColumnType::Timestamp),
             other => bail!("unknown column type: {other}"),
         }
     }
@@ -89,6 +91,12 @@ impl ColumnDef {
             "double" => Ok(DataType::Float64),
             "long" => Ok(DataType::Int64),
             "int" => Ok(DataType::Int32),
+            "bool" | "boolean" => Ok(DataType::Boolean),
+            // Arrow timestamp microseconds — matches our internal i64 unit.
+            "timestamp" | "datetime" | "ts" => Ok(DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            )),
             other => bail!("unknown column type: {other}"),
         }
     }

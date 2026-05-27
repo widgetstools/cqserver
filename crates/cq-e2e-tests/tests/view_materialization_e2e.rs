@@ -57,6 +57,8 @@ async fn view_materialization_e2e() {
         .sow_and_subscribe("/by-desk-e2e", None, None)
         .await
         .expect("subscribe to view");
+    // The actual snapshot assertion lives further down — diversification tests
+    // appended at the end of this file.
 
     // Drain a couple of deltas — snapshot + any seed-time deltas.
     let mut snapshot: std::collections::HashMap<String, i64> =
@@ -166,4 +168,88 @@ async fn view_materialization_e2e() {
         "expected a Remove delta on the view when FX group empties; observed: {:?}",
         observed
     );
+}
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// View backed by COUNT(*) — verify the count moves on every publish.
+#[tokio::test]
+async fn view_with_count_aggregate_increments_on_publish() {
+    let source = TopicSpec::new("/v_count_src", "k")
+        .with_inline_columns([("k", "string"), ("g", "string")]);
+    let view = ViewSpec::new("/v_count", "/v_count_src", "SELECT g, COUNT(*) AS c FROM t GROUP BY g");
+    let opts = ServerOpts { views: vec![view], ..ServerOpts::default() };
+    let server = start_server_with(vec![source], opts).await;
+    let client = Client::connect(&server.tcp_url()).await.unwrap();
+
+    for (k, g) in [("a", "X"), ("b", "X"), ("c", "Y")] {
+        client.publish("/v_count_src", json!({ "k": k, "g": g })).await.unwrap();
+    }
+
+    // View materializes async — poll until X=2 + Y=1 settles.
+    let mut by_g: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let snap = client.sow("/v_count", None).await.unwrap();
+        by_g = snap
+            .iter()
+            .map(|r| {
+                (
+                    r.get("g").unwrap().as_str().unwrap().to_string(),
+                    r.get("c").unwrap().as_i64().unwrap(),
+                )
+            })
+            .collect();
+        if by_g.get("X").copied() == Some(2) && by_g.get("Y").copied() == Some(1) {
+            break;
+        }
+    }
+    assert_eq!(by_g.get("X").copied(), Some(2), "by_g={by_g:?}");
+    assert_eq!(by_g.get("Y").copied(), Some(1));
+
+    // Publish a new Y → c becomes 2.
+    client.publish("/v_count_src", json!({ "k": "d", "g": "Y" })).await.unwrap();
+    let mut y_c: i64 = 0;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let snap = client.sow("/v_count", None).await.unwrap();
+        y_c = snap
+            .iter()
+            .find(|r| r.get("g").unwrap().as_str() == Some("Y"))
+            .map(|r| r.get("c").unwrap().as_i64().unwrap())
+            .unwrap_or(0);
+        if y_c == 2 {
+            break;
+        }
+    }
+    assert_eq!(y_c, 2);
+}
+
+/// View whose source has NO rows yet — view starts empty; first
+/// publish creates the group.
+#[tokio::test]
+async fn view_on_empty_source_starts_empty_then_grows() {
+    let source = TopicSpec::new("/v_late_src", "k")
+        .with_inline_columns([("k", "string"), ("g", "string"), ("v", "long")]);
+    let view = ViewSpec::new("/v_late", "/v_late_src", "SELECT g, SUM(v) AS s FROM t GROUP BY g");
+    let opts = ServerOpts { views: vec![view], ..ServerOpts::default() };
+    let server = start_server_with(vec![source], opts).await;
+    let client = Client::connect(&server.tcp_url()).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let snap1 = client.sow("/v_late", None).await.unwrap();
+    assert!(snap1.is_empty(), "view starts empty");
+
+    client.publish("/v_late_src", json!({ "k": "k1", "g": "G", "v": 42 })).await.unwrap();
+    // Poll for materialisation (asynchronous view runner).
+    let mut snap2 = Vec::new();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        snap2 = client.sow("/v_late", None).await.unwrap();
+        if !snap2.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(snap2.len(), 1, "view should grow to 1 row");
+    assert_eq!(snap2[0].get("s").unwrap().as_i64().unwrap(), 42);
 }

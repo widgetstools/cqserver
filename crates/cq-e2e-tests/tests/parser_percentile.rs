@@ -46,3 +46,126 @@ async fn percentile_cont_and_median_match_known_values() {
     //     = 7 + 0.65 * (9 - 7) = 8.3
     assert!((p95 - 8.3).abs() < 1e-9, "p95 expected 8.3, got {p95}");
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// q = 0 returns the min, q = 1 returns the max.
+#[tokio::test]
+async fn percentile_cont_at_extremes_returns_min_and_max() {
+    let topic = TopicSpec::new("/pct-ext", "k")
+        .with_inline_columns([("k", "string"), ("v", "double")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    for (i, v) in [3.0_f64, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0].iter().enumerate() {
+        client
+            .publish("/pct-ext", json!({ "k": format!("r{i}"), "v": v }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let row = client
+        .sow_sql(
+            "/pct-ext",
+            "SELECT PERCENTILE_CONT(v, 0) AS lo, PERCENTILE_CONT(v, 1) AS hi FROM t",
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.get("lo").and_then(|x| x.as_f64()).unwrap(), 1.0);
+    assert_eq!(row.get("hi").and_then(|x| x.as_f64()).unwrap(), 9.0);
+}
+
+/// PERCENTILE_CONT with GROUP BY computes per-group quantile.
+#[tokio::test]
+async fn percentile_cont_group_by_per_partition() {
+    let topic = TopicSpec::new("/pct-group", "k").with_inline_columns([
+        ("k", "string"),
+        ("g", "string"),
+        ("v", "double"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for (k, g, v) in [
+        ("a1", "A", 10.0), ("a2", "A", 20.0), ("a3", "A", 30.0),
+        ("b1", "B", 100.0), ("b2", "B", 200.0), ("b3", "B", 300.0),
+    ] {
+        client
+            .publish("/pct-group", json!({ "k": k, "g": g, "v": v }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let rows = client
+        .sow_sql(
+            "/pct-group",
+            "SELECT g, MEDIAN(v) AS m FROM t GROUP BY g",
+        )
+        .await
+        .unwrap();
+    let by_g: std::collections::HashMap<String, f64> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get("g").unwrap().as_str().unwrap().to_string(),
+                r.get("m").unwrap().as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(by_g["A"], 20.0);
+    assert_eq!(by_g["B"], 200.0);
+}
+
+/// Invalid q (outside [0, 1]) → clean server error.
+#[tokio::test]
+async fn percentile_cont_invalid_q_rejected() {
+    use cq_client::ClientError;
+    let topic = TopicSpec::new("/pct-bad-q", "k")
+        .with_inline_columns([("k", "string"), ("v", "double")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    client
+        .publish("/pct-bad-q", json!({ "k": "r1", "v": 1.0 }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let r = client
+        .sow_sql("/pct-bad-q", "SELECT PERCENTILE_CONT(v, 1.5) AS p FROM t")
+        .await;
+    assert!(
+        matches!(r, Err(ClientError::Server(_))),
+        "q outside [0,1] must error, got {r:?}"
+    );
+    let r2 = client
+        .sow_sql("/pct-bad-q", "SELECT PERCENTILE_CONT(v, -0.1) AS p FROM t")
+        .await;
+    assert!(matches!(r2, Err(ClientError::Server(_))));
+}
+
+/// Empty topic → MEDIAN and PERCENTILE_CONT return null (no rows to interpolate).
+#[tokio::test]
+async fn percentile_cont_on_empty_topic_is_null() {
+    let topic = TopicSpec::new("/pct-empty", "k")
+        .with_inline_columns([("k", "string"), ("v", "double")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    let rows = client
+        .sow_sql(
+            "/pct-empty",
+            "SELECT MEDIAN(v) AS m, PERCENTILE_CONT(v, 0.5) AS p FROM t",
+        )
+        .await
+        .unwrap();
+    // Either no rows, or one row with both fields absent/null.
+    if let Some(row) = rows.first() {
+        let m = row.get("m");
+        let p = row.get("p");
+        assert!(m.is_none() || m.unwrap().is_null());
+        assert!(p.is_none() || p.unwrap().is_null());
+    }
+}

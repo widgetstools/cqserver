@@ -5,6 +5,19 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0a0c10" />
+    <!-- Match the StarUI design system's font stack 1:1: Inter (display
+         + body, 400–800) and JetBrains Mono (mono, 400–600). The
+         @fontsource-variable package registered the family as
+         "JetBrains Mono Variable" instead of "JetBrains Mono", which
+         caused silent fallback to system mono. Google Fonts gives us
+         the canonical family names plus the 800-weight Inter the
+         design system relies on for display headings. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
     <title>cqserver · Atlas — example field guide</title>
   </head>
   <body class="bg-background text-foreground antialiased">

@@ -28,4 +28,8 @@ tracing-subscriber.workspace = true
 # timeout (replaces a serial join loop that could hang for hours).
 futures = "0.3"
 
+# Scenario I — admin add-column round-trip needs HTTP + URL encoding.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+urlencoding = "2"
+
 [dev-dependencies]

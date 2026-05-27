@@ -128,3 +128,140 @@ async fn queue_ack_prevents_redelivery() {
         "B got a redelivery after A acked"
     );
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// Round-robin: with 2 consumers, 2 messages distribute across both
+/// (not both to the first).
+#[tokio::test]
+async fn queue_distributes_across_consumers() {
+    let server = start_server_with(
+        Vec::<TopicSpec>::new(),
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: vec![QueueSpec::new("/work_rr").with_lease(1000)],
+            auth: None,
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+    let publisher = Client::connect(&server.tcp_url()).await.expect("pub");
+    let a = Client::connect(&server.tcp_url()).await.unwrap();
+    let b = Client::connect(&server.tcp_url()).await.unwrap();
+    let mut sub_a = a.sow_and_subscribe("/work_rr", None, None).await.unwrap();
+    let mut sub_b = b.sow_and_subscribe("/work_rr", None, None).await.unwrap();
+
+    publisher.publish("/work_rr", json!({ "task": "T1" })).await.unwrap();
+    publisher.publish("/work_rr", json!({ "task": "T2" })).await.unwrap();
+
+    let d1 = tokio::time::timeout(Duration::from_millis(500), sub_a.next_delta())
+        .await
+        .unwrap()
+        .unwrap();
+    let d2 = tokio::time::timeout(Duration::from_millis(500), sub_b.next_delta())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut seen = vec![
+        d1.data.get("task").and_then(|v| v.as_str()).unwrap().to_string(),
+        d2.data.get("task").and_then(|v| v.as_str()).unwrap().to_string(),
+    ];
+    seen.sort();
+    assert_eq!(seen, vec!["T1", "T2"], "both tasks distributed across consumers");
+}
+
+/// Consumer disconnects mid-lease → message redelivered to another
+/// consumer once lease expires.
+#[tokio::test]
+async fn queue_redelivers_after_consumer_disconnects() {
+    let server = start_server_with(
+        Vec::<TopicSpec>::new(),
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: vec![QueueSpec::new("/disc_q").with_lease(150)],
+            auth: None,
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+    let pubc = Client::connect(&server.tcp_url()).await.unwrap();
+    let b = Client::connect(&server.tcp_url()).await.unwrap();
+    let mut sub_b = b.sow_and_subscribe("/disc_q", None, None).await.unwrap();
+
+    {
+        let a = Client::connect(&server.tcp_url()).await.unwrap();
+        let mut sub_a = a.sow_and_subscribe("/disc_q", None, None).await.unwrap();
+        pubc.publish("/disc_q", json!({ "task": "lost" })).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_millis(500), sub_a.next_delta())
+            .await
+            .unwrap()
+            .unwrap();
+        // A drops here — implicit consumer.
+    }
+
+    // After lease expiry, B should receive the redelivery.
+    let d = tokio::time::timeout(Duration::from_secs(2), sub_b.next_delta())
+        .await
+        .expect("B should get redelivery after A's disconnect")
+        .unwrap();
+    assert_eq!(d.data.get("task").and_then(|v| v.as_str()), Some("lost"));
+}
+
+/// Multiple publishes interleaved with acks — every message either
+/// gets acked once or redelivers; none are lost.
+#[tokio::test]
+async fn queue_no_message_loss_under_ack_pattern() {
+    let server = start_server_with(
+        Vec::<TopicSpec>::new(),
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: vec![QueueSpec::new("/no_loss").with_lease(2000)],
+            auth: None,
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+    let pubc = Client::connect(&server.tcp_url()).await.expect("pub");
+    let cons = Client::connect(&server.tcp_url()).await.expect("c");
+    let mut sub = cons.sow_and_subscribe("/no_loss", None, None).await.unwrap();
+
+    for i in 0..10 {
+        pubc.publish("/no_loss", json!({ "task": format!("T{i}") }))
+            .await
+            .unwrap();
+    }
+
+    let mut received = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while received.len() < 10 && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next_delta()).await {
+            Ok(Some(d)) => {
+                let task = d.data.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                received.insert(task);
+                if let Some(did) = d.delivery_id {
+                    cons.queue_ack("/no_loss", did).await.ok();
+                }
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(received.len(), 10, "got tasks: {received:?}");
+}

@@ -74,3 +74,109 @@ async fn row_number_lag_lead_over_wire() {
     let (rn, _, _) = &by_key[&("MSFT".to_string(), 300)];
     assert_eq!(*rn, 2);
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// RANK + DENSE_RANK with explicit ties — wire path must agree with
+/// the proptest-verified semantics.
+#[tokio::test]
+async fn rank_dense_rank_distinguish_tie_handling() {
+    let topic = TopicSpec::new("/q7_rank", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    // {100,100,200,300} — RANK: 1,1,3,4; DENSE_RANK: 1,1,2,3.
+    for (k, v) in [("a", 100), ("b", 100), ("c", 200), ("d", 300)] {
+        client
+            .publish("/q7_rank", json!({ "k": k, "v": v }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let rows = client
+        .sow_sql(
+            "/q7_rank",
+            "SELECT k, v, \
+                    RANK()       OVER (ORDER BY v ASC) AS r, \
+                    DENSE_RANK() OVER (ORDER BY v ASC) AS d \
+             FROM t",
+        )
+        .await
+        .unwrap();
+    let by_k: std::collections::HashMap<String, (u64, u64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get("k").unwrap().as_str().unwrap().to_string(),
+                (
+                    r.get("r").unwrap().as_u64().unwrap(),
+                    r.get("d").unwrap().as_u64().unwrap(),
+                ),
+            )
+        })
+        .collect();
+    // a and b tied at v=100.
+    assert_eq!(by_k["a"], (1, 1));
+    assert_eq!(by_k["b"], (1, 1));
+    assert_eq!(by_k["c"], (3, 2), "RANK skips to 3 after the tie; DENSE goes 2");
+    assert_eq!(by_k["d"], (4, 3));
+}
+
+/// Window function over an empty topic returns no rows (not 1 row of NULLs).
+#[tokio::test]
+async fn window_over_empty_topic_returns_no_rows() {
+    let topic = TopicSpec::new("/q7_empty", "k")
+        .with_inline_columns([("k", "string"), ("v", "long")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    let rows = client
+        .sow_sql(
+            "/q7_empty",
+            "SELECT k, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM t",
+        )
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+/// LAG with explicit offset > 1 — offset=2 must skip one row.
+#[tokio::test]
+async fn lag_with_explicit_offset_two() {
+    let topic = TopicSpec::new("/q7_lag2", "k")
+        .with_inline_columns([("k", "string"), ("seq", "long")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    for i in 1..=5_i64 {
+        client
+            .publish("/q7_lag2", json!({ "k": format!("k{i}"), "seq": i }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let rows = client
+        .sow_sql(
+            "/q7_lag2",
+            "SELECT seq, LAG(seq, 2) OVER (ORDER BY seq ASC) AS lag2 FROM t",
+        )
+        .await
+        .unwrap();
+    let by_seq: std::collections::HashMap<i64, Option<i64>> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get("seq").unwrap().as_i64().unwrap(),
+                r.get("lag2").and_then(|v| v.as_i64()),
+            )
+        })
+        .collect();
+    assert_eq!(by_seq[&1], None, "row 1 has no lag2");
+    assert_eq!(by_seq[&2], None, "row 2 has no lag2");
+    assert_eq!(by_seq[&3], Some(1));
+    assert_eq!(by_seq[&4], Some(2));
+    assert_eq!(by_seq[&5], Some(3));
+}

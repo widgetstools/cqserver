@@ -773,6 +773,228 @@ async fn run_one_subscriber(
     }
 }
 
+/// Scenario H (Q2 follow-up) — measure the wire-level `publish_batch`
+/// throughput advantage over sequential per-row `publish`.
+///
+/// Protocol:
+/// 1. Issue `total_rows` via N-sized batches; record total wall-clock
+///    + average per-row latency.
+/// 2. Issue the same `total_rows` one row at a time; record same.
+/// 3. Report the speedup ratio.
+///
+/// `cfg.publish_rate` is reinterpreted as `total_rows` (ignoring the
+/// rate-limiter — the point of this scenario is unthrottled
+/// throughput). `cfg.warmup` is reinterpreted as batch size.
+#[derive(Debug)]
+pub struct BatchReport {
+    pub scenario: &'static str,
+    pub total_rows: u64,
+    pub batch_size: u64,
+    pub batch_elapsed: Duration,
+    pub seq_elapsed: Duration,
+    pub batch_per_row_us: f64,
+    pub seq_per_row_us: f64,
+    pub speedup: f64,
+}
+
+impl BatchReport {
+    pub fn print(&self) {
+        println!("──────────────────────────────────────────────────");
+        println!("Scenario: {}", self.scenario);
+        println!("Rows:        {} (batch size = {})", self.total_rows, self.batch_size);
+        println!(
+            "publish_batch: {:.2}s total ({:.2} µs/row)",
+            self.batch_elapsed.as_secs_f64(),
+            self.batch_per_row_us
+        );
+        println!(
+            "publish     : {:.2}s total ({:.2} µs/row)",
+            self.seq_elapsed.as_secs_f64(),
+            self.seq_per_row_us
+        );
+        println!(
+            "Speedup     : {:.2}× (publish_batch / publish)",
+            self.speedup
+        );
+        println!("──────────────────────────────────────────────────");
+    }
+}
+
+pub async fn publish_batch_vs_sequential(cfg: &ScenarioConfig) -> Result<BatchReport> {
+    let client = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| format!("connect {}", cfg.server_url))?;
+    let total_rows: u64 = cfg.publish_rate as u64;
+    let batch_size: u64 = cfg.warmup.as_secs().max(1);
+
+    // Seed: drive schema discovery so the timing measurements aren't
+    // skewed by the first-publish discovery cost.
+    client
+        .publish(&cfg.topic, json!({ "k": "seed", "v": 0u64 }))
+        .await
+        .context("seed publish")?;
+
+    // Phase 1: batched.
+    let mut row_counter: u64 = 0;
+    let batch_start = Instant::now();
+    while row_counter < total_rows {
+        let take = batch_size.min(total_rows - row_counter);
+        let rows: Vec<serde_json::Value> = (0..take)
+            .map(|i| {
+                json!({
+                    "k": format!("b{}", row_counter + i),
+                    "v": row_counter + i,
+                })
+            })
+            .collect();
+        client
+            .publish_batch(&cfg.topic, rows)
+            .await
+            .with_context(|| format!("publish_batch at row {row_counter}"))?;
+        row_counter += take;
+    }
+    let batch_elapsed = batch_start.elapsed();
+
+    // Phase 2: sequential.
+    let seq_start = Instant::now();
+    for i in 0..total_rows {
+        client
+            .publish(
+                &cfg.topic,
+                json!({ "k": format!("s{i}"), "v": i + total_rows }),
+            )
+            .await
+            .with_context(|| format!("publish at row {i}"))?;
+    }
+    let seq_elapsed = seq_start.elapsed();
+
+    let batch_per_row_us = batch_elapsed.as_micros() as f64 / total_rows as f64;
+    let seq_per_row_us = seq_elapsed.as_micros() as f64 / total_rows as f64;
+    let speedup = seq_per_row_us / batch_per_row_us.max(0.001);
+
+    Ok(BatchReport {
+        scenario: "publish-batch-vs-sequential",
+        total_rows,
+        batch_size,
+        batch_elapsed,
+        seq_elapsed,
+        batch_per_row_us,
+        seq_per_row_us,
+        speedup,
+    })
+}
+
+/// Scenario I (Q11 follow-up) — schema evolution under publish load.
+///
+/// Protocol:
+/// - 1 publisher sustains `cfg.publish_rate` msg/s for `cfg.duration`.
+/// - Every 5 seconds, fire `POST /admin/add-column` to append a new
+///   column (`extra_0`, `extra_1`, ...).
+/// - Track publish ack latency p50/p99 throughout. Asserts that no
+///   publish errors out, and that p99 stays under the configured
+///   `latency_budget` (default 50 ms).
+///
+/// `cfg.admin_url` is the admin HTTP base; topic name is appended.
+#[derive(Debug)]
+pub struct EvolutionReport {
+    pub scenario: &'static str,
+    pub publishes_issued: u64,
+    pub publishes_acked: u64,
+    pub publish_errors: u64,
+    pub columns_added: u64,
+    pub publish_ack_p50: Duration,
+    pub publish_ack_p99: Duration,
+    pub duration: Duration,
+}
+
+impl EvolutionReport {
+    pub fn print(&self) {
+        println!("──────────────────────────────────────────────────");
+        println!("Scenario: {}", self.scenario);
+        println!("Duration: {:.2}s", self.duration.as_secs_f64());
+        println!(
+            "Publishes:    issued = {}, acked = {}, errors = {}",
+            self.publishes_issued, self.publishes_acked, self.publish_errors
+        );
+        println!("Columns added (online): {}", self.columns_added);
+        println!(
+            "Publish→Ack:  p50 = {}µs, p99 = {}µs",
+            self.publish_ack_p50.as_micros(),
+            self.publish_ack_p99.as_micros()
+        );
+        println!("──────────────────────────────────────────────────");
+    }
+}
+
+pub async fn schema_evolution_under_load(cfg: &ScenarioConfig) -> Result<EvolutionReport> {
+    let client = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| format!("connect {}", cfg.server_url))?;
+    let mut limiter = RateLimiter::new(cfg.publish_rate);
+    let mut ack_hist = LatencyHistogram::new();
+    let started = Instant::now();
+    let deadline = started + cfg.duration;
+    let mut next_evolve = started + Duration::from_secs(5);
+    let mut columns_added: u64 = 0;
+    let mut issued: u64 = 0;
+    let mut acked: u64 = 0;
+    let mut errors: u64 = 0;
+
+    // Seed publish so schema is established.
+    let _ = client
+        .publish(&cfg.topic, json!({ "k": "seed", "v": 0u64 }))
+        .await;
+
+    while Instant::now() < deadline {
+        limiter.tick().await;
+        // Fire an add-column every 5s.
+        if Instant::now() >= next_evolve {
+            let col_name = format!("extra_{columns_added}");
+            let url = format!(
+                "{}/admin/add-column/{}?name={}&type=long",
+                cfg.admin_url.trim_end_matches('/'),
+                urlencoding::encode(&cfg.topic),
+                col_name
+            );
+            match reqwest::Client::new().post(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    columns_added += 1;
+                }
+                Ok(r) => {
+                    eprintln!("add-column non-2xx: {}", r.status());
+                }
+                Err(e) => {
+                    eprintln!("add-column error: {e}");
+                }
+            }
+            next_evolve += Duration::from_secs(5);
+        }
+        let body = json!({ "k": issued.to_string(), "v": issued });
+        let t0 = Instant::now();
+        match client.publish(&cfg.topic, body).await {
+            Ok(_) => {
+                ack_hist.record(t0.elapsed());
+                acked += 1;
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+        issued += 1;
+    }
+
+    Ok(EvolutionReport {
+        scenario: "schema-evolution-under-load",
+        publishes_issued: issued,
+        publishes_acked: acked,
+        publish_errors: errors,
+        columns_added,
+        publish_ack_p50: ack_hist.p50(),
+        publish_ack_p99: ack_hist.p99(),
+        duration: started.elapsed(),
+    })
+}
+
 async fn read_rss_subs(admin: &cq_client::admin::AdminClient) -> Result<(f64, u64)> {
     let stats = admin.stats().await.context("admin stats")?;
     let rss = stats

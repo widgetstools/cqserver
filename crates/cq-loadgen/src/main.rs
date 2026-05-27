@@ -46,6 +46,14 @@ enum Scenario {
     /// Reports rows + bytes + latency. Result set is small
     /// (|books| × |sectors|) regardless of underlying position count.
     TraderViewPivot,
+    /// Q2 follow-up — measure wire-level `publish_batch` throughput
+    /// vs sequential per-row `publish`. `--rate` is reinterpreted as
+    /// total rows; `--warmup-secs` is reinterpreted as batch size.
+    PublishBatchVsSeq,
+    /// Q11 follow-up — sustain `--rate` msg/s while adding a column
+    /// online every 5 seconds. Reports publish ack p50/p99 and the
+    /// number of columns added in the window.
+    SchemaEvolutionUnderLoad,
 }
 
 #[derive(Parser, Debug)]
@@ -107,6 +115,12 @@ async fn main() -> Result<()> {
         }
         Scenario::TraderViewPivot => {
             scenarios::trader_view_pivot(&cfg).await?;
+        }
+        Scenario::PublishBatchVsSeq => {
+            scenarios::publish_batch_vs_sequential(&cfg).await?.print();
+        }
+        Scenario::SchemaEvolutionUnderLoad => {
+            scenarios::schema_evolution_under_load(&cfg).await?.print();
         }
     };
     Ok(())

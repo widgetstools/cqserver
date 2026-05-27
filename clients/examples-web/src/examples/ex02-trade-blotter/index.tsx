@@ -8,59 +8,119 @@ import { KpiPanel, type Kpi } from '@/components/panels/KpiPanel';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { useLiveTrades } from '@/lib/tick-engine';
+import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
+import { useFilteredAggregate } from '@/lib/use-filtered-aggregate';
 import { TRADE_COLUMNS } from '@/lib/schema/trades';
 import { buildColDefs, defaultTradeView } from '@/lib/grid-cols';
+import { BOOKS } from '@/lib/refdata';
 import { DOCS_BY_ID } from '@/docs';
 
-type FilterId = 'us' | 'eu' | 'asia' | 'fills_only' | 'breaks' | 'big_slip' | 'block';
+type FilterId =
+  | 'us'
+  | 'eu'
+  | 'asia'
+  | 'fills_only'
+  | 'breaks'
+  | 'big_slip'
+  | 'block'
+  | 'mifid'
+  | 'soft_dollar'
+  | 'dvp';
 
-const FILTERS: { id: FilterId; label: string; predicate: (t: Record<string, unknown>) => boolean }[] = [
-  { id: 'us', label: 'US venues', predicate: (t) => ['NYSE', 'NASDAQ', 'BATS', 'IEX', 'DARK_POOL'].includes(String(t.execution_venue)) },
-  { id: 'eu', label: 'EU venues', predicate: (t) => ['LSE', 'XETRA', 'EURONEXT', 'EUREX'].includes(String(t.execution_venue)) },
-  { id: 'asia', label: 'APAC venues', predicate: (t) => ['TSE', 'HKEX', 'ASX', 'KRX', 'TWSE'].includes(String(t.execution_venue)) },
-  { id: 'fills_only', label: 'Filled only', predicate: (t) => t.status === 'FILLED' },
-  { id: 'breaks', label: 'Has break', predicate: (t) => t.break_flag === true },
-  { id: 'big_slip', label: 'Slippage > 5bps', predicate: (t) => Math.abs(t.slippage_arrival_bps as number) > 5 },
-  { id: 'block', label: 'Block trade', predicate: (t) => Boolean(t.block_trade_id) },
+/**
+ * Each chip carries the server-side predicate it composes into when
+ * toggled. cqserver evaluates these on its filter compiler before
+ * egress — every row in `useFilteredSubscription` already passes the
+ * full predicate, so the React layer never filters anything.
+ */
+const FILTERS: { id: FilterId; label: string; cqExpr: string }[] = [
+  { id: 'us', label: 'US venues', cqExpr: "execution_venue IN ('NYSE','NASDAQ','BATS','IEX','DARK_POOL')" },
+  { id: 'eu', label: 'EU venues', cqExpr: "execution_venue IN ('LSE','XETRA','EURONEXT','EUREX')" },
+  { id: 'asia', label: 'APAC venues', cqExpr: "execution_venue IN ('TSE','HKEX','ASX','KRX','TWSE')" },
+  { id: 'fills_only', label: 'Filled only', cqExpr: "status = 'FILLED'" },
+  { id: 'breaks', label: 'Has break', cqExpr: 'break_flag = TRUE' },
+  { id: 'big_slip', label: 'Slippage > 5bps', cqExpr: 'ABS(slippage_arrival_bps) > 5' },
+  { id: 'block', label: 'Block trade', cqExpr: "block_trade_id != ''" },
+  // Native-bool chips — every Phase-11 bool column on /trades.
+  { id: 'mifid', label: 'MiFID', cqExpr: 'mifid_flag = TRUE' },
+  { id: 'soft_dollar', label: 'Soft-dollar', cqExpr: 'soft_dollar_eligible = TRUE' },
+  { id: 'dvp', label: 'DvP', cqExpr: 'dvp_flag = TRUE' },
 ];
 
 export function TradeBlotterCanvas() {
-  const trades = useLiveTrades();
   const colDefs = useMemo(() => buildColDefs(TRADE_COLUMNS), []);
   const visible = useMemo(() => defaultTradeView(), []);
 
   const [active, setActive] = useState<Set<FilterId>>(new Set());
+  const [selectedBooks, setSelectedBooks] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
 
-  const filtered = useMemo(() => {
-    let out = trades as Record<string, unknown>[];
+  // Compose the server-side filter expression from active chips +
+  // free-text search. Empty predicate ⇒ unfiltered subscription.
+  const cqFilter = useMemo<string | null>(() => {
+    const clauses: string[] = [];
     for (const f of FILTERS) {
-      if (active.has(f.id)) out = out.filter(f.predicate);
+      if (active.has(f.id)) clauses.push(`(${f.cqExpr})`);
     }
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      out = out.filter(
-        (t) =>
-          String(t.symbol).toLowerCase().includes(q) ||
-          String(t.trader_name).toLowerCase().includes(q) ||
-          String(t.book_name).toLowerCase().includes(q) ||
-          String(t.broker).toLowerCase().includes(q),
+    // Multi-select book filter — IN clause compiled server-side. Empty
+    // selection means "all books" and contributes no clause.
+    if (selectedBooks.size > 0) {
+      const list = Array.from(selectedBooks)
+        .map((b) => `'${b.replace(/'/g, "''")}'`)
+        .join(', ');
+      clauses.push(`book_name IN (${list})`);
+    }
+    const q = search.trim();
+    if (q) {
+      // Server-side LIKE on the four searchable string columns.
+      // cqserver's filter grammar supports LIKE with `%` wildcards.
+      const lit = q.replace(/'/g, "''");
+      clauses.push(
+        `(symbol LIKE '%${lit}%' OR trader_name LIKE '%${lit}%' OR ` +
+          `book_name LIKE '%${lit}%' OR broker LIKE '%${lit}%')`,
       );
     }
-    return out;
-  }, [trades, active, search]);
+    return clauses.length ? clauses.join(' AND ') : null;
+  }, [active, selectedBooks, search]);
+
+  // Per-component server-side subscription. Each filter change tears
+  // down the old subscription and opens a new one — cqserver returns
+  // only matching rows + OOF events when rows leave the filter set.
+  const tradesSub = useFilteredSubscription('/trades', cqFilter);
+
+  // Server-side aggregate subscription for the KPI panel. cqserver
+  // runs the SUM / AVG / COUNT on the same chip-filtered slice the
+  // grid is consuming and re-emits ONE row whenever any input row
+  // changes (continuous-aggregate semantics — Q3/P5). The React
+  // layer never reduces, never averages — it just renders.
+  const aggSql = useMemo(() => {
+    const where = cqFilter ? `WHERE ${cqFilter}` : '';
+    return (
+      `SELECT COUNT(*)                  AS trades,
+              SUM(notional_usd)         AS gross_notional,
+              SUM(total_fees_usd)       AS total_fees,
+              AVG(slippage_arrival_bps) AS avg_slip_bps
+       FROM t ${where}`
+    );
+  }, [cqFilter]);
+  const tradesAgg = useFilteredAggregate('/trades', aggSql);
 
   const kpis = useMemo<Kpi[]>(() => {
-    const sumN = (f: string) => filtered.reduce((s, r) => s + ((typeof r[f] === 'number' ? r[f] as number : 0)), 0);
-    const avg = (f: string) => filtered.length ? sumN(f) / filtered.length : 0;
+    const r = tradesAgg.row;
+    const num = (k: string): number =>
+      typeof r[k] === 'number' ? (r[k] as number) : 0;
     return [
-      { label: 'Trades', value: filtered.length, kind: 'count', sub: `${trades.length} total` },
-      { label: 'Gross Notional', value: sumN('notional_usd'), kind: 'ccy' },
-      { label: 'Total Fees', value: sumN('total_fees_usd'), kind: 'ccy' },
-      { label: 'Avg Slip Arr', value: avg('slippage_arrival_bps'), kind: 'pct', sub: 'bps' },
+      {
+        label: 'Trades',
+        value: num('trades'),
+        kind: 'count',
+        sub: cqFilter ? 'filtered · server-aggregated' : 'unfiltered · server-aggregated',
+      },
+      { label: 'Gross Notional', value: num('gross_notional'), kind: 'ccy' },
+      { label: 'Total Fees', value: num('total_fees'), kind: 'ccy' },
+      { label: 'Avg Slip Arr', value: num('avg_slip_bps'), kind: 'pct', sub: 'bps' },
     ];
-  }, [filtered, trades.length]);
+  }, [tradesAgg.row, cqFilter]);
 
   const toggle = (id: FilterId) => {
     setActive((a) => {
@@ -71,19 +131,27 @@ export function TradeBlotterCanvas() {
     });
   };
 
-  const filterSql = `SELECT trade_id, trade_ts, symbol, side, quantity, price,
+  const toggleBook = (name: string) => {
+    setSelectedBooks((s) => {
+      const n = new Set(s);
+      if (n.has(name)) n.delete(name);
+      else n.add(name);
+      return n;
+    });
+  };
+
+  // The SQL panel now shows the EXACT predicate cqserver is evaluating
+  // on the wire — no longer a hand-edited approximation. Composed from
+  // the same `cqFilter` string that the FilteredSubscription passes
+  // through to `sowAndSubscribe({ filter })`.
+  const filterSql = `-- Wire-form predicate, evaluated by cqserver
+-- before delta egress. Open the admin /subscriptions page to
+-- see this exact filter compiled and attached to the active sub.
+SELECT trade_id, trade_ts, symbol, side, quantity, price,
        notional_usd, execution_venue, execution_algo,
        slippage_arrival_bps, total_fees_usd, status
 FROM trades
-WHERE 1=1${active.has('us') ? `
-  AND execution_venue IN ('NYSE','NASDAQ','BATS','IEX','DARK_POOL')` : ''}${active.has('eu') ? `
-  AND execution_venue IN ('LSE','XETRA','EURONEXT','EUREX')` : ''}${active.has('asia') ? `
-  AND execution_venue IN ('TSE','HKEX','ASX','KRX','TWSE')` : ''}${active.has('fills_only') ? `
-  AND status = 'FILLED'` : ''}${active.has('breaks') ? `
-  AND break_flag = TRUE` : ''}${active.has('big_slip') ? `
-  AND ABS(slippage_arrival_bps) > 5` : ''}${active.has('block') ? `
-  AND block_trade_id IS NOT NULL` : ''}${search.trim() ? `
-  AND (symbol ILIKE '%${search}%' OR trader_name ILIKE '%${search}%')` : ''}
+WHERE ${cqFilter ?? '/* no predicate — full stream */'}
 ORDER BY trade_ts DESC
 LIMIT 500;`;
 
@@ -126,18 +194,60 @@ LIMIT 500;`;
                 );
               })}
             </div>
+            <div className="atlas-eyebrow mt-4 mb-2">
+              Books{' '}
+              {selectedBooks.size > 0 && (
+                <span className="font-mono text-foreground/70">
+                  · {selectedBooks.size} of {BOOKS.length}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {BOOKS.map((b) => {
+                const on = selectedBooks.has(b.name);
+                return (
+                  <button
+                    key={b.id}
+                    onClick={() => toggleBook(b.name)}
+                    className={
+                      'inline-flex items-center gap-1 h-6 px-2 rounded-full border text-[10.5px] font-mono uppercase tracking-[0.05em] transition-colors ' +
+                      (on
+                        ? 'border-signal/60 bg-signal-muted text-signal'
+                        : 'border-border text-muted-foreground hover:border-foreground/40 hover:text-foreground')
+                    }
+                    title={`${b.strategy} · ${b.desk}`}
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full ${on ? 'bg-signal' : 'bg-muted-foreground/40'}`} />
+                    {b.name}
+                  </button>
+                );
+              })}
+            </div>
             <div className="mt-4 atlas-eyebrow">Active filters</div>
             <div className="mt-1 flex flex-wrap gap-1">
-              {active.size === 0 ? (
+              {active.size === 0 && selectedBooks.size === 0 ? (
                 <Badge variant="muted">none</Badge>
               ) : (
-                Array.from(active).map((id) => (
-                  <Badge key={id} variant="signal">{FILTERS.find((f) => f.id === id)?.label}</Badge>
-                ))
+                <>
+                  {Array.from(active).map((id) => (
+                    <Badge key={id} variant="signal">{FILTERS.find((f) => f.id === id)?.label}</Badge>
+                  ))}
+                  {Array.from(selectedBooks).map((name) => (
+                    <Badge key={`book:${name}`} variant="signal">{name}</Badge>
+                  ))}
+                </>
               )}
             </div>
             <div className="mt-3">
-              <Button size="xs" variant="outline" onClick={() => { setActive(new Set()); setSearch(''); }}>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => {
+                  setActive(new Set());
+                  setSelectedBooks(new Set());
+                  setSearch('');
+                }}
+              >
                 Reset all
               </Button>
             </div>
@@ -151,10 +261,11 @@ LIMIT 500;`;
       render: () => (
         <GridPanel
           title="Trade Tape · 21 of 203 cols"
-          rows={filtered}
           colDefs={colDefs}
           visible={visible}
           getRowId={(r) => r.trade_id as string}
+          liveSubscription={tradesSub}
+          tickTopic="trades"
         />
       ),
     },
@@ -162,7 +273,14 @@ LIMIT 500;`;
       id: 'sql',
       title: 'SQL · generated',
       pin: 'right',
-      render: () => <SqlPanel title="Generated SQL" value={filterSql} readOnly planSummary={`${filtered.length} rows · ${active.size + (search ? 1 : 0)} predicates`} />,
+      render: () => (
+        <SqlPanel
+          title="Generated SQL"
+          value={filterSql}
+          readOnly
+          planSummary={`${tradesSub.size} rows · ${active.size + (selectedBooks.size > 0 ? 1 : 0) + (search ? 1 : 0)} predicates`}
+        />
+      ),
     },
     {
       id: 'notes',
@@ -172,10 +290,23 @@ LIMIT 500;`;
     },
   ];
 
+  // Layout proportions:
+  //
+  //   ┌─────────────────────────┬──────────────┐ ┐
+  //   │ Filter KPIs (≈25 % H)   │              │ │
+  //   ├─────────────────────────┤ Filter Chips │ │ SQL + Help pinned
+  //   │                         │  (≈25 % W)   │ │ on the right edge
+  //   │ Trade Tape (≈75 % H)    │              │ │
+  //   │                         │              │ │
+  //   └─────────────────────────┴──────────────┘ ┘
+  //
+  // Filter Chips is the new panel on step 2 → `size: 0.25` makes it
+  // 25 % of the root split. Trade Tape is the new panel on step 3 →
+  // `size: 0.75` makes it 75 % of the left column (KPIs gets 25 %).
   const layout: DockLayoutStep[] = [
     { id: 'kpis' },
-    { id: 'filters', relativeTo: 'kpis', direction: 'right' },
-    { id: 'tape', relativeTo: 'kpis', direction: 'below' },
+    { id: 'filters', relativeTo: 'kpis', direction: 'right', size: 0.25 },
+    { id: 'tape', relativeTo: 'kpis', direction: 'below', size: 0.75 },
     { id: 'sql', relativeTo: 'tape', direction: 'right' },
     { id: 'notes', relativeTo: 'sql', direction: 'below' },
   ];

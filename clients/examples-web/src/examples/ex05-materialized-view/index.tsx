@@ -5,58 +5,20 @@ import { SqlPanel } from '@/components/panels/SqlPanel';
 import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
 import { Badge } from '@/components/ui/badge';
-import { getPositions } from '@/lib/data-gen';
+import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 import { QUERIES } from '@/lib/queries/library';
 import { DOCS_BY_ID } from '@/docs';
 import { fmtCcy, fmtPct, fmtSigned } from '@/lib/format';
 import type { ColDef } from 'ag-grid-community';
 
-interface ExposureRow {
-  book_id: string;
-  book_name: string;
-  asset_class: string;
-  currency: string;
-  net_mv_usd: number;
-  gross_exposure: number;
-  net_dv01: number;
-  sum_var: number;
-  worst_util_pct: number;
-  n_positions: number;
-}
-
-function computeView(positions: Record<string, unknown>[]): ExposureRow[] {
-  const m = new Map<string, ExposureRow>();
-  for (const p of positions) {
-    const k = `${p.book_id}::${p.asset_class}::${p.currency}`;
-    let r = m.get(k);
-    if (!r) {
-      r = {
-        book_id: String(p.book_id),
-        book_name: String(p.book_name),
-        asset_class: String(p.asset_class),
-        currency: String(p.currency),
-        net_mv_usd: 0,
-        gross_exposure: 0,
-        net_dv01: 0,
-        sum_var: 0,
-        worst_util_pct: 0,
-        n_positions: 0,
-      };
-      m.set(k, r);
-    }
-    r.net_mv_usd += (p.market_value_usd as number) || 0;
-    r.gross_exposure += (p.exposure_gross as number) || 0;
-    r.net_dv01 += (p.dv01_usd as number) || 0;
-    r.sum_var += (p.var_1d_95 as number) || 0;
-    r.worst_util_pct = Math.max(r.worst_util_pct, (p.risk_limit_utilization_pct as number) || 0);
-    r.n_positions += 1;
-  }
-  return Array.from(m.values()).sort((a, b) => b.gross_exposure - a.gross_exposure);
-}
-
 export function MaterializedViewCanvas() {
-  const positions = useMemo(() => getPositions(), []);
-  const rows = useMemo(() => computeView(positions as Record<string, unknown>[]), [positions]);
+  // The view is a real cqserver topic — declared in cqserver.toml as
+  // an aggregate over /positions, materialized incrementally on the
+  // server, and republished as a delta stream whenever any group's
+  // running aggregate changes. The React layer NEVER recomputes the
+  // aggregate; it subscribes to the view's SOW + deltas just like any
+  // other topic.
+  const viewSub = useFilteredSubscription('/v_net_exposure', null);
 
   const cols: ColDef[] = useMemo(() => [
     { field: 'book_name', headerName: 'Book', width: 160 },
@@ -158,8 +120,11 @@ export function MaterializedViewCanvas() {
       render: () => (
         <GridPanel
           title="View Output · net_exposure"
-          rows={rows as unknown as Record<string, unknown>[]}
           colDefs={cols}
+          getRowId={(r) =>
+            `${r.book_id ?? ''}|${r.book_name ?? ''}|${r.asset_class ?? ''}|${r.currency ?? ''}`
+          }
+          liveSubscription={viewSub}
         />
       ),
     },

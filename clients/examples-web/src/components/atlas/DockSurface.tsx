@@ -8,7 +8,9 @@ import {
   type DockviewApi,
   type DockPosition,
   type DockEdge,
+  type LayoutNode,
   type Placement,
+  type SplitNode,
 } from '@widgetstools/dock-manager-core';
 import { useTheme } from '@/components/theme/ThemeProvider';
 
@@ -61,7 +63,17 @@ export interface DockLayoutStep {
   id: string;
   direction?: DockDirection;
   relativeTo?: string;
-  /** Reserved for future use (no per-step sizing in this surface yet). */
+  /**
+   * Fraction of the parent split this panel should occupy (0–1). Sets
+   * the percent on the immediate enclosing split right after the panel
+   * is inserted, so a step like
+   *
+   *     { id: 'editor', relativeTo: 'library', direction: 'right', size: 0.7 }
+   *
+   * makes editor 70 % wide and library 30 %. Only honored on
+   * two-child splits — for arbitrary arity, set sizes manually via
+   * the `onReady(api)` escape hatch.
+   */
   size?: number;
 }
 
@@ -131,6 +143,20 @@ export function DockSurface({ panels, layout, onReady }: DockSurfaceProps) {
           targetGroupId: groupId ?? undefined,
           position: DIRECTION_TO_POSITION[dir],
         });
+
+        // Apply per-step sizing if requested. We walk the layout tree
+        // looking for the split that now contains this panel as a
+        // direct child; the dock-manager's `resizeSplit` takes percent
+        // sizes that sum to 100.
+        if (typeof step.size === 'number' && step.size > 0 && step.size < 1) {
+          const found = findEnclosingSplit(api.layout, step.id);
+          if (found && found.split.children.length === 2) {
+            const sizes = [0, 0];
+            sizes[found.childIndex] = Math.round(step.size * 100);
+            sizes[1 - found.childIndex] = 100 - sizes[found.childIndex]!;
+            api.resizeSplit(found.split.id, sizes);
+          }
+        }
       }
 
       // Pin/unpin pass: any panel with `pin: <edge>` is moved from its
@@ -178,4 +204,28 @@ export function DockSurface({ panels, layout, onReady }: DockSurfaceProps) {
       />
     </div>
   );
+}
+
+/**
+ * Walk a LayoutNode tree looking for the split that directly contains
+ * a tab-group with `panelId` as one of its panels. Used by the
+ * `DockLayoutStep.size` post-processing to find the split whose sizes
+ * should be adjusted after a panel is inserted.
+ */
+function findEnclosingSplit(
+  root: LayoutNode,
+  panelId: string,
+): { split: SplitNode; childIndex: number } | null {
+  if (root.type !== 'split') return null;
+  for (let i = 0; i < root.children.length; i++) {
+    const child = root.children[i]!;
+    if (child.type === 'tabgroup' && child.panels.includes(panelId)) {
+      return { split: root, childIndex: i };
+    }
+    if (child.type === 'split') {
+      const inner = findEnclosingSplit(child, panelId);
+      if (inner) return inner;
+    }
+  }
+  return null;
 }

@@ -40,3 +40,8 @@ libc = "0.2"
 tokio = { workspace = true }
 bcrypt = { workspace = true }
 jsonwebtoken = { workspace = true }
+# Q2/Q11 follow-up — smoke harness for the new loadgen scenarios.
+cq-loadgen = { path = "../cq-loadgen" }
+# Q10 bytes wire e2e — encode/decode base64 payloads + URL-encode topic paths.
+base64 = "0.22"
+urlencoding = "2"

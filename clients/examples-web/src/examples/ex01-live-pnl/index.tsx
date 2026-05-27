@@ -5,71 +5,74 @@ import { KpiPanel, type Kpi } from '@/components/panels/KpiPanel';
 import { SqlPanel } from '@/components/panels/SqlPanel';
 import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
-import { useLivePositions } from '@/lib/tick-engine';
 import { POSITION_COLUMNS } from '@/lib/schema/positions';
 import { buildColDefs, defaultPositionView } from '@/lib/grid-cols';
 import { fmtSigned, fmtCcy } from '@/lib/format';
 import { QUERIES } from '@/lib/queries/library';
 import { DOCS_BY_ID } from '@/docs';
+import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 
-// Sum a numeric field across positions, optionally filtering.
-function sum(rows: Record<string, unknown>[], field: string, filter?: (r: Record<string, unknown>) => boolean): number {
-  let s = 0;
-  for (const r of rows) {
-    if (filter && !filter(r)) continue;
-    const v = r[field];
-    if (typeof v === 'number' && Number.isFinite(v)) s += v;
-  }
-  return s;
-}
-
-function groupSum(rows: Record<string, unknown>[], keyField: string, valueField: string): { key: string; v: number }[] {
-  const m = new Map<string, number>();
-  for (const r of rows) {
-    const k = String(r[keyField] ?? '');
-    const v = (typeof r[valueField] === 'number' ? r[valueField] as number : 0);
-    m.set(k, (m.get(k) ?? 0) + v);
-  }
-  return Array.from(m.entries()).map(([key, v]) => ({ key, v })).sort((a, b) => b.v - a.v);
-}
-
-// Numeric columns that should flash when their value updates live.
-const FLASH_COLS = [
-  'last_price', 'last_price_local', 'last_price_usd',
-  'market_value', 'market_value_local', 'market_value_usd',
-  'unrealized_pnl', 'unrealized_pnl_usd',
-  'day_pnl', 'total_pnl',
-  'price_change', 'price_change_pct',
-] as const;
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
 
 export function LivePnlCanvas() {
-  const live = useLivePositions();
+  // Three server-side aggregates feed this tab:
+  //   /v_pnl_by_sector      — Sector PnL ladder
+  //   /v_pnl_by_book        — Book contribution waterfall + KPI totals
+  //   /v_compliance_counts  — Compliance breaches counter
+  // The Positions grid itself stays on the raw /positions topic via
+  // GridPanel's imperative binding (snapshot + delta stream).
+  //
+  // Grand totals are rolled up from /v_pnl_by_book's 8 rows on the
+  // client. cqserver's view runner stores rows by GROUP BY key, so a
+  // degenerate (no-GROUP-BY) totals view doesn't dedupe — instead we
+  // sum 8 already-aggregated rows here, which is presentation, not
+  // stream aggregation.
+  const sectorSub = useFilteredSubscription('/v_pnl_by_sector', null);
+  const bookSub = useFilteredSubscription('/v_pnl_by_book', null);
+  const complianceSub = useFilteredSubscription('/v_compliance_counts', null);
+
   const colDefs = useMemo(() => buildColDefs(POSITION_COLUMNS), []);
   const visible = useMemo(() => defaultPositionView(), []);
 
   const kpis = useMemo<Kpi[]>(() => {
-    const gross = sum(live, 'exposure_gross');
-    const net = sum(live, 'market_value_usd');
-    const upnl = sum(live, 'unrealized_pnl_usd');
-    const rpnl = sum(live, 'realized_pnl_usd');
-    const day = sum(live, 'day_pnl');
-    const ytd = sum(live, 'ytd_pnl');
-    const var95 = sum(live, 'var_1d_95');
-    const breaches = live.filter((p) => p.compliance_status === 'BREACH').length;
+    let gross = 0, net = 0, upnl = 0, rpnl = 0, day = 0, ytd = 0, var95 = 0, nPos = 0;
+    for (const r of bookSub.rows) {
+      gross += num(r.exposure_gross);
+      net   += num(r.market_value);
+      upnl  += num(r.unrealized_pnl);
+      rpnl  += num(r.realized_pnl);
+      day   += num(r.day_pnl);
+      ytd   += num(r.ytd_pnl);
+      var95 += num(r.var_95);
+      nPos  += num(r.n_positions);
+    }
+    const breachRow = complianceSub.rows.find((r) => r.compliance_status === 'BREACH');
+    const breaches = num(breachRow?.n_positions);
     return [
-      { label: 'Gross Exposure',   value: gross,    kind: 'ccy',          sub: `${live.length} positions` },
-      { label: 'Net MV',           value: net,      kind: 'signed-ccy',   delta: day * 0.1 },
-      { label: 'Unrealized PnL',   value: upnl,     kind: 'signed-ccy',   delta: day },
+      { label: 'Gross Exposure',   value: gross,    kind: 'ccy',         sub: `${nPos} positions` },
+      { label: 'Net MV',           value: net,      kind: 'signed-ccy',  delta: day * 0.1 },
+      { label: 'Unrealized PnL',   value: upnl,     kind: 'signed-ccy',  delta: day },
       { label: 'Realized PnL',     value: rpnl,     kind: 'signed-ccy' },
-      { label: 'Day PnL',          value: day,      kind: 'signed-ccy',   delta: day * 0.04, sub: 'vs t-1 close' },
-      { label: 'YTD PnL',          value: ytd,      kind: 'signed-ccy',   sub: 'inception' },
-      { label: 'VaR (1d, 95%)',    value: var95,    kind: 'ccy',          sub: 'sum of pos VaR' },
-      { label: 'Compliance Brchs', value: breaches, kind: 'count',        sub: 'BREACH status' },
+      { label: 'Day PnL',          value: day,      kind: 'signed-ccy',  delta: day * 0.04, sub: 'vs t-1 close' },
+      { label: 'YTD PnL',          value: ytd,      kind: 'signed-ccy',  sub: 'inception' },
+      { label: 'VaR (1d, 95%)',    value: var95,    kind: 'ccy',         sub: 'sum of pos VaR' },
+      { label: 'Compliance Brchs', value: breaches, kind: 'count',       sub: 'BREACH status' },
     ];
-  }, [live]);
+  }, [bookSub.rows, complianceSub.rows]);
 
-  const sectorPnL = useMemo(() => groupSum(live, 'issuer_sector', 'day_pnl'), [live]);
-  const bookPnL = useMemo(() => groupSum(live, 'book_name', 'unrealized_pnl_usd'), [live]);
+  // Server-side aggregate rows; sort + project to the {key,v} shape
+  // the existing ladder/contribution SVGs already expect.
+  const sectorPnL = useMemo(() => {
+    return sectorSub.rows
+      .map((r) => ({ key: String(r.issuer_sector ?? ''), v: num(r.day_pnl) }))
+      .sort((a, b) => b.v - a.v);
+  }, [sectorSub.rows]);
+
+  const bookPnL = useMemo(() => {
+    return bookSub.rows
+      .map((r) => ({ key: String(r.book_name ?? ''), v: num(r.unrealized_pnl) }))
+      .sort((a, b) => b.v - a.v);
+  }, [bookSub.rows]);
 
   const liveQuery = QUERIES.find((q) => q.id === 'vw-1')!;
 
@@ -132,11 +135,10 @@ export function LivePnlCanvas() {
       render: () => (
         <GridPanel
           title="Positions · 23 of 203 cols"
-          rows={live as Record<string, unknown>[]}
           colDefs={colDefs}
           visible={visible}
           getRowId={(r) => r.position_id as string}
-          flashColumns={FLASH_COLS}
+          topic="positions"
         />
       ),
     },
@@ -189,10 +191,23 @@ export function LivePnlCanvas() {
     },
   ];
 
+  // Symmetric 2×2 grid:
+  //
+  //   ┌─────────────┬─────────────┐
+  //   │  KPIs       │  Sector PnL │
+  //   ├─────────────┼─────────────┤
+  //   │  Positions  │  Book Contr │
+  //   └─────────────┴─────────────┘
+  //
+  // Order matters: react-dock-manager's `relativeTo` targets a *leaf*,
+  // so we must create the top/bottom split FIRST (positions below
+  // kpis) before splitting either row horizontally. Otherwise the
+  // first horizontal split (ladder right of kpis) makes ladder the
+  // full-height right column and we never get a symmetric grid.
   const layout: DockLayoutStep[] = [
     { id: 'kpis' },
-    { id: 'ladder', relativeTo: 'kpis', direction: 'right' },
     { id: 'positions', relativeTo: 'kpis', direction: 'below' },
+    { id: 'ladder', relativeTo: 'kpis', direction: 'right' },
     { id: 'bookpnl', relativeTo: 'positions', direction: 'right' },
     { id: 'sql', relativeTo: 'bookpnl', direction: 'below' },
     { id: 'notes', relativeTo: 'positions', direction: 'below' },

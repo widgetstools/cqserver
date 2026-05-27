@@ -73,3 +73,105 @@ async fn count_distinct_returns_unique_value_count() {
     assert_eq!(by_desk["EQUITIES"], 2, "EQUITIES has alice + charlie");
     assert_eq!(by_desk["TECH"], 1, "TECH has only dave");
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// COUNT(DISTINCT col) ignores NULLs — ANSI behaviour.
+#[tokio::test]
+async fn count_distinct_skips_null_values() {
+    let topic = TopicSpec::new("/cd-null", "k")
+        .with_inline_columns([("k", "string"), ("tag", "string")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for (k, tag) in [
+        ("a", Some("X")),
+        ("b", None),
+        ("c", Some("Y")),
+        ("d", None),
+        ("e", Some("X")), // dup
+    ] {
+        let map = match tag {
+            Some(t) => json!({ "k": k, "tag": t }),
+            None => json!({ "k": k }),
+        };
+        client.publish("/cd-null", map).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let row = client
+        .sow_sql("/cd-null", "SELECT COUNT(DISTINCT tag) AS c, COUNT(*) AS n FROM t")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.get("c").unwrap().as_u64().unwrap(), 2, "X + Y, NULLs ignored");
+    assert_eq!(row.get("n").unwrap().as_u64().unwrap(), 5);
+}
+
+/// COUNT(DISTINCT) over numeric column.
+#[tokio::test]
+async fn count_distinct_over_numeric_column() {
+    let topic = TopicSpec::new("/cd-int", "k")
+        .with_inline_columns([("k", "string"), ("bucket", "long")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for (k, b) in [("a", 10), ("b", 10), ("c", 20), ("d", 30), ("e", 20)] {
+        client
+            .publish("/cd-int", json!({ "k": k, "bucket": b }))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let row = client
+        .sow_sql("/cd-int", "SELECT COUNT(DISTINCT bucket) AS c FROM t")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.get("c").unwrap().as_u64().unwrap(), 3);
+}
+
+/// Empty topic → COUNT(DISTINCT) = 0.
+#[tokio::test]
+async fn count_distinct_on_empty_topic_is_zero() {
+    let topic = TopicSpec::new("/cd-empty", "k")
+        .with_inline_columns([("k", "string"), ("tag", "string")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    let row = client
+        .sow_sql("/cd-empty", "SELECT COUNT(DISTINCT tag) AS c FROM t")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.get("c").unwrap().as_u64().unwrap(), 0);
+}
+
+/// All-same-value column → COUNT(DISTINCT) = 1.
+#[tokio::test]
+async fn count_distinct_all_same_value_is_one() {
+    let topic = TopicSpec::new("/cd-same", "k")
+        .with_inline_columns([("k", "string"), ("tag", "string")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    for i in 0..20 {
+        client
+            .publish(
+                "/cd-same",
+                json!({ "k": format!("k{i}"), "tag": "ONE_VALUE" }),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let row = client
+        .sow_sql("/cd-same", "SELECT COUNT(DISTINCT tag) AS c FROM t")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(row.get("c").unwrap().as_u64().unwrap(), 1);
+}

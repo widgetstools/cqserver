@@ -121,6 +121,12 @@ export class Client {
   private subs = new Map<string, Subscription>();
   private snapshotBuffers = new Map<string, Record<string, unknown>[]>();
   private snapshotCompletions = new Map<string, (rows: Record<string, unknown>[]) => void>();
+  // Parallel to snapshotCompletions: lets the dispatcher reject a
+  // pending SOW when the server returns an error ack with the SOW's
+  // cid (e.g. JOIN parse failure surfaces as `{c:'ack', status:'error',
+  // cid:<sow-cid>}` and would otherwise be silently dropped because
+  // the SOW cid isn't in the `pending` RPC map).
+  private snapshotRejecters = new Map<string, (err: Error) => void>();
   private closed = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private closeListeners = new Set<() => void>();
@@ -372,11 +378,19 @@ export class Client {
       const timer = setTimeout(() => {
         this.snapshotBuffers.delete(cid);
         this.snapshotCompletions.delete(cid);
+        this.snapshotRejecters.delete(cid);
         reject(new ClientError(`sow timeout (cid=${cid})`));
       }, ackTimeoutMs);
       this.snapshotCompletions.set(cid, (rows) => {
         clearTimeout(timer);
+        this.snapshotRejecters.delete(cid);
         resolve(rows);
+      });
+      this.snapshotRejecters.set(cid, (err) => {
+        clearTimeout(timer);
+        this.snapshotBuffers.delete(cid);
+        this.snapshotCompletions.delete(cid);
+        reject(err);
       });
       const msg: CqMessage = { c: 'sow', cid, t: topic };
       if (opts.filter) msg.f = opts.filter;
@@ -385,34 +399,49 @@ export class Client {
         clearTimeout(timer);
         this.snapshotBuffers.delete(cid);
         this.snapshotCompletions.delete(cid);
+        this.snapshotRejecters.delete(cid);
         reject(err);
       });
     });
   }
 
-  async subscribe(topic: string, opts: { filter?: string } = {}): Promise<Subscription> {
-    return this.subscribeInternal('subscribe', topic, opts.filter, undefined);
+  async subscribe(
+    topic: string,
+    opts: { filter?: string; sql?: string } = {},
+  ): Promise<Subscription> {
+    return this.subscribeInternal('subscribe', topic, opts.filter, opts.sql, undefined);
   }
 
   async sowAndSubscribe(
     topic: string,
-    opts: { filter?: string; bookmark?: number } = {},
+    opts: { filter?: string; sql?: string; bookmark?: number } = {},
   ): Promise<Subscription> {
-    return this.subscribeInternal('sow_and_subscribe', topic, opts.filter, opts.bookmark);
+    return this.subscribeInternal(
+      'sow_and_subscribe',
+      topic,
+      opts.filter,
+      opts.sql,
+      opts.bookmark,
+    );
   }
 
-  async deltaSubscribe(topic: string, opts: { filter?: string } = {}): Promise<Subscription> {
-    return this.subscribeInternal('delta_subscribe', topic, opts.filter, undefined);
+  async deltaSubscribe(
+    topic: string,
+    opts: { filter?: string; sql?: string } = {},
+  ): Promise<Subscription> {
+    return this.subscribeInternal('delta_subscribe', topic, opts.filter, opts.sql, undefined);
   }
 
   private async subscribeInternal(
     command: string,
     topic: string,
     filter: string | undefined,
+    sql: string | undefined,
     bookmark: number | undefined,
   ): Promise<Subscription> {
     const msg: CqMessage = { c: command, t: topic };
     if (filter !== undefined) msg.f = filter;
+    if (sql !== undefined) msg.sql = sql;
     if (bookmark !== undefined) msg.bm = bookmark;
     const ack = await this.rpc(msg);
     const subId = ack.sid;
@@ -455,6 +484,22 @@ export class Client {
         if (p.timer) clearTimeout(p.timer);
         this.pending.delete(cid);
         p.resolve(msg);
+        return;
+      }
+      // SOW failure: server emits `{c:'ack', status:'error', cid:<sow-cid>}`
+      // when a JOIN parse / topic / column error happens before any
+      // group_begin. Route to the SOW promise's rejecter so the
+      // caller gets a clean error instead of waiting for the 30s
+      // ack timeout to fire.
+      const status = (msg as { status?: string }).status;
+      const reason = (msg as { reason?: string }).reason;
+      if (status === 'error') {
+        const sowReject = this.snapshotRejecters.get(cid);
+        if (sowReject) {
+          this.snapshotRejecters.delete(cid);
+          sowReject(new ClientError(reason ?? 'server error'));
+          return;
+        }
       }
       return;
     }

@@ -62,3 +62,113 @@ async fn pivot_in_any_discovers_values_from_source() {
     }
     assert_eq!(seen_desks.len(), 3, "expected all 3 desks to surface");
 }
+
+// ───── Diversification ────────────────────────────────────────────
+
+/// Single-value PIVOT IN (ANY) — degenerate case with only one
+/// distinct pivot value.
+#[tokio::test]
+async fn pivot_in_any_with_single_distinct_value() {
+    let topic = TopicSpec::new("/pivot_single", "rk").with_inline_columns([
+        ("rk", "string"),
+        ("trader", "string"),
+        ("desk", "string"),
+        ("qty", "long"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    // All rows share desk=RATES.
+    for (rk, trader, qty) in [("r1", "alice", 100_i64), ("r2", "bob", 200), ("r3", "alice", 50)] {
+        client
+            .publish(
+                "/pivot_single",
+                json!({ "rk": rk, "trader": trader, "desk": "RATES", "qty": qty }),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let snap = client
+        .sow_sql(
+            "/pivot_single",
+            "SELECT * FROM t PIVOT (SUM(qty) FOR desk IN (ANY))",
+        )
+        .await
+        .unwrap();
+    assert_eq!(snap.len(), 3, "3 anchor rows");
+    for row in &snap {
+        assert!(row.contains_key("RATES"));
+        // The single column carries the qty for that anchor row.
+        assert!(row.get("RATES").map(|v| !v.is_null()).unwrap_or(false));
+    }
+}
+
+/// Empty topic → PIVOT IN (ANY) returns empty (no rows to discover
+/// pivot values from).
+#[tokio::test]
+async fn pivot_in_any_empty_topic_returns_empty() {
+    let topic = TopicSpec::new("/pivot_empty", "rk").with_inline_columns([
+        ("rk", "string"),
+        ("trader", "string"),
+        ("desk", "string"),
+        ("qty", "long"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    let snap = client
+        .sow_sql(
+            "/pivot_empty",
+            "SELECT * FROM t PIVOT (SUM(qty) FOR desk IN (ANY))",
+        )
+        .await
+        .expect("empty pivot sow");
+    assert!(snap.is_empty());
+}
+
+/// PIVOT IN (ANY) discovers many distinct values — verify the
+/// dynamic value list scales (each distinct value becomes a column).
+#[tokio::test]
+async fn pivot_in_any_handles_many_distinct_values() {
+    let topic = TopicSpec::new("/pivot_many", "rk").with_inline_columns([
+        ("rk", "string"),
+        ("trader", "string"),
+        ("desk", "string"),
+        ("qty", "long"),
+    ]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    // 8 distinct desks across 8 rows; one row per desk for alice.
+    let desks = [
+        "RATES", "FX", "EQUITIES", "TECH", "ENERGY",
+        "CONSUMER", "INDUSTRIALS", "HEALTHCARE",
+    ];
+    for (i, d) in desks.iter().enumerate() {
+        client
+            .publish(
+                "/pivot_many",
+                json!({ "rk": format!("r{i}"), "trader": "alice", "desk": d, "qty": (i + 1) * 100 }),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let snap = client
+        .sow_sql(
+            "/pivot_many",
+            "SELECT * FROM t PIVOT (SUM(qty) FOR desk IN (ANY))",
+        )
+        .await
+        .unwrap();
+    assert_eq!(snap.len(), 8, "one row per (rk, trader) anchor");
+    // Every row must have all 8 discovered columns present.
+    for row in &snap {
+        for d in &desks {
+            assert!(row.contains_key(*d), "missing pivot col `{d}`: {row:?}");
+        }
+    }
+}

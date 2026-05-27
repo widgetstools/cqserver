@@ -72,9 +72,17 @@ fn torn_write_at_tail_truncates_and_recovers_prior_entries() {
 }
 
 /// C10.3 — CRC corruption mid-log. A byte is flipped inside a
-/// completed entry's body (NOT at the tail). The reader must
+/// completed entry's BODY (not in a header). The reader must
 /// surface a CRC error rather than silently producing garbage data
 /// or skipping past the bad frame.
+///
+/// NB: this test specifically targets a body byte (offset 12 — past
+/// the first entry's 8-byte header). Header-byte corruption can
+/// decode to an oversized frame_len, which the reader now treats as
+/// torn-tail garbage on the active segment (see
+/// `restart_after_garbage_appended_to_txlog_does_not_crash` in the
+/// e2e suite). The CRC path remains strict — that's what this test
+/// pins.
 #[test]
 fn crc_corruption_mid_log_surfaces_error() {
     let dir = tempdir().unwrap();
@@ -85,11 +93,12 @@ fn crc_corruption_mid_log_surfaces_error() {
     let segment_path = w.path().to_path_buf();
     drop(w);
 
-    // Open the file, find a byte well inside it (offset 200 — past
-    // the first entry's header & well before the tail), and flip it.
     let file_size = std::fs::metadata(&segment_path).expect("meta").len();
     assert!(file_size > 400, "log too small to corrupt mid-stream");
-    let corrupt_at = 200;
+    // Offset 12 = 4 bytes into the first record's body (skip the
+    // 8-byte header). Flipping here always trips CRC, never the
+    // length-decoding path.
+    let corrupt_at = 12;
 
     let mut f = OpenOptions::new()
         .read(true)
@@ -104,11 +113,6 @@ fn crc_corruption_mid_log_surfaces_error() {
     f.write_all(&byte).expect("write flipped byte");
     drop(f);
 
-    // Read until we hit the corruption. We're testing that an error
-    // surfaces — not whether N-correctly-decoded entries appeared
-    // first. Either:
-    //   (a) read_all returns Err — fine.
-    //   (b) read_next eventually returns Err mid-stream — fine.
     let mut r = TxLogReader::open(dir.path()).expect("reopen");
     let mut hit_error = false;
     let mut entries_read = 0usize;

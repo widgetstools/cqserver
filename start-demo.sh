@@ -57,7 +57,7 @@ fi
 ok "cqserver binary present"
 
 # Make sure JS deps are installed.
-for d in clients/ts clients/react-demo; do
+for d in client-sdks/ts clients/react-demo; do
   if [ ! -d "$ROOT/$d/node_modules" ]; then
     info "Installing JS deps in $d..."
     (cd "$ROOT/$d" && npm install --silent)
@@ -92,15 +92,15 @@ ok "cqserver healthy"
 # ──────────────────────────────────────────────────────────────────
 
 step "Generating FI demo JSON"
-(cd "$ROOT/clients/ts" && npm run --silent generate-fi-data) > "$RUN_DIR/generate.log" 2>&1
-ok "JSON written to clients/ts/examples/data/"
+(cd "$ROOT/client-sdks/ts" && npm run --silent generate-fi-data) > "$RUN_DIR/generate.log" 2>&1
+ok "JSON written to client-sdks/ts/examples/data/"
 
 # ──────────────────────────────────────────────────────────────────
 # 3. Load JSON into server
 # ──────────────────────────────────────────────────────────────────
 
 step "Loading data into cqserver"
-(cd "$ROOT/clients/ts" && npm run --silent load-fi-data) > "$RUN_DIR/load.log" 2>&1
+(cd "$ROOT/client-sdks/ts" && npm run --silent load-fi-data) > "$RUN_DIR/load.log" 2>&1
 ok "$(grep -E '^Loaded in' "$RUN_DIR/load.log" || echo loaded)"
 
 # ──────────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ ok "$(grep -E '^Loaded in' "$RUN_DIR/load.log" || echo loaded)"
 
 step "Starting live publisher"
 (
-  cd "$ROOT/clients/ts"
+  cd "$ROOT/client-sdks/ts"
   exec npx --no-install tsx examples/fi-publisher.ts >"$RUN_DIR/publisher.log" 2>&1
 ) &
 echo $! > "$RUN_DIR/publisher.pid"

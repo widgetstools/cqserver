@@ -12,6 +12,225 @@ use cq_core::topic::SharedTopic;
 use cq_protocol::command::Command;
 use cq_protocol::message::CqMessage;
 
+/// R10 — derived-table materialisation. Detects
+/// `SELECT … FROM (SELECT … FROM real_topic …) [outer pred]` and
+/// runs the inner subquery against the source topic, then re-runs
+/// the outer SELECT against an EPHEMERAL in-memory topic seeded
+/// with the inner rows. The transient topic carries an
+/// auto-discovered schema from the inner result; it lives only for
+/// the duration of the call.
+///
+/// AMPS supports derived tables in this exact shape — the inner is
+/// an uncorrelated query against a real topic, the outer is a
+/// final projection / filter / sort / limit. Correlated derived
+/// tables (where the inner references outer columns) aren't AMPS-
+/// supported and are out of scope.
+///
+/// Returns:
+///   - `Ok(Some(rows))` — the derived-table path consumed the query
+///     and produced the final outer result.
+///   - `Ok(None)` — query has no derived table; fall through to the
+///     regular SOW path.
+///   - `Err(...)` — derived-table detected but materialisation /
+///     outer execution failed.
+fn try_resolve_derived_table(
+    sql: &str,
+    topics: &dashmap::DashMap<String, SharedTopic>,
+) -> Result<Option<Vec<serde_json::Map<String, serde_json::Value>>>, String> {
+    use sqlparser::ast::{
+        Query, SetExpr, Statement, TableFactor,
+    };
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    let dialect = GenericDialect {};
+    // Same parse-tolerance as resolve_in_subqueries: PIVOT and other
+    // AMPS-native syntax may not round-trip through sqlparser. A parse
+    // failure here just means "not a derived-table query" — fall
+    // through to the normal SOW path.
+    let Ok(ast) = Parser::parse_sql(&dialect, sql) else {
+        return Ok(None);
+    };
+    if ast.is_empty() {
+        return Ok(None);
+    }
+    let stmt = &ast[0];
+    let outer_query = match stmt {
+        Statement::Query(q) => q,
+        _ => return Ok(None),
+    };
+    let outer_select = match outer_query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return Ok(None),
+    };
+    if outer_select.from.len() != 1 {
+        return Ok(None);
+    }
+    let inner_query: &Query = match &outer_select.from[0].relation {
+        TableFactor::Derived { subquery, .. } => subquery.as_ref(),
+        _ => return Ok(None),
+    };
+    // Materialise the inner query against its source topic.
+    let inner_select = match inner_query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return Err("derived-table inner must be a SELECT".into()),
+    };
+    if inner_select.from.len() != 1 || !inner_select.from[0].joins.is_empty() {
+        return Err("derived-table inner FROM must be a single topic (no JOIN)".into());
+    }
+    let inner_topic_raw = match &inner_select.from[0].relation {
+        TableFactor::Table { name, .. } => {
+            let raw = name.to_string();
+            raw.trim_matches('"')
+                .trim_matches('`')
+                .trim_matches('[')
+                .trim_matches(']')
+                .to_string()
+        }
+        _ => return Err("derived-table inner FROM must be a plain topic".into()),
+    };
+    let canonical = cq_core::topic::canonicalize_topic(&inner_topic_raw);
+    let inner_topic = topics
+        .get(&canonical)
+        .ok_or_else(|| format!("derived-table inner topic `{inner_topic_raw}` not found"))?;
+    let inner_sql = format!("{inner_query}");
+    let inner_result = inner_topic
+        .query(&inner_sql)
+        .map_err(|e| format!("derived-table inner: {e}"))?;
+    let inner_rows = inner_result.rows;
+
+    // Build an ephemeral topic from the inner result. Schema
+    // discovery: type-infer each column from the first non-null
+    // value in the result.
+    if inner_rows.is_empty() {
+        // No inner rows → outer has nothing to filter; just return
+        // an empty result without spinning up the transient topic.
+        return Ok(Some(Vec::new()));
+    }
+    let ephemeral = make_ephemeral_topic_from_rows(&inner_rows)
+        .map_err(|e| format!("derived-table materialise: {e}"))?;
+
+    // Run the OUTER query against the ephemeral topic. We rewrite
+    // the outer SQL's FROM clause to point at the ephemeral topic's
+    // placeholder identifier `t` — which is what `Topic::query`
+    // already expects (cqserver rewrites topic refs to `t` in the
+    // streaming path).
+    let outer_sql_rewritten = rewrite_outer_from_to_t(sql)
+        .map_err(|e| format!("derived-table outer rewrite: {e}"))?;
+    let outer_result = ephemeral
+        .query(&outer_sql_rewritten)
+        .map_err(|e| format!("derived-table outer: {e}"))?;
+    Ok(Some(outer_result.rows))
+}
+
+/// R10 helper — replace the derived-table subquery `(SELECT …)` in
+/// the outer FROM with the placeholder `t` so the ephemeral topic
+/// can serve the outer query through its standard `Topic::query`
+/// path. sqlparser's `Display` round-trips, so we mutate the AST
+/// and re-serialize.
+fn rewrite_outer_from_to_t(sql: &str) -> Result<String, String> {
+    use sqlparser::ast::{
+        Ident, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
+    };
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    let dialect = GenericDialect {};
+    let mut ast = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| format!("outer-rewrite parse: {e}"))?;
+    if let Some(Statement::Query(q)) = ast.first_mut() {
+        if let SetExpr::Select(s) = q.body.as_mut() {
+            if s.from.len() == 1 {
+                if let TableFactor::Derived { .. } = &s.from[0].relation {
+                    s.from[0].relation = TableFactor::Table {
+                        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("t"))]),
+                        alias: None,
+                        args: None,
+                        with_hints: vec![],
+                        version: None,
+                        with_ordinality: false,
+                        partitions: vec![],
+                        json_path: None,
+                        sample: None,
+                        index_hints: vec![],
+                    };
+                }
+            }
+        }
+        Ok(format!("{q}"))
+    } else {
+        Err("outer-rewrite: not a query".into())
+    }
+}
+
+/// R10 helper — build an ephemeral cq-core `Topic` from a vector of
+/// JSON rows. Type inference scans each column for its first non-
+/// null value to pick String / Long / Double. The resulting topic
+/// has no key (single-row collapse disabled — every input row is
+/// preserved by giving each one a synthetic row-id key) and no
+/// persistence.
+fn make_ephemeral_topic_from_rows(
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<std::sync::Arc<cq_core::topic::Topic>, String> {
+    use cq_core::schema::{ColumnType, Schema};
+    use cq_core::topic::{Topic, TopicConfig};
+    if rows.is_empty() {
+        return Err("cannot infer schema from empty rows".into());
+    }
+    // Collect column names in first-row order; type-infer per column.
+    let mut col_order: Vec<String> = Vec::new();
+    for k in rows[0].keys() {
+        col_order.push(k.clone());
+    }
+    // Add the synthetic key column.
+    let key_col = "__derived_id__";
+    let mut names: Vec<&str> = vec![key_col];
+    names.extend(col_order.iter().map(|s| s.as_str()));
+    let mut types: Vec<ColumnType> = Vec::with_capacity(names.len());
+    types.push(ColumnType::String); // synthetic key
+    for col in &col_order {
+        let mut t = ColumnType::String;
+        for row in rows {
+            match row.get(col) {
+                Some(serde_json::Value::Number(n)) => {
+                    t = if n.is_i64() { ColumnType::Long } else { ColumnType::Double };
+                    break;
+                }
+                Some(serde_json::Value::String(_)) => {
+                    t = ColumnType::String;
+                    break;
+                }
+                Some(serde_json::Value::Bool(_)) => {
+                    t = ColumnType::Bool;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        types.push(t);
+    }
+    let schema = std::sync::Arc::new(Schema::from_strs(&names, &types));
+    let topic = std::sync::Arc::new(Topic::new(
+        TopicConfig {
+            name: "/__derived__".into(),
+            key_fields: vec![key_col.into()],
+            persist: false,
+            conflation_ms: None,
+            index_columns: Vec::new(),
+            expire_seconds: None,
+        },
+        schema,
+        rows.len(),
+    ));
+    // Seed every inner row.
+    for (i, row) in rows.iter().enumerate() {
+        let mut m = row.clone();
+        m.insert(key_col.into(), serde_json::Value::String(format!("r{i}")));
+        topic
+            .upsert_map(&m)
+            .map_err(|e| format!("seed ephemeral: {e}"))?;
+    }
+    Ok(topic)
+}
+
 /// Q9 — pre-flight subquery materialisation. Walks the WHERE clause
 /// for `Expr::InSubquery` patterns (e.g.
 /// `WHERE symbol IN (SELECT symbol FROM watchlist)`), runs each
@@ -35,8 +254,14 @@ fn resolve_in_subqueries(
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     let dialect = GenericDialect {};
-    let mut ast = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| format!("parse: {e}"))?;
+    // sqlparser's GenericDialect rejects PIVOT/UNPIVOT at the top level
+    // and a few other AMPS-native shapes (the cqserver query layer
+    // handles those itself). A pre-flight parse failure just means
+    // "nothing for us to rewrite here" — pass the SQL through and let
+    // the real executor speak.
+    let Ok(mut ast) = Parser::parse_sql(&dialect, sql) else {
+        return Ok(sql.to_string());
+    };
     if ast.is_empty() {
         return Ok(sql.to_string());
     }
@@ -60,12 +285,92 @@ fn resolve_in_subqueries(
     Ok(format!("{q}"))
 }
 
+/// R8 — materialise an uncorrelated EXISTS subquery to a boolean
+/// literal. AMPS only supports uncorrelated subqueries (the inner
+/// query doesn't reference outer columns); under that constraint
+/// EXISTS reduces to "does ANY row match?", which can be answered
+/// once with a one-shot SOW and the result substituted as a literal.
+///
+/// Subquery shape: `EXISTS (SELECT * FROM topic [WHERE …])` — the
+/// projection list doesn't matter, only the row count. We run a
+/// `SELECT 1 FROM <topic>` materialisation with the WHERE applied
+/// and check if any rows came back.
+fn materialise_exists(
+    query: &sqlparser::ast::Query,
+    topics: &dashmap::DashMap<String, SharedTopic>,
+) -> Result<bool, String> {
+    use sqlparser::ast::{SetExpr, TableFactor};
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return Err("EXISTS subquery must be a SELECT (no set ops)".into()),
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Err("EXISTS subquery FROM must be a single topic (no JOIN)".into());
+    }
+    let topic_name = match &select.from[0].relation {
+        TableFactor::Table { name, .. } => {
+            let raw = name.to_string();
+            let trimmed = raw
+                .trim_matches('"')
+                .trim_matches('`')
+                .trim_matches('[')
+                .trim_matches(']');
+            trimmed.to_string()
+        }
+        _ => return Err("EXISTS subquery FROM must be a plain topic name".into()),
+    };
+    let canonical = cq_core::topic::canonicalize_topic(&topic_name);
+    let topic = topics
+        .get(&canonical)
+        .ok_or_else(|| format!("EXISTS subquery topic `{topic_name}` not found"))?;
+    let where_part = select
+        .selection
+        .as_ref()
+        .map(|e| format!(" WHERE {e}"))
+        .unwrap_or_default();
+    // Use `SELECT *` so we don't need to project a specific column —
+    // we only care if row_count > 0. LIMIT 1 keeps the materialisation
+    // bounded even on multi-million-row source topics.
+    let sub_sql = format!("SELECT * FROM t{where_part} LIMIT 1");
+    let result = topic
+        .query(&sub_sql)
+        .map_err(|e| format!("EXISTS subquery: {e}"))?;
+    Ok(!result.rows.is_empty())
+}
+
 fn rewrite_in_subqueries(
     expr: &mut sqlparser::ast::Expr,
     topics: &dashmap::DashMap<String, SharedTopic>,
     changed: &mut bool,
 ) -> Result<(), String> {
     use sqlparser::ast::{Expr, SetExpr, TableFactor, Value, ValueWithSpan, SelectItem, GroupByExpr};
+    match expr {
+        // R8 — uncorrelated EXISTS / NOT EXISTS.
+        Expr::Exists { subquery, negated } => {
+            let has_rows = materialise_exists(subquery, topics)?;
+            // EXISTS = has_rows; NOT EXISTS = !has_rows.
+            let bool_val = if *negated { !has_rows } else { has_rows };
+            // Replace with a literal `TRUE` or `FALSE`. We construct
+            // an always-true / always-false predicate that's safe to
+            // serialize via sqlparser Display — `1 = 1` / `1 = 0`.
+            let one = Expr::Value(ValueWithSpan {
+                value: Value::Number("1".into(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            let other = Expr::Value(ValueWithSpan {
+                value: Value::Number(if bool_val { "1" } else { "0" }.into(), false),
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            *expr = Expr::BinaryOp {
+                left: Box::new(one),
+                op: sqlparser::ast::BinaryOperator::Eq,
+                right: Box::new(other),
+            };
+            *changed = true;
+            return Ok(());
+        }
+        _ => {}
+    }
     match expr {
         Expr::InSubquery { expr: inner_lhs, subquery, negated } => {
             // Materialise the subquery → InList of literals.
@@ -476,6 +781,41 @@ fn publish_snapshot_to_cache(topic: &str, sql: &str, batches: Arc<Vec<Vec<Vec<u8
     }
     if let Some(n) = notify_to_wake {
         n.notify_waiters();
+    }
+}
+
+/// Drop every Ready entry whose topic matches `topic`. Called from the
+/// publish / delta-publish / sow-delete paths so a SOW issued after a
+/// write never returns pre-write rows just because the cache's 500 ms
+/// TTL hasn't elapsed. Building entries are left alone — their
+/// in-flight build will publish a Ready entry next, which will get
+/// evicted on the next write.
+///
+/// Why per-topic and not per-(topic, sql): a publish can change rows
+/// that match any predicate that was previously cached against this
+/// topic. We have no cheap way to tell which sql-keyed entries the
+/// publish invalidates, so we drop them all. The cache exists for
+/// fanout (N subs joining within ms of each other on the same SQL);
+/// dropping it on every write doesn't hurt that workload because the
+/// next sub in the wave rebuilds and re-fills the entry.
+fn invalidate_snapshot_cache_for_topic(topic: &str) {
+    let mut cache = snapshot_fanout_cache().lock();
+    let drop_keys: Vec<(String, String)> = cache
+        .iter()
+        .filter(|(k, v)| {
+            k.0 == topic && matches!(v, SnapshotCacheState::Ready(_))
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in &drop_keys {
+        cache.remove(k);
+    }
+    let total_after = current_cache_bytes(&cache);
+    drop(cache);
+    if !drop_keys.is_empty() {
+        metrics::counter!("cq_snapshot_cache_invalidated_total")
+            .increment(drop_keys.len() as u64);
+        metrics::gauge!("cq_snapshot_cache_bytes").set(total_after as f64);
     }
 }
 
@@ -1046,6 +1386,10 @@ fn handle_publish_batch(session: &mut Session, msg: CqMessage, ctx: &RouterConte
         .increment(n);
     metrics::histogram!("cq_publish_batch_latency_us", "topic" => topic_name.clone())
         .record(elapsed_us);
+    // Same per-topic invalidation as the single-publish path — see
+    // `handle_publish_inner`. One eviction sweep per batch (not per
+    // row) keeps amortised cost equal to a single publish.
+    invalidate_snapshot_cache_for_topic(&topic_name);
     let mut ack = CqMessage::ack_ok_for_request(&msg);
     ack.sequences = Some(seqs);
     let _ = session.send_message(&ack);
@@ -1139,6 +1483,11 @@ fn handle_publish_inner(
                 metrics::counter!(counter, "topic" => topic_name.clone()).increment(1);
                 metrics::histogram!("cq_publish_latency_us", "topic" => topic_name.clone())
                     .record(elapsed_us);
+                // Drop any cached SOW snapshots for this topic: a SOW
+                // issued after the ack must see this publish, but the
+                // 500 ms TTL would otherwise let an old (topic, sql)
+                // entry serve pre-publish rows to the next caller.
+                invalidate_snapshot_cache_for_topic(&topic_name);
                 let mut ack = CqMessage::ack_ok_for_request(&msg);
                 ack.sequence = Some(seq);
                 let _ = session.send_message(&ack);
@@ -1196,6 +1545,55 @@ fn handle_sow(
                 let _ = session.send_message(&CqMessage::error(
                     msg.command_id,
                     &format!("Subquery: {e}"),
+                ));
+                return;
+            }
+        }
+    }
+    // R10 — derived-table pre-flight. If `msg.sql` is shaped like
+    // `SELECT … FROM (SELECT … FROM real_topic …) …`, materialise
+    // the inner against the real topic and run the outer against an
+    // ephemeral in-memory topic. Returns the final rows directly so
+    // we can ship them through the standard group_begin/sow_batch/
+    // group_end frame envelope without re-entering the streaming
+    // path.
+    if let Some(raw_sql_ref) = msg.sql.as_deref() {
+        match try_resolve_derived_table(raw_sql_ref, topics) {
+            Ok(Some(rows)) => {
+                // Stream the derived-table result through the same
+                // frame envelope a normal SOW uses.
+                let sub_id = msg.command_id.clone().unwrap_or_default();
+                let tx = session.tx.clone();
+                let codec = *session.codec.lock();
+                let session_id = session.id.clone();
+                let topic_label = topic_name.clone();
+                tokio::spawn(async move {
+                    use crate::session::encode_frame;
+                    if let Some(f) = encode_frame(codec, &CqMessage::group_begin(&sub_id, rows.len())) {
+                        if tx.send(f).await.is_err() {
+                            return;
+                        }
+                    }
+                    if !rows.is_empty() {
+                        let batch = CqMessage::sow_batch(&sub_id, rows);
+                        if let Some(f) = encode_frame(codec, &batch) {
+                            if tx.send(f).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
+                        let _ = tx.send(f).await;
+                    }
+                    let _ = (session_id, topic_label);
+                });
+                return;
+            }
+            Ok(None) => { /* no derived table — fall through to normal path */ }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!("Derived-table: {e}"),
                 ));
                 return;
             }
@@ -1277,12 +1675,14 @@ fn handle_sow(
                 return;
             }
             Ok(None) => { /* falls through to single-topic streaming path */ }
-            Err(e) => {
-                let _ = session.send_message(&CqMessage::error(
-                    msg.command_id,
-                    &format!("Parse JOIN: {e}"),
-                ));
-                return;
+            Err(_) => {
+                // peek_join uses sqlparser's GenericDialect, which
+                // doesn't accept every AMPS-native shape (PIVOT/UNPIVOT
+                // at the top level, etc.). A parse failure here just
+                // means "definitely not a JOIN" — fall through to the
+                // single-topic streaming path and let the real query
+                // executor surface a proper diagnostic if the SQL is
+                // genuinely malformed.
             }
         }
     }
@@ -1346,6 +1746,84 @@ fn handle_sow_and_subscribe(
 
     let topics = &ctx.topics;
     let registry = &ctx.sessions;
+
+    // R8 / Q9 — pre-flight subquery + EXISTS materialisation for the
+    // live-subscribe path, mirroring handle_sow. Live subscriptions
+    // see the rewrite once at snapshot time; subsequent updates do
+    // NOT re-materialise (subscription correctness assumes the
+    // EXISTS-driven set is stable for the snapshot session). For
+    // uncorrelated subqueries — which AMPS limits us to — this is
+    // identical to the SOW semantics: the subquery is a closed
+    // computation against its source topic at request time.
+    let mut msg = msg;
+    if let Some(raw_sql_ref) = msg.sql.as_deref() {
+        match resolve_in_subqueries(raw_sql_ref, topics) {
+            Ok(rewritten) => {
+                if rewritten != raw_sql_ref {
+                    msg.sql = Some(rewritten);
+                }
+            }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!("Subquery: {e}"),
+                ));
+                return;
+            }
+        }
+    }
+
+    // R10 — derived-table pre-flight on the live-subscribe path.
+    // `SELECT … FROM (SELECT … FROM real_topic) AS x WHERE …` is
+    // materialised once against the source topic; the outer query
+    // runs against an ephemeral in-memory topic and is delivered to
+    // the subscriber via the same group_begin/sow_batch/group_end
+    // frame envelope a normal SOW snapshot uses. Subsequent updates
+    // do NOT re-materialise — the live subscription behaves as a
+    // snapshot for derived-table queries (AMPS semantics). We still
+    // send an ack so the client treats the result as a closed
+    // subscription it can unsubscribe from.
+    if let Some(raw_sql_ref) = msg.sql.as_deref() {
+        match try_resolve_derived_table(raw_sql_ref, topics) {
+            Ok(Some(rows)) => {
+                let sub_id = session.next_sub_id();
+                session.subscriptions.push(sub_id.clone());
+                let mut ack = CqMessage::ack_ok(msg.command_id);
+                ack.sub_id = Some(sub_id.clone());
+                let _ = session.send_message(&ack);
+                let tx = session.tx.clone();
+                let codec = *session.codec.lock();
+                tokio::spawn(async move {
+                    use crate::session::encode_frame;
+                    if let Some(f) = encode_frame(codec, &CqMessage::group_begin(&sub_id, rows.len())) {
+                        if tx.send(f).await.is_err() {
+                            return;
+                        }
+                    }
+                    if !rows.is_empty() {
+                        let batch = CqMessage::sow_batch(&sub_id, rows);
+                        if let Some(f) = encode_frame(codec, &batch) {
+                            if tx.send(f).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(f) = encode_frame(codec, &CqMessage::group_end(&sub_id)) {
+                        let _ = tx.send(f).await;
+                    }
+                });
+                return;
+            }
+            Ok(None) => { /* not a derived-table query — fall through */ }
+            Err(e) => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!("Derived-table: {e}"),
+                ));
+                return;
+            }
+        }
+    }
 
     let sql = build_sql(&msg);
 
@@ -1947,6 +2425,10 @@ fn handle_sow_delete(
         if let Some(topic) = topics.get(&topic_name) {
             match topic.delete(&key) {
                 Ok(seq_opt) => {
+                    // Same per-topic eviction as publishes — a SOW
+                    // after a delete must not return the deleted row
+                    // from a stale snapshot entry.
+                    invalidate_snapshot_cache_for_topic(&topic_name);
                     let mut ack = CqMessage::ack_ok(msg.command_id);
                     ack.sequence = seq_opt;
                     let _ = session.send_message(&ack);
@@ -2144,43 +2626,158 @@ fn rewrite_from_to_t(sql: &str) -> String {
         return sql.to_string();
     };
     let after_from = from_pos + 4;
-    // Find the start of the next clause boundary. `JOIN` is treated as
-    // a boundary so that `FROM <left> JOIN <right> USING (...)` keeps
-    // the JOIN clause intact while still anonymising the left-side
-    // table identifier. peek_join + the SOW JOIN path rely on the
-    // JOIN/USING text being preserved on the wire.
-    let clauses = [
-        " WHERE ",
-        " GROUP BY ",
-        " ORDER BY ",
-        " LIMIT ",
-        " HAVING ",
-        " JOIN ",
-        " INNER JOIN ",
-        " LEFT JOIN ",
-        " RIGHT JOIN ",
-        " FULL JOIN ",
-        " CROSS JOIN ",
-        // Q3 — PIVOT/UNPIVOT are FROM-clause modifiers that must be
-        // preserved verbatim so the parser sees the full pivot spec
-        // (without these the rewrite eats `PIVOT (...) FOR ... IN ...`).
-        " PIVOT (",
-        " UNPIVOT (",
+    // Each clause is matched as a sequence of tokens separated by ANY
+    // ASCII whitespace (handles `\n`, `\t`, multiple spaces) and must
+    // be preceded by whitespace so we don't match identifiers like
+    // `the_where_clause`. `JOIN` is treated as a boundary so that
+    // `FROM <left> JOIN <right> USING (...)` keeps the JOIN clause
+    // intact while still anonymising the left-side table identifier.
+    let clause_kws: &[&[&str]] = &[
+        &["WHERE"],
+        &["GROUP", "BY"],
+        &["ORDER", "BY"],
+        &["LIMIT"],
+        &["HAVING"],
+        &["JOIN"],
+        &["INNER", "JOIN"],
+        &["LEFT", "JOIN"],
+        &["RIGHT", "JOIN"],
+        &["FULL", "JOIN"],
+        &["CROSS", "JOIN"],
     ];
     let mut end = sql.len();
-    for kw in clauses {
-        if let Some(p) = upper[after_from..].find(kw) {
-            let abs = after_from + p;
-            if abs < end {
-                end = abs;
+    for kws in clause_kws {
+        if let Some(p) = find_clause_kw(&upper, after_from, kws) {
+            if p < end {
+                end = p;
             }
         }
+    }
+    // Q3 — PIVOT/UNPIVOT are FROM-clause modifiers; allow any whitespace
+    // run before the open-paren so `\nPIVOT (...)` works the same as
+    // ` PIVOT (...)`.
+    for tok in ["PIVOT", "UNPIVOT"] {
+        if let Some(p) = find_pivot_kw(&upper, after_from, tok) {
+            if p < end {
+                end = p;
+            }
+        }
+    }
+    // Walk `end` back through any leading whitespace so the tail keeps
+    // its separator from the placeholder ` t`. Otherwise `FROM` + `t` +
+    // `GROUP BY …` would collapse to `…FROM tGROUP BY…`.
+    let bytes = sql.as_bytes();
+    while end > after_from && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
     }
     let mut out = String::with_capacity(sql.len());
     out.push_str(&sql[..after_from]);
     out.push_str(" t");
-    out.push_str(&sql[end..]);
+    if end < sql.len() {
+        out.push(' ');
+        out.push_str(&sql[end..]);
+    }
     out
+}
+
+/// Locate `PIVOT` or `UNPIVOT` token followed (after any whitespace
+/// run) by an open paren. Returns the absolute offset of the keyword.
+/// Paren-depth aware: skips inner parenthesised regions so a `PIVOT`
+/// inside a subquery isn't mistaken for the outer FROM modifier.
+fn find_pivot_kw(upper: &str, start: usize, tok: &str) -> Option<usize> {
+    let bytes = upper.as_bytes();
+    let tb = tok.as_bytes();
+    let mut i = start;
+    let mut depth: i32 = 0;
+    while i + tb.len() <= bytes.len() {
+        match bytes[i] {
+            b'(' => { depth += 1; i += 1; continue; }
+            b')' => { depth -= 1; i += 1; continue; }
+            _ => {}
+        }
+        if depth != 0 {
+            i += 1;
+            continue;
+        }
+        let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if prev_ok && &bytes[i..i + tb.len()] == tb {
+            let mut cursor = i + tb.len();
+            // Require at least one whitespace before `(`, then `(`.
+            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if cursor < bytes.len() && bytes[cursor] == b'(' {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find a clause keyword sequence (e.g. `["GROUP", "BY"]`) in `upper`
+/// starting at byte offset `start`. The first token must be preceded
+/// by ASCII whitespace; tokens may be separated by any run of ASCII
+/// whitespace (space, tab, newline, etc.); the last token must be
+/// followed by whitespace or end-of-input. Returns the absolute byte
+/// offset of the FIRST token, or `None` if not found.
+///
+/// **Paren-depth aware**: matches only at depth 0 so an inner
+/// `ORDER BY` inside `OVER (...)` or `(SELECT ... ORDER BY ...)` is
+/// not treated as the outer query's clause boundary.
+fn find_clause_kw(upper: &str, start: usize, tokens: &[&str]) -> Option<usize> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let bytes = upper.as_bytes();
+    let first = tokens[0].as_bytes();
+    let mut i = start;
+    let mut depth: i32 = 0;
+    // Walk from `start` tracking paren depth so subquery / OVER bodies
+    // are skipped over rather than scanned for clause keywords.
+    'scan: while i + first.len() <= bytes.len() {
+        match bytes[i] {
+            b'(' => { depth += 1; i += 1; continue; }
+            b')' => { depth -= 1; i += 1; continue; }
+            _ => {}
+        }
+        if depth != 0 {
+            i += 1;
+            continue;
+        }
+        let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if !prev_ok || &bytes[i..i + first.len()] != first {
+            i += 1;
+            continue;
+        }
+        // Walk the remaining tokens, skipping whitespace runs between them.
+        let mut cursor = i + first.len();
+        for tok in &tokens[1..] {
+            // Require at least one whitespace byte between tokens.
+            if cursor >= bytes.len() || !bytes[cursor].is_ascii_whitespace() {
+                i += 1;
+                continue 'scan;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let tb = tok.as_bytes();
+            if cursor + tb.len() > bytes.len() || &bytes[cursor..cursor + tb.len()] != tb {
+                i += 1;
+                continue 'scan;
+            }
+            cursor += tb.len();
+        }
+        // Final boundary: end-of-input or whitespace.
+        let next_ok = cursor == bytes.len() || bytes[cursor].is_ascii_whitespace();
+        if next_ok {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Find a keyword as a standalone token (preceded by start-of-input
@@ -2615,7 +3212,10 @@ async fn deliver_join_snapshot(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(session = %session_id, topic = %topic_label, error = %e, "JOIN snapshot failed");
-            if let Some(f) = encode_frame(codec, &CqMessage::error(None, &e)) {
+            // For SOW the caller passes `command_id` as `sub_id` so
+            // routing the error back through the original cid lets the
+            // client's pending SOW future resolve instead of timing out.
+            if let Some(f) = encode_frame(codec, &CqMessage::error(Some(sub_id.clone()), &e)) {
                 let _ = tx.send(f).await;
             }
             return;

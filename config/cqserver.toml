@@ -42,21 +42,27 @@ conflation_ms = 100
 initial_capacity = 1000
 schema_file = "schemas/fi-market-data.json"
 
-# Persistent trade log — each fill is a row, never updated in place.
+# Trade log — each fill is a row. 60-second TTL keeps the topic
+# bounded at ~6 000 rows (publisher emits ~100 trades/sec), which
+# fits comfortably under the SOW size cap so unfiltered blotter
+# subscriptions don't blow up. Server-side `expire_seconds` is
+# swept by cqserver's TTL sweeper.
 [[topics]]
 name = "/trades"
-key = ["tradeId"]
+key = ["trade_id"]
 persist = true
-initial_capacity = 100000
+expire_seconds = 60
+initial_capacity = 10000
 schema_file = "schemas/trades.json"
 
-# Derived positions, keyed by `book|cusip`. Recomputed each trade.
+# Derived positions, keyed by `position_id`. The Atlas publisher emits
+# the rich 200-column shape and ticks each position when prices move.
 [[topics]]
 name = "/positions"
-key = ["positionKey"]
+key = ["position_id"]
 persist = false
 conflation_ms = 50
-initial_capacity = 10000
+initial_capacity = 50000
 schema_file = "schemas/positions.json"
 
 # Risk metrics — wide nested schema (~112 columns) showcasing
@@ -83,3 +89,172 @@ name = "/orders"
 key = ["orderId"]
 persist = true
 initial_capacity = 100000
+
+# ===== Materialized views =====
+#
+# Every aggregation, pivot, join, and sliced projection the Atlas demo
+# shows is computed HERE by cqserver — never on the React client. The
+# client subscribes to the view topic just like it would any other
+# topic, gets a SOW snapshot, and receives a row-level delta whenever
+# the source mutates and the affected group's running aggregate moves.
+#
+# Naming convention: `/v_*` so views never collide with raw topics.
+# Source topics are referenced by full name (with leading `/`). Each
+# view's key columns are derived from its GROUP BY clause.
+
+# ── ex05: Net Exposure ──────────────────────────────────────────────
+# The canonical "materialized view" example — risk roll-up by book ×
+# asset class × currency. The React tab subscribes to this topic, drops
+# the rows into AG Grid, and re-renders only the rows that change.
+[[views]]
+name = "/v_net_exposure"
+source = "/positions"
+sql = """
+  SELECT book_id, book_name, asset_class, currency,
+         SUM(market_value_usd) AS net_mv_usd,
+         SUM(exposure_gross)   AS gross_exposure,
+         SUM(dv01_usd)         AS net_dv01,
+         SUM(var_1d_95)        AS sum_var,
+         MAX(risk_limit_utilization_pct) AS worst_util_pct,
+         COUNT(*)              AS n_positions
+  FROM positions
+  GROUP BY book_id, book_name, asset_class, currency
+"""
+
+# ── ex07: Slippage Aggregate ───────────────────────────────────────
+# Trade-level execution metrics rolled up by (venue, algo). cqserver's
+# aggregate lattice covers SUM / AVG / MIN / MAX / COUNT — no native
+# stddev or percentile yet, so the tab's spark-line / P95 columns are
+# scoped out for the server-side cut. The grid still gets count, mean,
+# fee total, and the min/max envelopes — fully server-computed.
+[[views]]
+name = "/v_slippage_venue_algo"
+source = "/trades"
+sql = """
+  SELECT execution_venue, execution_algo,
+         COUNT(*)                   AS n_trades,
+         AVG(slippage_arrival_bps)  AS avg_slip_arr,
+         AVG(slippage_vwap_bps)     AS avg_slip_vwap,
+         MAX(slippage_arrival_bps)  AS max_slip_arr,
+         MIN(slippage_arrival_bps)  AS min_slip_arr,
+         SUM(total_fees_usd)        AS total_fees
+  FROM trades
+  GROUP BY execution_venue, execution_algo
+"""
+
+# ── ex01: PnL ladders ──────────────────────────────────────────────
+# Two complementary aggregates over the same /positions stream:
+#   v_pnl_by_sector — drives the Sector PnL Ladder (day_pnl by sector)
+#   v_pnl_by_book   — drives the Book Contribution waterfall and KPIs
+# Both are incremental; the React tab consumes raw rows and renders
+# them in two SVG visualisations + the KPI strip.
+[[views]]
+name = "/v_pnl_by_sector"
+source = "/positions"
+sql = """
+  SELECT issuer_sector,
+         SUM(day_pnl)            AS day_pnl,
+         SUM(unrealized_pnl_usd) AS unrealized_pnl,
+         SUM(market_value_usd)   AS market_value,
+         COUNT(*)                AS n_positions
+  FROM positions
+  GROUP BY issuer_sector
+"""
+
+[[views]]
+name = "/v_pnl_by_book"
+source = "/positions"
+sql = """
+  SELECT book_id, book_name,
+         SUM(day_pnl)            AS day_pnl,
+         SUM(ytd_pnl)            AS ytd_pnl,
+         SUM(unrealized_pnl_usd) AS unrealized_pnl,
+         SUM(realized_pnl_usd)   AS realized_pnl,
+         SUM(market_value_usd)   AS market_value,
+         SUM(exposure_gross)     AS exposure_gross,
+         SUM(var_1d_95)          AS var_95,
+         COUNT(*)                AS n_positions
+  FROM positions
+  GROUP BY book_id, book_name
+"""
+
+# Compliance-status counter — one row per status bucket. The Live PnL
+# tab uses this for the "Compliance Breaches" KPI by looking up the
+# row where compliance_status = 'BREACH'.
+[[views]]
+name = "/v_compliance_counts"
+source = "/positions"
+sql = """
+  SELECT compliance_status,
+         COUNT(*) AS n_positions
+  FROM positions
+  GROUP BY compliance_status
+"""
+
+# ── ex06: server-side JOIN ─────────────────────────────────────────
+# Demonstrates cqserver's `A JOIN B USING (col)` view. Groups trades
+# by the *position's* compliance status — a column that lives only on
+# /positions but is reachable through the join on `position_id`. The
+# aggregates come from /trades, the grouping dimension from /positions.
+[[views]]
+name = "/v_trades_by_compliance"
+source = "/trades"
+sql = """
+  SELECT compliance_status,
+         COUNT(*)                  AS n_trades,
+         SUM(total_fees_usd)       AS total_fees,
+         AVG(slippage_arrival_bps) AS avg_slip_arr
+  FROM trades JOIN positions USING (position_id)
+  GROUP BY compliance_status
+"""
+
+# ── ex04: Ticking Heatmap ──────────────────────────────────────────
+# MV-weighted intraday return by (issuer_sector, issuer_region) over
+# the equities sleeve only. cqserver's aggregate lattice cannot do
+# `SUM(a * b)`, so the publisher pre-shapes two columns —
+# `mv_x_pct = market_value_usd * price_change_pct` and
+# `mv_abs = ABS(market_value_usd)` — and the view sums those. The
+# client divides `weighted_sum / weight` per cell at render time,
+# which is presentation arithmetic on already-aggregated rows, not a
+# stream aggregation.
+[[views]]
+name = "/v_heatmap_sector_region"
+source = "/positions"
+sql = """
+  SELECT issuer_sector, issuer_region,
+         SUM(mv_x_pct)  AS weighted_sum,
+         SUM(mv_abs)    AS weight,
+         COUNT(*)       AS n_positions
+  FROM positions
+  WHERE asset_class = 'EQUITY'
+  GROUP BY issuer_sector, issuer_region
+"""
+
+# ── ex03: Cross-Asset Pivot ────────────────────────────────────────
+# Long-form aggregate. The React tab pivots the rows into a wide grid
+# for display, but the SUMs themselves come from cqserver — pivoting
+# already-aggregated long-form rows into a wide layout is presentation,
+# not aggregation. All four selectable measures are projected in the
+# same view so the measure switcher is a column pick on the client,
+# not a re-subscription.
+[[views]]
+name = "/v_cross_asset_pivot"
+source = "/positions"
+sql = """
+  SELECT asset_class, currency,
+         SUM(market_value_usd)   AS market_value_usd,
+         SUM(unrealized_pnl_usd) AS unrealized_pnl_usd,
+         SUM(var_1d_95)          AS var_1d_95,
+         SUM(exposure_gross)     AS exposure_gross,
+         COUNT(*)                AS n_positions
+  FROM positions
+  GROUP BY asset_class, currency
+"""
+
+# Atlas demo uses very wide rows (200+ columns × 200k+ trades) so the
+# default 100MB SOW estimate cap rejects /trades. Raise to 1GB — the
+# server only blocks at the SOW path; live deltas are unaffected. The
+# `hard_max_*` ceilings are the real safety net.
+[query_limits]
+max_sow_estimated_bytes = 1073741824
+hard_max_sow_result_bytes = 2147483648

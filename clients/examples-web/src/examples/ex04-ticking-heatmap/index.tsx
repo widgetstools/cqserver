@@ -6,48 +6,51 @@ import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
 import { KpiPanel, type Kpi } from '@/components/panels/KpiPanel';
 import { Badge } from '@/components/ui/badge';
-import { useLivePositions } from '@/lib/tick-engine';
+import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 import { QUERIES } from '@/lib/queries/library';
 import { DOCS_BY_ID } from '@/docs';
 
-// Build a sector × region matrix using weighted average of
-// price_change_pct. Mirrors the SQL view shown in the notes.
-function buildHeatmap(positions: Record<string, unknown>[]): HeatmapDatum[] {
-  type Agg = { num: number; den: number; n: number };
-  const m = new Map<string, Agg>();
-  for (const p of positions) {
-    if (p.asset_class !== 'EQUITY') continue;
-    const r = String(p.issuer_sector ?? '—');
-    const c = String(p.issuer_region ?? '—');
-    const w = Math.abs(p.market_value_usd as number) || 0;
-    const pc = (p.price_change_pct as number) || 0;
-    const k = `${r}::${c}`;
-    const cur = m.get(k);
-    if (cur) {
-      cur.num += w * pc;
-      cur.den += w;
-      cur.n += 1;
-    } else {
-      m.set(k, { num: w * pc, den: w, n: 1 });
-    }
-  }
+/**
+ * Arrange the long-form aggregate rows from /v_heatmap_sector_region
+ * into the heatmap shape. cqserver has summed the MV-weighted
+ * numerator and denominator per (sector × region) group; we just
+ * divide and project — no client-side aggregation over the raw
+ * positions stream.
+ */
+function viewToHeatmap(rows: Record<string, unknown>[]): HeatmapDatum[] {
   const out: HeatmapDatum[] = [];
-  for (const [k, a] of m.entries()) {
-    const [row, col] = k.split('::');
-    if (!row || !col) continue;
-    out.push({ row, col, value: a.den ? a.num / a.den : 0, weight: a.den });
+  for (const r of rows) {
+    const row = String(r.issuer_sector ?? '—');
+    const col = String(r.issuer_region ?? '—');
+    const num = typeof r.weighted_sum === 'number' ? r.weighted_sum : 0;
+    const den = typeof r.weight === 'number' ? r.weight : 0;
+    out.push({ row, col, value: den ? num / den : 0, weight: den });
   }
   return out.sort((a, b) => a.row.localeCompare(b.row) || a.col.localeCompare(b.col));
 }
 
 export function TickingHeatmapCanvas() {
-  const positions = useLivePositions();
-  const data = useMemo(() => buildHeatmap(positions as Record<string, unknown>[]), [positions]);
+  // cqserver's /v_heatmap_sector_region materializes the
+  // MV-weighted return matrix incrementally. The React layer only
+  // arranges the rows into cells and renders.
+  const heatmapSub = useFilteredSubscription('/v_heatmap_sector_region', null);
+  const data = useMemo(
+    () => viewToHeatmap(heatmapSub.rows as Record<string, unknown>[]),
+    [heatmapSub.rows],
+  );
 
   const kpis: Kpi[] = useMemo(() => {
+    if (data.length === 0) {
+      return [
+        { label: 'Cells', value: 0, kind: 'count' },
+        { label: 'Best', value: 0, kind: 'pct', sub: '—' },
+        { label: 'Worst', value: 0, kind: 'pct', sub: '—' },
+        { label: 'Range', value: 0, kind: 'pct', sub: 'max − min' },
+      ];
+    }
     const vals = data.map((d) => d.value);
-    const best = data.reduce((a, b) => (b.value > a.value ? b : a), data[0]);
-    const worst = data.reduce((a, b) => (b.value < a.value ? b : a), data[0]);
+    const best = data.reduce((a, b) => (b.value > a.value ? b : a), data[0]!);
+    const worst = data.reduce((a, b) => (b.value < a.value ? b : a), data[0]!);
     return [
       { label: 'Cells', value: data.length, kind: 'count' },
       { label: 'Best', value: best.value, kind: 'pct', sub: `${best.row} · ${best.col}` },
@@ -88,7 +91,7 @@ export function TickingHeatmapCanvas() {
               outline marks bucket crossings explicitly so the eye can spot
               meaningful state changes from rate-of-change noise.
             </p>
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               {([
                 ['≤ −3.0%', '-3'],
                 ['−1.5 .. −3', '-2'],
@@ -99,7 +102,25 @@ export function TickingHeatmapCanvas() {
                 ['≥ +3.0%', '3'],
               ] as const).map(([label, bucket]) => (
                 <div key={bucket} className="flex items-center gap-2">
-                  <div className="heatmap-cell" data-bucket={bucket} style={{ width: 50, height: 18, fontSize: 9.5 }}>
+                  {/*
+                   * Swatch: widened so the longest range label
+                   * (`−0.3 .. −1.5`) fits on one line, `flex-shrink: 0`
+                   * so the row's gap layout can't squish it, and
+                   * `white-space: nowrap` to prevent the multi-line
+                   * overflow that previously bled into the next row.
+                   */}
+                  <div
+                    className="heatmap-cell"
+                    data-bucket={bucket}
+                    style={{
+                      width: 96,
+                      height: 22,
+                      fontSize: 10,
+                      flexShrink: 0,
+                      whiteSpace: 'nowrap',
+                      padding: '0 6px',
+                    }}
+                  >
                     {label}
                   </div>
                   <span className="font-mono text-[10px] text-muted-foreground">data-bucket="{bucket}"</span>

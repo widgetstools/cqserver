@@ -606,6 +606,17 @@ pub enum ColumnTypeSpec {
     /// Alias for `long` — for users who think of integers as 64-bit by default.
     #[serde(alias = "integer")]
     Integer,
+    /// Native boolean column — mirrors AMPS's `Bool` type lattice entry.
+    /// JSON `true` / `false` round-trips; canonical string forms
+    /// (`"true"`, `"false"`, `"1"`, `"0"`) coerce to bool on ingest.
+    #[serde(alias = "boolean")]
+    Bool,
+    /// i64 μs-since-epoch column. JSON in: RFC 3339 / ISO 8601 strings
+    /// (`2026-05-25T22:48:43Z`) or epoch numbers (seconds / ms / μs /
+    /// ns by magnitude). JSON out: RFC 3339 micros-precision strings.
+    #[serde(alias = "datetime")]
+    #[serde(alias = "ts")]
+    Timestamp,
 }
 
 fn default_capacity() -> usize {

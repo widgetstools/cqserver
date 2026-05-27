@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7459ce7c3bef846415b5c3fd6136cd6ff48a2d31ac5eceff5050aad3d51ae413 # shrinks to rows = [("k00", 0)], v = -1, op_idx = 0
+cc e89b3e4ddf11d74dc964acf9c28b3f243cd255eeb18472519952fb55ce653ef8 # shrinks to rows = [("k00", 0)], a = 0, b = -1, use_or = false
+cc 5b13292da1d52b41a98f90d131033d18b2892e46ad4f8d47d12f4e5ddd407fd9 # shrinks to rows = [("k00", 0)], a = 0, b = -1
+cc 80075fdb88059c9acba5eaae6569e2d7f992e80c4e56909e2755cdc74290eb04 # shrinks to rows = [("k07", 1), ("k07", 0)], v = 1, op_idx = 3
+cc b67202f07d0cd35accc4656556a293c63c3ae5925e89995ceae37a7958edf21a # shrinks to rows = [("k05", -10), ("k05", 0)], a = -10, b = -1

@@ -4,7 +4,7 @@ import { GridPanel } from '@/components/panels/GridPanel';
 import { SqlPanel } from '@/components/panels/SqlPanel';
 import { MarkdownPanel } from '@/components/panels/MarkdownPanel';
 import { PanelChrome } from '@/components/panels/PanelChrome';
-import { getPositions } from '@/lib/data-gen';
+import { useFilteredSubscription } from '@/lib/use-filtered-subscription';
 import { POSITION_COLUMNS } from '@/lib/schema/positions';
 import { buildColDefs, defaultPositionView } from '@/lib/grid-cols';
 import { fmtCcy, fmtSigned } from '@/lib/format';
@@ -27,7 +27,16 @@ interface PivotCell {
   n: number;
 }
 
-function buildPivot(positions: Record<string, unknown>[], measure: Measure): {
+/**
+ * Arrange long-form aggregate rows from /v_cross_asset_pivot into the
+ * 2D grid the table expects. This is presentation only — every number
+ * already came from cqserver's incremental aggregation, this just
+ * picks the selected measure column and indexes by (row, col).
+ */
+function arrangeViewIntoPivot(
+  rows: Record<string, unknown>[],
+  measure: Measure,
+): {
   rows: string[];
   cols: string[];
   cells: Map<string, PivotCell>;
@@ -42,26 +51,19 @@ function buildPivot(positions: Record<string, unknown>[], measure: Measure): {
   const colT = new Map<string, number>();
   let grand = 0;
 
-  for (const p of positions) {
-    const r = String(p.asset_class ?? '—');
-    const c = String(p.currency ?? '—');
-    const vRaw = p[measure];
+  for (const r of rows) {
+    const rk = String(r.asset_class ?? '—');
+    const ck = String(r.currency ?? '—');
+    const vRaw = r[measure];
     const v = typeof vRaw === 'number' ? vRaw : 0;
-    rowSet.add(r);
-    colSet.add(c);
-    const k = `${r}::${c}`;
-    const cur = cells.get(k);
-    if (cur) {
-      cur.v += v;
-      cur.n += 1;
-    } else {
-      cells.set(k, { row: r, col: c, v, n: 1 });
-    }
-    rowT.set(r, (rowT.get(r) ?? 0) + v);
-    colT.set(c, (colT.get(c) ?? 0) + v);
+    const n = typeof r.n_positions === 'number' ? r.n_positions : 0;
+    rowSet.add(rk);
+    colSet.add(ck);
+    cells.set(`${rk}::${ck}`, { row: rk, col: ck, v, n });
+    rowT.set(rk, (rowT.get(rk) ?? 0) + v);
+    colT.set(ck, (colT.get(ck) ?? 0) + v);
     grand += v;
   }
-
   return {
     rows: Array.from(rowSet).sort(),
     cols: Array.from(colSet).sort(),
@@ -73,14 +75,21 @@ function buildPivot(positions: Record<string, unknown>[], measure: Measure): {
 }
 
 export function CrossAssetPivotCanvas() {
-  const positions = useMemo(() => getPositions(), []);
+  // The pivot table reads from a long-form aggregate view —
+  // /v_cross_asset_pivot — that re-materializes whenever any
+  // position's measure column changes. The 2D arrangement on the
+  // client is presentation, not aggregation.
+  const pivotSub = useFilteredSubscription('/v_cross_asset_pivot', null);
   const colDefs = useMemo(() => buildColDefs(POSITION_COLUMNS), []);
   const visible = useMemo(() => defaultPositionView(), []);
 
   const [measure, setMeasure] = useState<Measure>('market_value_usd');
   const [selected, setSelected] = useState<{ row?: string; col?: string }>({});
 
-  const pivot = useMemo(() => buildPivot(positions as Record<string, unknown>[], measure), [positions, measure]);
+  const pivot = useMemo(
+    () => arrangeViewIntoPivot(pivotSub.rows as Record<string, unknown>[], measure),
+    [pivotSub.rows, measure],
+  );
   const measureDef = MEASURES.find((m) => m.id === measure)!;
 
   // Max-abs for the heatmap fill scale.
@@ -90,22 +99,37 @@ export function CrossAssetPivotCanvas() {
     return m || 1;
   }, [pivot.cells]);
 
-  const drillthrough = useMemo(() => {
-    if (!selected.row && !selected.col) return positions;
-    return positions.filter((p) => {
-      if (selected.row && p.asset_class !== selected.row) return false;
-      if (selected.col && p.currency !== selected.col) return false;
-      return true;
-    });
-  }, [positions, selected]);
+  // Drill-through is a server-side filter over /positions. The
+  // predicate composes from the pivot's selected (row, col); empty
+  // selection means no predicate and a full /positions stream. Each
+  // selection change tears down the prior sub and opens a new one,
+  // so cqserver's filter compiler is doing the work — no React
+  // post-filtering, no full-table scan on the client.
+  const drillFilter = useMemo<string | null>(() => {
+    const clauses: string[] = [];
+    if (selected.row) clauses.push(`asset_class = '${selected.row.replace(/'/g, "''")}'`);
+    if (selected.col) clauses.push(`currency = '${selected.col.replace(/'/g, "''")}'`);
+    return clauses.length ? clauses.join(' AND ') : null;
+  }, [selected]);
+  const drillSub = useFilteredSubscription('/positions', drillFilter);
+  const drillthrough = drillSub.rows;
 
-  const pivotSql = `SELECT asset_class, currency,
-       SUM(${measure}) AS measure,
-       COUNT(*)       AS n
+  const pivotSql = `-- Pivot source (declared in cqserver.toml)
+SELECT asset_class, currency,
+       SUM(market_value_usd)   AS market_value_usd,
+       SUM(unrealized_pnl_usd) AS unrealized_pnl_usd,
+       SUM(var_1d_95)          AS var_1d_95,
+       SUM(exposure_gross)     AS exposure_gross,
+       COUNT(*)                AS n_positions
 FROM positions
-${selected.row || selected.col ? `WHERE 1=1${selected.row ? ` AND asset_class = '${selected.row}'` : ''}${selected.col ? ` AND currency = '${selected.col}'` : ''}` : ''}
-GROUP BY asset_class, currency
-PIVOT (currency);`;
+GROUP BY asset_class, currency;
+
+-- Drill-through (per-component server filter on /positions)
+SELECT *
+FROM positions
+${drillFilter ? `WHERE ${drillFilter}` : '-- (no filter — full stream)'};
+
+-- Active measure on the pivot table: ${measure}`;
 
   const panels: DockPanelSpec[] = [
     {
@@ -226,9 +250,10 @@ PIVOT (currency);`;
       render: () => (
         <GridPanel
           title="Drill-through Positions"
-          rows={drillthrough as Record<string, unknown>[]}
           colDefs={colDefs}
           visible={visible}
+          getRowId={(r) => r.position_id as string}
+          liveSubscription={drillSub}
         />
       ),
     },

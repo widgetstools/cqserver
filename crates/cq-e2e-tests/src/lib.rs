@@ -600,6 +600,25 @@ pub struct KeptDir {
     admin_port: u16,
 }
 
+impl KeptDir {
+    /// Path to the on-disk root for this server — exposed so
+    /// restart-after-corruption tests can inject torn/truncated
+    /// txlog segments or bookmark-file damage between stop and
+    /// restart. Read-only callers (poke at file shapes, list
+    /// segments) can use this without affecting recovery; the
+    /// recovery tests write to it deliberately.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Convenience: the txlog directory the server writes segments
+    /// into. Equivalent to `root().join("txlog")` per `spawn_server`'s
+    /// directory layout.
+    pub fn txlog_dir(&self) -> PathBuf {
+        self.root.join("txlog")
+    }
+}
+
 fn build_toml(
     tcp_port: u16,
     ws_port: u16,
