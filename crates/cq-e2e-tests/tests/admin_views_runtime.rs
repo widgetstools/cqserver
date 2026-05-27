@@ -179,9 +179,11 @@ async fn create_view_invalid_sql_is_rejected_and_not_persisted() {
         .send()
         .await
         .expect("create-view POST");
-    assert!(
-        !resp.status().is_success(),
-        "invalid SQL must be rejected, got {}",
+    // Bad SQL (parse/build failure) maps to 400 via InitViewError::Build.
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "invalid SQL must be rejected with 400, got {}",
         resp.status()
     );
 
@@ -189,4 +191,40 @@ async fn create_view_invalid_sql_is_rejected_and_not_persisted() {
     let empty = !rt.exists()
         || std::fs::read_to_string(&rt).unwrap().trim().is_empty();
     assert!(empty, "rejected view must not be persisted");
+}
+
+#[tokio::test]
+async fn create_view_name_collision_returns_409() {
+    let topic = TopicSpec::new("/positions", "position_id")
+        .with_inline_columns([("position_id", "string"), ("sector", "string")]);
+    let server = start_server(vec![topic]).await;
+    let url = format!("{}/admin/views", server.admin_url());
+    let body = json!({
+        "name": "/v_dup",
+        "source": "/positions",
+        "sql": "SELECT sector, COUNT(*) AS n FROM t GROUP BY sector"
+    });
+
+    let first = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("first create");
+    assert_eq!(first.status().as_u16(), 201, "first create should succeed");
+
+    // Re-creating the same name collides with the now-existing view topic
+    // → InitViewError::NameCollision → HTTP 409.
+    let second = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("second create");
+    assert_eq!(
+        second.status().as_u16(),
+        409,
+        "duplicate view name must return 409, got {}",
+        second.status()
+    );
 }
