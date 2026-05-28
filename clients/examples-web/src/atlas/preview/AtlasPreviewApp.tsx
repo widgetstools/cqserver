@@ -2,10 +2,10 @@ import { useState } from 'react';
 import { AppShell } from '../components/AppShell';
 import { StationsNav } from '../components/StationsNav';
 import { Footer } from '../components/Footer';
-import { PulsePreview } from './PulsePreview';
+import { PulseChapter } from '../chapters/PulseChapter';
 import type { ChapterId } from '../types';
 
-/** Stub for any chapter that hasn't been migrated yet (Phase 1 = Pulse only). */
+/** Stub for any chapter that hasn't been migrated yet (Phase 3 = Pulse only). */
 function ComingSoon({ id }: { id: ChapterId }) {
   return (
     <div
@@ -28,12 +28,12 @@ export function AtlasPreviewApp() {
   const [active, setActive] = useState<ChapterId>('pulse');
 
   return (
-    <AppShell hint="phase 1 preview · placeholder data">
+    <AppShell hint="phase 3 · pulse live">
       <StationsNav active={active} onChange={setActive} />
       <main style={{ position: 'relative', zIndex: 1, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-        {active === 'pulse' ? <PulsePreview /> : <ComingSoon id={active} />}
+        {active === 'pulse' ? <PulseChapter /> : <ComingSoon id={active} />}
       </main>
-      <Footer cadence="250ms cadence" tickStats="placeholder" />
+      <Footer />
     </AppShell>
   );
 }
