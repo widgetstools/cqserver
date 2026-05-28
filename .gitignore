@@ -59,3 +59,4 @@ coverage/
 *.profdata
 lcov.info
 tarpaulin-report.html
+.superpowers/
