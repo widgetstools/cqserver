@@ -34,7 +34,7 @@ export function TapeChapter() {
     return `SELECT COUNT(*) AS n_trades,
                    SUM(notional_usd) AS total_notional,
                    AVG(slippage_arrival_bps) AS avg_slip,
-                   SUM(total_fees) AS total_fees
+                   SUM(total_fees_usd) AS total_fees
             FROM trades ${where}`;
   }, [scope.filterExpression]);
   const agg = useFilteredAggregate('/trades', aggSql);
