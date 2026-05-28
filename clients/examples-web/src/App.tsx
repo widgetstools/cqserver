@@ -11,6 +11,7 @@ import { FEATURE_META, orderFeatures } from '@/lib/features';
 // positions / trades / securities / fi-market-data into the live store
 // before any example needs them.
 import '@/lib/cq-store';
+import { AtlasPreviewApp } from '@/atlas/preview/AtlasPreviewApp';
 
 /**
  * App shell — header, slim tab strip, single-row context band,
@@ -21,6 +22,12 @@ import '@/lib/cq-store';
  * a teal accent bar, feature dots, optional LIVE pulse.
  */
 export function App() {
+  // Phase 1 redesign preview — opt-in via #atlas hash. Existing app
+  // continues to render at every other URL.
+  if (typeof window !== 'undefined' && window.location.hash === '#atlas') {
+    return <AtlasPreviewApp />;
+  }
+
   const [active, setActive] = useState<ExampleId>('live-pnl');
   const ex = exampleById(active);
 
