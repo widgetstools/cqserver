@@ -48,8 +48,17 @@ const TRADES_PER_TICK = Number(process.env.TRADES_PER_TICK ?? 5);
 // a high tick rate); override e.g. `POSITIONS=40000` for a large SOW —
 // pair a big universe with a low TICK_PCT so the tick volume stays sane.
 const POSITION_COUNT = Number(process.env.POSITIONS ?? 480);
-const SEED_CHUNK = 200;
-const SEED_CONCURRENCY = 64;
+// Rows per `publishBatch` wire frame, and how many such frames to keep
+// in flight. Each batch is ONE round-trip for `SEED_CHUNK` rows, so a
+// large universe seeds in (rows / SEED_CHUNK / concurrency) round-trips
+// instead of one per row.
+const SEED_CHUNK = 100;
+// Shallow pipeline: many large frames in flight over one TCP connection
+// can deadlock (publisher blocks writing while the server blocks writing
+// acks) → ack timeout. A small frame + low concurrency trickles but
+// never stalls. High-throughput bulk seeding needs a dedicated server
+// load path (see notes), not deeper client pipelining.
+const SEED_CONCURRENCY = 4;
 
 function pick<T>(arr: readonly T[]): T {
   return arr[Math.floor(Math.random() * arr.length)]!;
@@ -260,46 +269,45 @@ async function publishChunked<T extends Record<string, unknown>>(
   concurrency = SEED_CONCURRENCY,
   chunkSize = SEED_CHUNK,
 ): Promise<void> {
+  // Slice into batch frames; `publishBatch` commits each frame in one
+  // wire round-trip (vs one per row), so throughput is bounded by
+  // round-trips, not row count — the difference between a multi-minute
+  // and a sub-second seed for a large universe.
+  const batches: T[][] = [];
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    batches.push(rows.slice(i, i + chunkSize));
+  }
   let next = 0;
-  let inflight = 0;
   let published = 0;
-  return new Promise((resolve, reject) => {
-    const pump = () => {
-      while (inflight < concurrency && next < rows.length) {
-        const row = rows[next++]!;
-        inflight++;
-        client
-          .publish(topic, row)
-          .then(() => {
-            inflight--;
-            published++;
-            if (published % chunkSize === 0) {
-              process.stdout.write(`  ${topic} ${published}/${rows.length}\r`);
-            }
-            if (next >= rows.length && inflight === 0) {
-              process.stdout.write(`  ${topic} ${published}/${rows.length}\n`);
-              resolve();
-            } else {
-              pump();
-            }
-          })
-          .catch((err: unknown) => {
-            reject(err instanceof Error ? err : new Error(String(err)));
-          });
-      }
-    };
-    pump();
-  });
+  const worker = async (): Promise<void> => {
+    while (next < batches.length) {
+      const batch = batches[next++]!;
+      await client.publishBatch(topic, batch);
+      published += batch.length;
+      process.stdout.write(`  ${topic} ${published}/${rows.length}\r`);
+    }
+  };
+  const workers = Array.from(
+    { length: Math.min(concurrency, batches.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  process.stdout.write(`  ${topic} ${published}/${rows.length}\n`);
 }
 
 // ── Main ────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   console.log(`[atlas-publisher] connecting → ${CQ_URL}`);
-  const client = await Client.connect(CQ_URL);
+  // Generous ack timeout: a large seed keeps many batches in flight, so
+  // a frame can wait behind others on the connection before its ack.
+  const client = await Client.connect(CQ_URL, { ackTimeoutMs: 60_000 });
 
   console.log('[atlas-publisher] generating universe ...');
   const positions = generatePositions(POSITION_COUNT).map((p) => ({ ...p }));
-  const trades = generateTrades(positions);
+  // Trades scale with positions (~4 each by default → 160k+ at a large
+  // universe, which dominates seed time). TRADES_PER_POSITION lets a big
+  // run keep the trade volume sane, e.g. `TRADES_PER_POSITION=1`.
+  const trades = generateTrades(positions, Number(process.env.TRADES_PER_POSITION ?? 4));
 
   console.log(
     `[atlas-publisher] seeding /positions (${positions.length}) and /trades (${trades.length}) ...`,

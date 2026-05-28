@@ -112,7 +112,9 @@ echo $! > "$RUN_DIR/publisher.pid"
 info "pid=$(cat "$RUN_DIR/publisher.pid")  log=$RUN_DIR/publisher.log"
 
 # Wait for the publisher to finish seeding before bringing up the UI.
-for _ in $(seq 1 120); do
+# Generous (5 min): a large POSITIONS universe seeds for a while before
+# the tick loop starts.
+for _ in $(seq 1 600); do
   if grep -q "tick loop:" "$RUN_DIR/publisher.log" 2>/dev/null; then break; fi
   sleep 0.5
 done
