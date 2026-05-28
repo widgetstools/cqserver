@@ -44,8 +44,10 @@ path; persistent topics back the store with an append-only txlog.
   from the default workspace because Arrow / DataFusion transitives now
   require cargo 1.85+. Build standalone with a newer toolchain.
 - **Multi-language clients** — Rust (`cq-client`), TypeScript / Node, Python.
-  A React demo with AG Grid pivot + dock-manager layout lives at
-  [clients/react-demo/](clients/react-demo/).
+  A React demo — `cq · atlas`, an eight-chapter field guide built on a
+  SharedWorker data layer and AG Grid — lives at
+  [clients/examples-web/](clients/examples-web/). Launch via
+  `./start-atlas-demo.sh` at the repo root.
 
 ---
 

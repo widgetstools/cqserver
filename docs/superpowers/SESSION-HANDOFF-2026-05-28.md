@@ -98,3 +98,45 @@ Phase 1 placeholder data used `'RATES-US'` etc. as book names — those don't ex
 When picking back up in a fresh session, the instruction is:
 
 > Continue Plan B option 3 — chapter-by-chapter polish push. Start with PulseChapter (sector ladder + book contribution + restructure). Reference the legacy ex01-live-pnl/index.tsx for the ladder/bar math. Single commit per chapter. After PulseChapter + JoinChapter + SlipChapter polish, run final review and write Plan C.
+
+---
+
+## Update — Phase 5+6 done (2026-05-28, same session)
+
+The polish push and Plan C both shipped after this handoff was written.
+This document is now historical; the resume instruction above is no
+longer applicable. Current state of the Atlas redesign:
+
+- **`/` renders the Atlas chapter app.** The `#atlas` hash gate and the
+  `LegacyApp` fork are gone. `App.tsx` is now a single line:
+  `<AtlasApp />`.
+- **Eight chapters live** (01 PULSE through 08 QUERY). PulseChapter has
+  the sector ladder + book contribution + 2-col layout. JoinChapter is a
+  3-pane LHS/MID/RHS layout. SlipChapter is a 60/40 grid + slippage
+  bars split. The remaining four chapters (Tape, Lens, Heat, View)
+  match the spec already; their optional polish was deferred.
+- **QueryChapter** at `src/atlas/chapters/QueryChapter.tsx` ports the
+  legacy ex08 query builder to the Atlas chrome — catalog rail on the
+  left, controlled-textarea SQL editor + Run button on the top right,
+  dual-mode (live + static) result grid below. Aliases stripped before
+  submission; mode auto-detected by JOIN heuristic.
+- **AtlasPreviewApp** has been renamed to **AtlasApp** and moved from
+  `src/atlas/preview/` to `src/atlas/app/`. There is no preview folder
+  anymore.
+- **Legacy retired.** Deleted in a single commit: `src/examples/`,
+  `src/components/{atlas,panels,theme,ui}/`, `src/docs/`,
+  `src/lib/schema/`, plus `features.ts`, `format.ts`,
+  `aggrid-theme.ts`, `grid-cols.ts`, `utils.ts`, `catalog.ts`,
+  `use-catalog.ts`, `use-filtered-subscription.ts`. The CSS bundle
+  dropped from 89 kB → 6 kB (gzip 19 → 3 kB). The Stockflux
+  `src/styles/{tokens,palettes}.css` files are orphan but left on
+  disk for the user to prune later.
+- **Plan C** is at
+  `docs/superpowers/plans/2026-05-28-examples-web-phase-5-query-and-swap.md`.
+- **Phase 5+6 commit range:** `02ce6d6d..ac92c74d` (Pulse polish through
+  the legacy retirement chore). Eleven commits total.
+
+The polish-push handoff that preceded this update (everything above the
+horizontal rule) is preserved for archeology. Any future archaeological
+needs should start from a fresh handoff doc rather than re-amending this
+one.
