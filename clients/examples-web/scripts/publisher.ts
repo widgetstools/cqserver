@@ -41,6 +41,7 @@ import {
 // capped, keeping the browser comfortable while still showcasing the
 // fan-out the server is doing under the hood.
 const CQ_URL = process.env.CQ_URL ?? 'tcp://127.0.0.1:9007';
+const ADMIN_URL = process.env.CQ_ADMIN_URL ?? 'http://127.0.0.1:8085';
 const TICK_INTERVAL_MS = Number(process.env.TICK_MS ?? 50);
 const TICK_PCT = Number(process.env.TICK_PCT ?? 0.30);
 const TRADES_PER_TICK = Number(process.env.TRADES_PER_TICK ?? 5);
@@ -295,6 +296,20 @@ async function publishChunked<T extends Record<string, unknown>>(
   process.stdout.write(`  ${topic} ${published}/${rows.length}\n`);
 }
 
+/** Probe a topic's row count via the admin HTTP endpoint. Returns 0
+ *  on any failure (admin unreachable, topic absent) — caller treats
+ *  that as "must seed." */
+async function topicRowCount(name: string): Promise<number> {
+  try {
+    const r = await fetch(`${ADMIN_URL}/topics`);
+    if (!r.ok) return 0;
+    const arr = (await r.json()) as Array<{ name: string; rowCount: number }>;
+    return arr.find((t) => t.name === name)?.rowCount ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 // ── Main ────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   console.log(`[atlas-publisher] connecting → ${CQ_URL}`);
@@ -302,18 +317,37 @@ async function main(): Promise<void> {
   // a frame can wait behind others on the connection before its ack.
   const client = await Client.connect(CQ_URL, { ackTimeoutMs: 60_000 });
 
-  console.log('[atlas-publisher] generating universe ...');
-  const positions = generatePositions(POSITION_COUNT).map((p) => ({ ...p }));
-  // Trades scale with positions (~4 each by default → 160k+ at a large
-  // universe, which dominates seed time). TRADES_PER_POSITION lets a big
-  // run keep the trade volume sane, e.g. `TRADES_PER_POSITION=1`.
-  const trades = generateTrades(positions, Number(process.env.TRADES_PER_POSITION ?? 4));
+  // Skip the seed entirely when the topic already has rows (persisted
+  // data restored from the txlog on cqserver restart). RESEED=1 forces
+  // a re-seed regardless — paired with the start script's txlog wipe.
+  const reseed = process.env.RESEED === '1';
+  const existingPositions = await topicRowCount('/positions');
+  const needSeed = reseed || existingPositions === 0;
 
-  console.log(
-    `[atlas-publisher] seeding /positions (${positions.length}) and /trades (${trades.length}) ...`,
-  );
-  await publishChunked(client, '/positions', positions);
-  await publishChunked(client, '/trades', trades);
+  let positions: Position[] = [];
+  if (needSeed) {
+    console.log('[atlas-publisher] generating universe ...');
+    positions = generatePositions(POSITION_COUNT).map((p) => ({ ...p }));
+    // Trades scale with positions (~4 each by default → 160k+ at a
+    // large universe). TRADES_PER_POSITION lets a big run pick a
+    // realistic ratio without overrunning the publisher.
+    const trades = generateTrades(positions, Number(process.env.TRADES_PER_POSITION ?? 4));
+
+    console.log(
+      `[atlas-publisher] seeding /positions (${positions.length}) and /trades (${trades.length}) ...`,
+    );
+    await publishChunked(client, '/positions', positions);
+    await publishChunked(client, '/trades', trades);
+  } else {
+    console.log(
+      `[atlas-publisher] /positions already has ${existingPositions} rows (persisted) — skipping seed.`,
+    );
+    // Regenerate the same deterministic universe so the tick loop has
+    // the row identifiers it needs to bump existing rows (generators
+    // use fixed seeds → same positions/trades the txlog holds).
+    positions = generatePositions(POSITION_COUNT).map((p) => ({ ...p }));
+    void generateTrades(positions, Number(process.env.TRADES_PER_POSITION ?? 4));
+  }
 
   console.log(
     `[atlas-publisher] tick loop: ${TICK_INTERVAL_MS}ms, ${(TICK_PCT * 100).toFixed(0)}% positions per tick, ${TRADES_PER_TICK} trades per tick`,

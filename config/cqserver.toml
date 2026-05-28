@@ -28,7 +28,7 @@ outbound_queue_capacity = 2048
 [[topics]]
 name = "/securities"
 key = ["cusip"]
-persist = false
+persist = true
 initial_capacity = 1000
 schema_file = "schemas/securities.json"
 
@@ -37,7 +37,7 @@ schema_file = "schemas/securities.json"
 [[topics]]
 name = "/fi-market-data"
 key = ["cusip"]
-persist = false
+persist = true
 conflation_ms = 100
 initial_capacity = 1000
 schema_file = "schemas/fi-market-data.json"
@@ -60,7 +60,7 @@ schema_file = "schemas/trades.json"
 [[topics]]
 name = "/positions"
 key = ["position_id"]
-persist = false
+persist = true
 conflation_ms = 50
 initial_capacity = 50000
 schema_file = "schemas/positions.json"
@@ -70,7 +70,7 @@ schema_file = "schemas/positions.json"
 [[topics]]
 name = "/risk"
 key = ["positionKey"]
-persist = false
+persist = true
 conflation_ms = 100
 initial_capacity = 50000
 schema_file = "schemas/risk.json"

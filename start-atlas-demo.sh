@@ -70,19 +70,24 @@ ok "$(ls -lh "$PUB_BUNDLE" | awk '{print $5, $9}')"
 
 # The Atlas schema re-keys /trades (trade_id) and /positions (position_id).
 # Any txlog written under the older fi-publisher key scheme would replay
-# into a store with a different key, which is both slow and meaningless
-# for a demo. Wipe so cqserver starts from a clean SOW each run.
-step "Clearing stale txlog state"
-if [ -d "$ROOT/data/txlog" ]; then
-  for topic in trades positions; do
-    if [ -d "$ROOT/data/txlog/$topic" ] && [ -n "$(ls -A "$ROOT/data/txlog/$topic" 2>/dev/null)" ]; then
-      seg_count=$(ls -1 "$ROOT/data/txlog/$topic" | wc -l | tr -d ' ')
-      rm -f "$ROOT/data/txlog/$topic"/*
-      info "wiped $seg_count segment(s) under data/txlog/$topic/"
-    fi
-  done
+# into a store with a different key, which is both slow and meaningless.
+# Wipe is opt-in via RESEED=1 so persisted data survives restarts; on the
+# next start cqserver replays the txlog and the publisher skips its seed.
+if [ "${RESEED:-0}" = "1" ]; then
+  step "Clearing stale txlog state (RESEED=1)"
+  if [ -d "$ROOT/data/txlog" ]; then
+    for topic in trades positions securities fi-market-data risk; do
+      if [ -d "$ROOT/data/txlog/$topic" ] && [ -n "$(ls -A "$ROOT/data/txlog/$topic" 2>/dev/null)" ]; then
+        seg_count=$(ls -1 "$ROOT/data/txlog/$topic" | wc -l | tr -d ' ')
+        rm -f "$ROOT/data/txlog/$topic"/*
+        info "wiped $seg_count segment(s) under data/txlog/$topic/"
+      fi
+    done
+  fi
+  ok "txlog wiped"
+else
+  info "txlog preserved (set RESEED=1 to wipe and re-seed)"
 fi
-ok "txlog clean"
 
 step "Starting cqserver"
 (
