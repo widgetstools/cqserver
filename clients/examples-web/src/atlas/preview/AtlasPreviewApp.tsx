@@ -8,6 +8,7 @@ import { LensChapter } from '../chapters/LensChapter';
 import { HeatChapter } from '../chapters/HeatChapter';
 import { ViewChapter } from '../chapters/ViewChapter';
 import { JoinChapter } from '../chapters/JoinChapter';
+import { SlipChapter } from '../chapters/SlipChapter';
 import type { ChapterId } from '../types';
 
 /** Stub for any chapter that hasn't been migrated yet (Phase 3 = Pulse only). */
@@ -42,6 +43,7 @@ export function AtlasPreviewApp() {
           : active === 'heat' ? <HeatChapter />
           : active === 'view' ? <ViewChapter />
           : active === 'join' ? <JoinChapter />
+          : active === 'slip' ? <SlipChapter />
           : <ComingSoon id={active} />}
       </main>
       <Footer />
