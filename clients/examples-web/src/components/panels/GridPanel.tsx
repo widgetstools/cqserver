@@ -11,9 +11,8 @@ import { AllEnterpriseModule } from 'ag-grid-enterprise';
 import { useTheme } from '@/components/theme/ThemeProvider';
 import { getAgGridTheme } from '@/lib/aggrid-theme';
 import { PanelChrome } from './PanelChrome';
-import { cqStore, useTickCount, type CqTopic, type DeltaBatch, type Row } from '@/lib/cq-store';
+import type { DeltaBatch, Row } from '@/lib/use-subscription';
 import type { FilteredSubscription } from '@/lib/use-filtered-subscription';
-import type { SubscriptionHandle } from '@/lib/use-subscription';
 
 // Enterprise module unlocks the bottom status bar (`statusBar` prop +
 // `ag*Component` panels) and the row-range / aggregation widgets that
@@ -24,13 +23,13 @@ ModuleRegistry.registerModules([AllCommunityModule, AllEnterpriseModule]);
 interface GridPanelProps<T> {
   title: string;
   /**
-   * Static row array — used only when neither `topic` nor
-   * `liveSubscription` is set. With either imperative binding,
-   * rowData is seeded from the cqserver SOW and updated via
-   * `applyTransactionAsync`; this prop is ignored.
+   * Static row array — used only when `liveSubscription` is unset.
+   * When `liveSubscription` is set, rowData is seeded from the
+   * cqserver SOW and updated via `applyTransactionAsync`; this prop
+   * is ignored.
    *
    * Kept optional so demo panels that drive themselves entirely
-   * from a cqserver topic/sub don't have to pass `rows={[]}` as
+   * from a cqserver subscription don't have to pass `rows={[]}` as
    * dead placeholder.
    */
   rows?: T[];
@@ -55,62 +54,14 @@ interface GridPanelProps<T> {
    */
   flashColumns?: readonly string[];
   /**
-   * Bind this grid IMPERATIVELY to a cqserver topic. When set, the
-   * grid seeds its rowData once from the topic's snapshot and applies
-   * every subsequent change via `applyTransactionAsync`. The `rows`
-   * prop is ignored. Only use for grids that show the raw, unfiltered
-   * topic stream — derived grids (filtered, sliced, aggregated) must
-   * use `tickTopic` instead so the rowData prop still drives them.
-   */
-  topic?: CqTopic;
-  /**
-   * Display the tick counter for this cqserver topic in the chrome
-   * WITHOUT taking over the rowData binding. Use this on derived
-   * panels (filter chips, drill-through, aggregates, joins) that
-   * compute their own row subset in React state.
-   */
-  tickTopic?: CqTopic;
-  /**
    * A per-component server-side subscription (from
-   * `useFilteredSubscription`). When set, the grid seeds rowData once
-   * from the subscription's snapshot and applies every delta batch
-   * via `applyTransactionAsync` — same imperative path as `topic=`,
-   * but bound to the per-component sub instead of the global store.
-   * This is the right binding for any tab whose data shape matches
-   * the underlying topic but is filtered/sliced server-side.
+   * `useFilteredSubscription` or `useSubscription`). When set, the
+   * grid seeds rowData once from the subscription's snapshot and
+   * applies every delta batch via `applyTransactionAsync`. This is
+   * the only imperative binding mode; if it's omitted the `rows`
+   * prop drives the grid in React-controlled mode.
    */
-  liveSubscription?: FilteredSubscription | SubscriptionHandle;
-}
-
-/**
- * Header stats badge — isolated so the live tick counter re-renders
- * THIS leaf alone, not the whole GridPanel. A topic-bound grid drives
- * its rows imperatively via `applyTransactionAsync`; subscribing to
- * the tick stream in the GridPanel body would force a full React
- * re-render every tick for nothing. Keeping `useTickCount` down here
- * means the grid renders once (to seed) and stays still.
- */
-function GridStatsBadge({
-  rowCount,
-  colCount,
-  tickTopic,
-}: {
-  rowCount: number;
-  colCount: number;
-  tickTopic: CqTopic | undefined;
-}) {
-  const ticks = useTickCount(tickTopic);
-  return (
-    <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
-      {rowCount.toLocaleString()} rows · {colCount} cols
-      {tickTopic && (
-        <>
-          {' · '}
-          <span className="text-foreground">{ticks.toLocaleString()} ticks</span>
-        </>
-      )}
-    </span>
-  );
+  liveSubscription?: FilteredSubscription;
 }
 
 /**
@@ -131,8 +82,6 @@ function GridPanelInner<T extends Record<string, unknown>>({
   onRowClick,
   getRowId,
   flashColumns,
-  topic,
-  tickTopic,
   liveSubscription,
 }: GridPanelProps<T>) {
   const { theme, palette } = useTheme();
@@ -177,25 +126,12 @@ function GridPanelInner<T extends Record<string, unknown>>({
     [getRowId],
   );
 
-  // Topic-bound grids switch into IMPERATIVE mode: rowData is seeded
-  // exactly once from the cq-store snapshot, and every subsequent
-  // change flows through `applyTransactionAsync` against the captured
-  // GridApi. The `rows` prop is ignored when `topic` is set.
-  //
-  // Why: passing a fresh `rowData` array every coalesce window forces
-  // AG-Grid's immutable-data-mode diff over ALL N rows (~9k row
-  // compares/sec on the Live PnL grid), which starves the main
-  // thread of cycles for user interactions like header-click sort.
-  // With `applyTransactionAsync({ update: [...] })` the cost is
-  // O(changes) — typically ~50 rows per tick.
-  const isTopicBound = topic !== undefined;
-  const isLiveSubBound = liveSubscription !== undefined;
-  const isImperative = isTopicBound || isLiveSubBound;
+  const isImperative = liveSubscription !== undefined;
   if (isImperative && !getRowId) {
     // Surface the misuse loudly: an imperatively-bound grid without
     // getRowId can't match transaction updates to existing rows.
     throw new Error(
-      `<GridPanel topic="${topic ?? '(liveSubscription)'}"> requires getRowId — applyTransactionAsync needs a stable row id`,
+      '<GridPanel liveSubscription={...}> requires getRowId — applyTransactionAsync needs a stable row id',
     );
   }
   const apiRef = useRef<GridApi<T> | null>(null);
@@ -204,8 +140,8 @@ function GridPanelInner<T extends Record<string, unknown>>({
   // a FilteredSubscription rebuilds the underlying sub).
   const seededRef = useRef<unknown>(null);
 
-  // Pick the source: an external per-component subscription wins
-  // over the global topic-store, but both expose identical surface.
+  // The only imperative source is liveSubscription. When unset, the
+  // grid renders the static `rows` prop in React-controlled mode.
   const source: {
     getSnapshot: () => Row[];
     getStatus: () => string;
@@ -213,10 +149,9 @@ function GridPanelInner<T extends Record<string, unknown>>({
     subscribeStatus: (cb: () => void) => () => void;
     subscribeBatchedDeltas: (cb: (b: DeltaBatch) => void) => () => void;
   } | null = useMemo(() => {
-    if (isLiveSubBound) return liveSubscription as unknown as typeof source;
-    if (isTopicBound) return cqStore[topic!] as unknown as typeof source;
+    if (liveSubscription) return liveSubscription as unknown as typeof source;
     return null;
-  }, [isLiveSubBound, isTopicBound, liveSubscription, topic]);
+  }, [liveSubscription]);
 
   useEffect(() => {
     if (!source) return;
@@ -295,11 +230,9 @@ function GridPanelInner<T extends Record<string, unknown>>({
       title={title}
       right={
         right ?? (
-          <GridStatsBadge
-            rowCount={(isImperative ? (boundRows ?? []) : (rows ?? [])).length}
-            colCount={cols.length}
-            tickTopic={topic ?? tickTopic}
-          />
+          <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+            {(isImperative ? (boundRows ?? []) : (rows ?? [])).length.toLocaleString()} rows · {cols.length} cols
+          </span>
         )
       }
     >

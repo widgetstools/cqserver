@@ -27,6 +27,7 @@ export function LivePnlCanvas() {
   //   /v_book_totals        — KPI grand totals (single-row aggregate)
   // The Positions grid itself stays on the raw /positions topic via
   // GridPanel's imperative binding (snapshot + delta stream).
+  const positionsSub = useFilteredSubscription('/positions', null);
   const sectorSub = useFilteredSubscription('/v_pnl_by_sector', null);
   const bookSub = useFilteredSubscription('/v_pnl_by_book', null);
   const complianceSub = useFilteredSubscription('/v_compliance_counts', null);
@@ -140,7 +141,7 @@ export function LivePnlCanvas() {
           colDefs={colDefs}
           visible={visible}
           getRowId={positionRowId}
-          topic="positions"
+          liveSubscription={positionsSub}
         />
       ),
     },

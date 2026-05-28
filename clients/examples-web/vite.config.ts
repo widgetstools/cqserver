@@ -44,6 +44,21 @@ export default defineConfig({
       },
     },
   },
+  worker: {
+    // The cqserver SharedWorker imports `@cqserver/client`, which pulls
+    // the same SDK that needs the `transport-node.js` externalisation
+    // dance as the main bundle. Worker builds get a separate Rollup pass
+    // so they don't inherit `build.rollupOptions` — replicate the
+    // externals here so `cq-worker.shared.ts` and `cq-worker.dedicated.ts`
+    // compile cleanly.
+    format: 'es',
+    rollupOptions: {
+      external: (id) =>
+        id.startsWith('node:') ||
+        id === '../../client-sdks/ts/dist/transport-node.js' ||
+        id.endsWith('/transport-node.js'),
+    },
+  },
   server: {
     port: 5175,
     strictPort: false,

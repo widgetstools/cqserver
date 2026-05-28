@@ -44,6 +44,8 @@ export function JoinsCanvas() {
   // positions USING (position_id)` aggregated by the position-side
   // `compliance_status` column. The view runner recomputes whenever
   // either side mutates, and republishes only the affected groups.
+  const positionsSub = useFilteredSubscription('/positions', null);
+  const tradesSub = useFilteredSubscription('/trades', null);
   const joinSub = useFilteredSubscription('/v_trades_by_compliance', null);
 
   // LHS / RHS samples for the source-side grids. We sample the raw
@@ -149,7 +151,7 @@ export function JoinsCanvas() {
           colDefs={posDefs}
           visible={['position_id', 'book_name', 'symbol', 'asset_class', 'market_value_usd', 'compliance_status']}
           getRowId={positionRowId}
-          topic="positions"
+          liveSubscription={positionsSub}
         />
       ),
     },
@@ -162,7 +164,7 @@ export function JoinsCanvas() {
           colDefs={trdDefs}
           visible={['trade_id', 'position_id', 'side', 'quantity', 'price', 'notional_usd', 'status']}
           getRowId={tradeRowId}
-          topic="trades"
+          liveSubscription={tradesSub}
         />
       ),
     },
