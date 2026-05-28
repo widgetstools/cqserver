@@ -14,7 +14,7 @@
 import { Client, Subscription } from '@cqserver/client';
 import type { Delta } from '@cqserver/client';
 import type { ClientMsg, ServerMsg, Row } from './protocol';
-import { SOW_CHUNK_ROWS } from './protocol';
+import { SOW_CHUNK_ROWS, COALESCE_MS } from './protocol';
 
 const DEFAULT_WS_URL = 'ws://127.0.0.1:9008/cq/json';
 const RECONNECT_BASE_MS = 500;
@@ -47,6 +47,10 @@ interface SharedSub {
   rows: Map<string, Row>;
   /** Per-port SOW progress so a port that joined late gets its own chunked replay. */
   newcomers: { portId: string; portSubId: string }[];
+  pendingAdd: Row[];
+  pendingUpdate: Row[];
+  pendingRemove: Row[];
+  coalesceTimer: ReturnType<typeof setTimeout> | null;
 }
 
 class Hub {
@@ -136,6 +140,10 @@ class Hub {
         isLive: false,
         rows: new Map(),
         newcomers: [],
+        pendingAdd: [],
+        pendingUpdate: [],
+        pendingRemove: [],
+        coalesceTimer: null,
       };
       this.subs.set(key, shared);
     }
@@ -240,12 +248,39 @@ class Hub {
     }
   }
 
-  /** Stub for Task 5. Task 4 only needs the function to exist so
-   *  `openShared`'s post-SOW branch compiles. */
-  private enqueueDelta(_shared: SharedSub, _kind: Delta['deltaType'], _row: Row): void {
-    void _shared;
-    void _kind;
-    void _row;
+  private enqueueDelta(shared: SharedSub, kind: Delta['deltaType'], row: Row): void {
+    if (kind === 'remove' || kind === 'oof') shared.pendingRemove.push(row);
+    else if (kind === 'add') shared.pendingAdd.push(row);
+    else shared.pendingUpdate.push(row);
+    if (shared.coalesceTimer == null) {
+      shared.coalesceTimer = setTimeout(() => this.flushPending(shared), COALESCE_MS);
+    }
+  }
+
+  private flushPending(shared: SharedSub): void {
+    shared.coalesceTimer = null;
+    if (
+      shared.pendingAdd.length === 0 &&
+      shared.pendingUpdate.length === 0 &&
+      shared.pendingRemove.length === 0
+    ) {
+      return;
+    }
+    const add = shared.pendingAdd;
+    const update = shared.pendingUpdate;
+    const remove = shared.pendingRemove;
+    shared.pendingAdd = [];
+    shared.pendingUpdate = [];
+    shared.pendingRemove = [];
+    for (const ref of shared.refs) {
+      this.send(ref.portId, {
+        kind: 'delta',
+        subId: ref.portSubId,
+        add,
+        update,
+        remove,
+      });
+    }
   }
 
   // ─── Unsubscribe path ────────────────────────────────────────
@@ -262,6 +297,10 @@ class Hub {
       }
     }
     if (shared.refs.size === 0) {
+      if (shared.coalesceTimer != null) {
+        clearTimeout(shared.coalesceTimer);
+        shared.coalesceTimer = null;
+      }
       const upstreamId = shared.sub?.subId;
       this.subs.delete(key);
       shared.sub = null;
