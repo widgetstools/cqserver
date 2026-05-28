@@ -108,7 +108,7 @@ export function TradeBlotterCanvas() {
   const tradesAgg = useFilteredAggregate('/trades', aggSql);
 
   const kpis = useMemo<Kpi[]>(() => {
-    const r = tradesAgg.row;
+    const r = tradesAgg.row ?? {};
     const num = (k: string): number =>
       typeof r[k] === 'number' ? (r[k] as number) : 0;
     return [
