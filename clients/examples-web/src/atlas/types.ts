@@ -20,29 +20,20 @@ export interface ChapterMeta {
   kicker: string;    // 'LIVE BOOK' — eyebrow text on the chapter head
 }
 
-/** One chip in a chapter's filter rail. Phase 1 uses these for the
- *  visual chip rail; Phase 2 wires them to subscription-driven values. */
+/**
+ * One chip in a chapter's filter rail. Plan A's `useChapterScope` reads
+ * `key`/`column`/`default`; chapter components subscribe to `source` to
+ * derive the option list.
+ */
 export interface ChipSpec {
   key: string;                  // 'BOOK', 'SECTOR' — the chip label
   column: string;               // 'book_name' — the source column
-  source?: string;              // '/v_pnl_by_book' — view that supplies values (Phase 2)
+  source?: string;              // '/v_pnl_by_book' — view that supplies values
   default?: string;             // first-paint scope (e.g. 'RATES-US')
 }
 
-export interface ChapterScope {
-  primary: {
-    topic: string;              // '/positions'
-    rowIdKey: string;           // 'position_id'
-    filter?: (s: Record<string, string>) => string | null;
-  };
-  views?: string[];             // '/v_book_totals' etc., subscribed for KPIs
-  chips: ChipSpec[];
-}
-
-export interface KpiSpec {
-  label: string;                // 'NET MV'
-  format: 'ccy' | 'signed-ccy' | 'count' | 'pct';
-  source: string;               // '/v_book_totals' — the view this reads from
-  column: string;               // 'market_value'
-  caption?: string;             // 'market_value · sum'
-}
+// Per-chapter KPI/scope sketches were absorbed into Plan A:
+//   - chip-and-WHERE state lives in `hooks/useChapterScope.ts`
+//   - per-chapter KPI mapping lives in `scopes/<chapter>.ts` (e.g.
+//     `PulseKpiDef` + `PULSE_KPIS` in `scopes/pulse.ts`)
+// New chapters should follow the Plan A pattern, not import from here.
