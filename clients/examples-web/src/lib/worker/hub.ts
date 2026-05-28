@@ -322,6 +322,22 @@ class Hub {
         this.reconnectAttempts = 0;
         c.onClose(() => this.handleClose());
         this.broadcast({ kind: 'connected' });
+        // Re-open every shared sub that still has refs.
+        for (const shared of this.subs.values()) {
+          if (shared.refs.size === 0) continue;
+          for (const ref of shared.refs) {
+            this.send(ref.portId, { kind: 'status', subId: ref.portSubId, status: 'snapshotting' });
+          }
+          void this.openShared(shared, c).catch((err) => {
+            for (const ref of shared.refs) {
+              this.send(ref.portId, {
+                kind: 'error',
+                subId: ref.portSubId,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
+          });
+        }
         return c;
       })
       .catch((err) => {
@@ -341,10 +357,21 @@ class Hub {
   private handleClose(): void {
     this.client = null;
     this.clientPromise = null;
-    // Mark every shared sub as torn down — Task 6 will resubscribe.
+    // Tear down every shared sub's upstream handle but keep the port refs.
     for (const shared of this.subs.values()) {
       shared.sub = null;
       shared.isLive = false;
+      shared.rows.clear();
+      shared.pendingAdd = [];
+      shared.pendingUpdate = [];
+      shared.pendingRemove = [];
+      if (shared.coalesceTimer != null) {
+        clearTimeout(shared.coalesceTimer);
+        shared.coalesceTimer = null;
+      }
+      for (const ref of shared.refs) {
+        this.send(ref.portId, { kind: 'status', subId: ref.portSubId, status: 'disconnected' });
+      }
     }
     this.broadcast({ kind: 'disconnected' });
     this.scheduleReconnect();
