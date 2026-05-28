@@ -11,7 +11,11 @@ import type { ChipSpec } from '../types';
 /** Chips render the FilterRail and drive the WHERE expression sent to
  *  /positions. Each chip's options come from the `source` view. */
 export const PULSE_CHIPS: readonly ChipSpec[] = [
-  { key: 'BOOK', column: 'book_name', source: '/v_pnl_by_book', default: 'RATES-US' },
+  // Default to a real seeded book name (see data-gen.ts BOOKS list:
+  // 'Global Macro', 'Equity Long-Short', 'Credit Relative Val',
+  // 'Vol Arbitrage', 'Index Replication', 'Rates Curve', 'EM Sovereign',
+  // 'High-Yield Carry'). 'Rates Curve' filters ~5k positions out of 40k.
+  { key: 'BOOK', column: 'book_name', source: '/v_pnl_by_book', default: 'Rates Curve' },
   { key: 'SECTOR', column: 'issuer_sector', source: '/v_pnl_by_sector' },
   { key: 'COMPLIANCE', column: 'compliance_status', source: '/v_compliance_counts' },
 ];
