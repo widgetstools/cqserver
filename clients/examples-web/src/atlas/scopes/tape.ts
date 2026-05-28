@@ -5,9 +5,30 @@
 import type { ColDef } from 'ag-grid-community';
 import type { ChipSpec } from '../types';
 
+/**
+ * Tape chips default STATUS to 'FILLED' so the initial subscription
+ * loads ~1/7 of the trade universe instead of all 320k+ rows. SIDE/STATUS
+ * options are hardcoded from the publisher's known enum (refdata.ts
+ * SIDES + TRADE_STATUSES) rather than derived from a secondary unfiltered
+ * /trades sub — the secondary sub doubled the network cost and was the
+ * main reason Tape felt slow.
+ */
 export const TAPE_CHIPS: readonly ChipSpec[] = [
   { key: 'SIDE', column: 'side', source: '/trades' },
-  { key: 'STATUS', column: 'status', source: '/trades' },
+  { key: 'STATUS', column: 'status', source: '/trades', default: 'FILLED' },
+];
+
+/** Static chip option lists — match the publisher's refdata.ts. */
+export const TAPE_SIDE_OPTIONS = ['All', 'BUY', 'SELL', 'SHORT', 'COVER'];
+export const TAPE_STATUS_OPTIONS = [
+  'All',
+  'NEW',
+  'PARTIALLY_FILLED',
+  'FILLED',
+  'CANCELED',
+  'REJECTED',
+  'EXPIRED',
+  'PENDING_REVIEW',
 ];
 
 export const TAPE_COL_DEFS: ColDef[] = [

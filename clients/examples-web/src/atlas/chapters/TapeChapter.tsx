@@ -3,20 +3,29 @@ import { ChapterHead, HeroMetric } from '../components/ChapterHead';
 import { FilterRail } from '../components/FilterRail';
 import { KpiStrip, type Kpi } from '../components/KpiStrip';
 import { DataTable } from '../components/DataTable';
-import { useChapterScope, distinctValues } from '../hooks/useChapterScope';
+import { useChapterScope } from '../hooks/useChapterScope';
 import { useSubscription, type Row } from '@/lib/use-subscription';
 import { useFilteredAggregate } from '@/lib/use-filtered-aggregate';
-import { TAPE_CHIPS, TAPE_COL_DEFS, fmtMillions, fmtBps, fmtCount } from '../scopes/tape';
+import {
+  TAPE_CHIPS,
+  TAPE_COL_DEFS,
+  TAPE_SIDE_OPTIONS,
+  TAPE_STATUS_OPTIONS,
+  fmtMillions,
+  fmtBps,
+  fmtCount,
+} from '../scopes/tape';
 
 const tradeRowId = (r: Row): string => String(r.trade_id ?? '');
 
 export function TapeChapter() {
   const scope = useChapterScope(TAPE_CHIPS);
 
-  // /trades is a big topic — we still subscribe to ALL of it for chip options
-  // (it's the only source of distinct side/status values). The primary
-  // subscription below is server-filtered.
-  const allTradesSub = useSubscription('/trades', null);
+  // Only one /trades subscription, server-filtered by chip selection. The
+  // default STATUS='FILLED' (declared in TAPE_CHIPS) shrinks the initial
+  // SOW to ~1/7 of the trade universe so the tape paints fast on first
+  // mount. Chip options are hardcoded constants — no separate unfiltered
+  // /trades sub.
   const tradesSub = useSubscription('/trades', scope.filterExpression, tradeRowId);
 
   // Server-side aggregate for KPIs — re-emits whenever any matching trade changes.
@@ -32,10 +41,10 @@ export function TapeChapter() {
 
   const chipOptions = useMemo(
     () => ({
-      SIDE: ['All', ...distinctValues(allTradesSub.rows, 'side')],
-      STATUS: ['All', ...distinctValues(allTradesSub.rows, 'status')],
+      SIDE: TAPE_SIDE_OPTIONS,
+      STATUS: TAPE_STATUS_OPTIONS,
     }),
-    [allTradesSub.rows],
+    [],
   );
 
   const kpis = useMemo<Kpi[]>(() => {
