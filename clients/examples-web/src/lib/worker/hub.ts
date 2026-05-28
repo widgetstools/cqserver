@@ -41,12 +41,15 @@ interface SharedSub {
   refs: Set<{ portId: string; portSubId: string }>;
   /** Once the cqserver sub is up. null while still snapshotting/connecting. */
   sub: Subscription | null;
+  /** Resolves when `openShared` completes for this key. Lets a second
+   *  port subscribing to the same `(topic, filter, sql)` triple wait
+   *  on the first port's open instead of racing it and leaking a
+   *  duplicate upstream sub on the server. */
+  openingPromise: Promise<void> | null;
   /** Set after `whenSnapshotComplete()`. */
   isLive: boolean;
   /** Worker-side row mirror for SOW replay on late join + Task 6 resub. */
   rows: Map<string, Row>;
-  /** Per-port SOW progress so a port that joined late gets its own chunked replay. */
-  newcomers: { portId: string; portSubId: string }[];
   pendingAdd: Row[];
   pendingUpdate: Row[];
   pendingRemove: Row[];
@@ -137,9 +140,9 @@ class Hub {
         sql: msg.sql,
         refs: new Set(),
         sub: null,
+        openingPromise: null,
         isLive: false,
         rows: new Map(),
-        newcomers: [],
         pendingAdd: [],
         pendingUpdate: [],
         pendingRemove: [],
@@ -151,9 +154,24 @@ class Hub {
     this.send(state.id, { kind: 'status', subId: msg.subId, status: 'snapshotting' });
     try {
       const client = await this.ensureClient();
-      // Only the FIRST refer opens the upstream subscription.
-      if (!shared.sub) await this.openShared(shared, client);
-      else if (shared.isLive) {
+      // Capture pre-await state so we know whether to do the late-join
+      // replay below. A "true late joiner" is a port that arrives after
+      // openShared has already completed (`shared.sub != null && isLive`);
+      // the first opener and any racing ports that join mid-open are
+      // already in `shared.refs` when openShared's `flushSowChunks`
+      // walks it, so they're covered by the fan-out.
+      const needLateReplay = shared.sub != null && shared.isLive;
+      if (shared.sub == null) {
+        // Race guard: if another port is mid-open for this key, await
+        // its promise instead of starting a duplicate sowAndSubscribe.
+        if (shared.openingPromise == null) {
+          shared.openingPromise = this.openShared(shared, client).finally(() => {
+            shared.openingPromise = null;
+          });
+        }
+        await shared.openingPromise;
+      }
+      if (needLateReplay) {
         // Replay the worker's mirrored rows so the newcomer paints in.
         this.sendSowChunked({ portId: state.id, portSubId: msg.subId }, Array.from(shared.rows.values()));
         this.send(state.id, { kind: 'status', subId: msg.subId, status: 'live' });
