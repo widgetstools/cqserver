@@ -12,7 +12,7 @@ import { SlipChapter } from '../chapters/SlipChapter';
 import { QueryChapter } from '../chapters/QueryChapter';
 import type { ChapterId } from '../types';
 
-/** Stub for any chapter that hasn't been migrated yet (Phase 4 = chapters 01–07; Query lands in Plan C). */
+/** Stub for any future chapter the stations rail might add. All eight current chapters have concrete implementations. */
 function ComingSoon({ id }: { id: ChapterId }) {
   return (
     <div
@@ -31,11 +31,11 @@ function ComingSoon({ id }: { id: ChapterId }) {
   );
 }
 
-export function AtlasPreviewApp() {
+export function AtlasApp() {
   const [active, setActive] = useState<ChapterId>('pulse');
 
   return (
-    <AppShell hint="phase 5 · chapters 01–08 live">
+    <AppShell hint="chapters 01–08 live">
       <StationsNav active={active} onChange={setActive} />
       <main style={{ position: 'relative', zIndex: 1, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         {active === 'pulse' ? <PulseChapter />
