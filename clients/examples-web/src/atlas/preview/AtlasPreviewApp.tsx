@@ -4,6 +4,7 @@ import { StationsNav } from '../components/StationsNav';
 import { Footer } from '../components/Footer';
 import { PulseChapter } from '../chapters/PulseChapter';
 import { TapeChapter } from '../chapters/TapeChapter';
+import { LensChapter } from '../chapters/LensChapter';
 import type { ChapterId } from '../types';
 
 /** Stub for any chapter that hasn't been migrated yet (Phase 3 = Pulse only). */
@@ -34,6 +35,7 @@ export function AtlasPreviewApp() {
       <main style={{ position: 'relative', zIndex: 1, flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
         {active === 'pulse' ? <PulseChapter />
           : active === 'tape' ? <TapeChapter />
+          : active === 'lens' ? <LensChapter />
           : <ComingSoon id={active} />}
       </main>
       <Footer />
