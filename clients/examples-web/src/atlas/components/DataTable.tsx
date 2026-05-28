@@ -55,6 +55,20 @@ export function DataTable<T extends Record<string, unknown>>({
     [getRowId],
   );
 
+  // AG-Grid v35 requires per-column `enableCellChangeFlash` to actually
+  // emit the value-change flash under React + immutable data mode.
+  // Default ColDef propagation does NOT work; the legacy GridPanel
+  // injected this column-by-column for the same reason. When we're
+  // bound to a liveSubscription, opt every column in so the user sees
+  // amber-flash on every tick.
+  const flashColDefs = useMemo<ColDef[]>(
+    () =>
+      liveSubscription
+        ? colDefs.map((c) => ({ ...c, enableCellChangeFlash: true }))
+        : colDefs,
+    [colDefs, liveSubscription],
+  );
+
   const apiRef = useRef<GridApi<T> | null>(null);
   const seededRef = useRef<SubscriptionHandle | null>(null);
   const [boundRows, setBoundRows] = useState<T[] | null>(null);
@@ -154,7 +168,7 @@ export function DataTable<T extends Record<string, unknown>>({
         <AgGridReact<T>
           theme={theme}
           rowData={effectiveRowData}
-          columnDefs={colDefs}
+          columnDefs={flashColDefs}
           rowHeight={26}
           headerHeight={28}
           animateRows={false}

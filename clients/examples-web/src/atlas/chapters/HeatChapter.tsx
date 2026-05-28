@@ -2,10 +2,10 @@ import { useMemo } from 'react';
 import { ChapterHead, HeroMetric } from '../components/ChapterHead';
 import { FilterRail } from '../components/FilterRail';
 import { KpiStrip, type Kpi } from '../components/KpiStrip';
-import { DataTable } from '../components/DataTable';
+import { HeatmapMatrix } from '../components/HeatmapMatrix';
 import { useChapterScope } from '../hooks/useChapterScope';
 import { useSubscription, type Row } from '@/lib/use-subscription';
-import { HEAT_COL_DEFS, fmtSignedMillions, fmtCount } from '../scopes/heat';
+import { fmtSignedMillions, fmtCount } from '../scopes/heat';
 
 const heatmapRowId = (r: Row): string =>
   `${String(r.issuer_sector ?? '')}|${String(r.issuer_region ?? '')}`;
@@ -16,8 +16,8 @@ export function HeatChapter() {
 
   const totals = useMemo(() => {
     let n = 0, weight = 0, weightedSum = 0;
-    let sectors = new Set<string>();
-    let regions = new Set<string>();
+    const sectors = new Set<string>();
+    const regions = new Set<string>();
     for (const r of heatSub.rows) {
       n += Number(r.n_positions ?? 0);
       weight += Number(r.weight ?? 0);
@@ -49,7 +49,7 @@ export function HeatChapter() {
       <ChapterHead
         kicker="CHAPTER 04 — HEAT"
         title="heat."
-        sub="The sector × region heatmap, recomputed by cqserver whenever any position mutates. Every cell is a continuous group aggregate; the browser just renders what the view emits."
+        sub="Sector × region heatmap, recomputed by cqserver whenever any position mutates. Each cell colours by weighted contribution — amber for positive, red for loss, intensity scaled to magnitude. Cells pulse amber on every tick."
         hero={<HeroMetric label="CELLS" value={fmtCount(heatSub.rows.length)} detail={`${totals.nSectors} sectors × ${totals.nRegions} regions`} />}
       />
       <FilterRail
@@ -60,12 +60,14 @@ export function HeatChapter() {
         subscriptionSummary={`/v_heatmap_sector_region · ${heatSub.size} cells`}
       />
       <KpiStrip kpis={kpis} />
-      <DataTable<Row>
-        title={`HEATMAP · ${HEAT_COL_DEFS.length} cols`}
+      <HeatmapMatrix
+        title="SECTOR × REGION · weighted_sum"
         status={status}
-        colDefs={HEAT_COL_DEFS}
-        getRowId={heatmapRowId}
         liveSubscription={heatSub}
+        rowKey="issuer_sector"
+        colKey="issuer_region"
+        valueKey="weighted_sum"
+        countKey="n_positions"
       />
     </>
   );
