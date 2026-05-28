@@ -267,7 +267,6 @@ LIMIT 500;`;
           visible={visible}
           getRowId={tradeRowId}
           liveSubscription={tradesSub}
-          tickTopic="trades"
         />
       ),
     },

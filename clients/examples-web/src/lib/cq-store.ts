@@ -70,13 +70,59 @@ class TopicStore {
   /** True after the initial SOW completes; gates batch delivery so
    *  the SOW burst doesn't trickle out as 40 000 add transactions. */
   private livePhase = false;
+  /** Lazy subscription: stays unsubscribed until some consumer calls a
+   *  subscribe* method. Avoids pulling the whole topic universe on every
+   *  page load when no tab actually needs it. */
+  private desired = false;
+  private running = false;
 
   constructor(
     public readonly topic: string,
     private readonly keyOf: (r: Row) => string,
   ) {}
 
+  /** Called by every subscribe* path. Marks the store as wanted and
+   *  kicks off the sowAndSubscribe if the client is up and nothing is
+   *  already in flight. Re-callable; cheap. */
+  ensureSubscribed = (): void => {
+    if (!this.desired) this.desired = true;
+    this.kickIfReady();
+  };
+
+  /** Start the subscription if a client exists and nothing is in
+   *  flight. Called by `ensureSubscribed` and by `bootstrap()` on
+   *  (re)connect so already-wanted stores reattach automatically. */
+  kickIfReady(): void {
+    if (this.running || !this.desired) return;
+    const client = getCqClient();
+    if (!client) return;
+    this.running = true;
+    void this.drive(client);
+  }
+
+  private async drive(client: Client): Promise<void> {
+    try {
+      this.setStatus('snapshotting');
+      const sub = await client.sowAndSubscribe(this.topic);
+      void sub.whenSnapshotComplete().then(() => {
+        this.flushNow();
+        this.markLive();
+        this.setStatus('live');
+      });
+      for await (const delta of sub) {
+        this.applyDelta(delta);
+      }
+      this.setStatus('disconnected');
+    } catch (err) {
+      console.error(`[cq-store] subscription ${this.topic} failed`, err);
+      this.setStatus('disconnected');
+    } finally {
+      this.running = false;
+    }
+  }
+
   subscribe = (cb: () => void): (() => void) => {
+    this.ensureSubscribed();
     this.listeners.add(cb);
     return () => {
       this.listeners.delete(cb);
@@ -84,6 +130,7 @@ class TopicStore {
   };
 
   subscribeStatus = (cb: () => void): (() => void) => {
+    this.ensureSubscribed();
     this.statusListeners.add(cb);
     return () => {
       this.statusListeners.delete(cb);
@@ -91,6 +138,7 @@ class TopicStore {
   };
 
   subscribeTicks = (cb: () => void): (() => void) => {
+    this.ensureSubscribed();
     this.tickListeners.add(cb);
     return () => {
       this.tickListeners.delete(cb);
@@ -98,6 +146,7 @@ class TopicStore {
   };
 
   subscribeDeltas = (cb: (row: Row) => void): (() => void) => {
+    this.ensureSubscribed();
     this.deltaListeners.add(cb);
     return () => {
       this.deltaListeners.delete(cb);
@@ -111,6 +160,7 @@ class TopicStore {
    * O(N) rowData diff that the React-prop path triggers.
    */
   subscribeBatchedDeltas = (cb: (b: DeltaBatch) => void): (() => void) => {
+    this.ensureSubscribed();
     this.batchListeners.add(cb);
     return () => {
       this.batchListeners.delete(cb);
@@ -302,13 +352,10 @@ async function bootstrap(): Promise<void> {
     }
   });
 
-  // Drive each topic in its own async loop. Each subscription consumes
-  // the SOW snapshot then transitions to live deltas — both arrive on
-  // the same async iterator because of the dispatch fix in @cqserver/client.
-  void driveSubscription(client, positionsStore);
-  void driveSubscription(client, tradesStore);
-  void driveSubscription(client, securitiesStore);
-  void driveSubscription(client, marketDataStore);
+  // Lazy subscriptions: only stores that some consumer has touched
+  // re-attach on (re)connect. A fresh load with nothing consumed leaves
+  // every topic dormant; tabs that never subscribe pay no SOW cost.
+  for (const s of ALL_STORES) s.kickIfReady();
 }
 
 function scheduleReconnect(): void {
@@ -322,33 +369,6 @@ function scheduleReconnect(): void {
     reconnectTimer = null;
     void bootstrap();
   }, delay);
-}
-
-async function driveSubscription(client: Client, store: TopicStore): Promise<void> {
-  try {
-    store.setStatus('snapshotting');
-    const sub = await client.sowAndSubscribe(store.topic);
-    void sub.whenSnapshotComplete().then(() => {
-      // Force a flush right at the snapshot boundary so the grid shows
-      // the full universe immediately, not on the next coalesce tick.
-      store.flushNow();
-      // Switch the store into live-phase BEFORE setStatus so any
-      // grids that subscribe on the 'live' transition see batched
-      // deltas from the very first post-SOW frame.
-      store.markLive();
-      store.setStatus('live');
-    });
-    for await (const delta of sub) {
-      store.applyDelta(delta);
-    }
-    // Iterator ended — either the subscription closed cleanly or the
-    // transport dropped. The client.onClose handler is responsible for
-    // the reconnect path; here we just reflect the per-topic state.
-    store.setStatus('disconnected');
-  } catch (err) {
-    console.error(`[cq-store] subscription ${store.topic} failed`, err);
-    store.setStatus('disconnected');
-  }
 }
 
 if (typeof window !== 'undefined') void bootstrap();
