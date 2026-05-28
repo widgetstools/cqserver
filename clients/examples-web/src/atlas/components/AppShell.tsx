@@ -15,7 +15,10 @@ interface AppShellProps {
 
 export function AppShell({ connection = 'ws://127.0.0.1:9008', hint, children }: AppShellProps) {
   return (
-    <div className="atlas-root atlas-app" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+    <div
+      className="atlas-root atlas-app"
+      style={{ height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
+    >
       <header
         style={{
           position: 'relative',

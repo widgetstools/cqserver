@@ -62,7 +62,7 @@ export function DataTable<T extends Record<string, unknown>>({
           {status ? <div style={{ fontSize: 10, color: 'var(--atlas-fg-faint)' }}>{status}</div> : null}
         </div>
       )}
-      <div style={{ flex: 1, minHeight: 280 }}>
+      <div style={{ flex: 1, minHeight: 280, width: '100%', height: '100%' }}>
         <AgGridReact<T>
           theme={theme}
           rowData={rows}
