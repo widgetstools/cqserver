@@ -5,6 +5,7 @@ import { Footer } from '../components/Footer';
 import { PulseChapter } from '../chapters/PulseChapter';
 import { TapeChapter } from '../chapters/TapeChapter';
 import { LensChapter } from '../chapters/LensChapter';
+import { HeatChapter } from '../chapters/HeatChapter';
 import type { ChapterId } from '../types';
 
 /** Stub for any chapter that hasn't been migrated yet (Phase 3 = Pulse only). */
@@ -36,6 +37,7 @@ export function AtlasPreviewApp() {
         {active === 'pulse' ? <PulseChapter />
           : active === 'tape' ? <TapeChapter />
           : active === 'lens' ? <LensChapter />
+          : active === 'heat' ? <HeatChapter />
           : <ComingSoon id={active} />}
       </main>
       <Footer />
