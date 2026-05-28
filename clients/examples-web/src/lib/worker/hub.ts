@@ -12,7 +12,9 @@
  * only when the count hits zero.
  */
 import { Client, Subscription } from '@cqserver/client';
-import type { ClientMsg, ServerMsg } from './protocol';
+import type { Delta } from '@cqserver/client';
+import type { ClientMsg, ServerMsg, Row } from './protocol';
+import { SOW_CHUNK_ROWS } from './protocol';
 
 const DEFAULT_WS_URL = 'ws://127.0.0.1:9008/cq/json';
 const RECONNECT_BASE_MS = 500;
@@ -41,6 +43,10 @@ interface SharedSub {
   sub: Subscription | null;
   /** Set after `whenSnapshotComplete()`. */
   isLive: boolean;
+  /** Worker-side row mirror for SOW replay on late join + Task 6 resub. */
+  rows: Map<string, Row>;
+  /** Per-port SOW progress so a port that joined late gets its own chunked replay. */
+  newcomers: { portId: string; portSubId: string }[];
 }
 
 class Hub {
@@ -59,6 +65,18 @@ class Hub {
     port.addEventListener('message', (e) => this.onClientMsg(state, e.data));
     if (this.client) port.postMessage({ kind: 'connected' });
     void this.ensureClient();
+  }
+
+  private rowKey(row: Row): string {
+    // Best-effort key: prefer common id columns, then composite. The
+    // main thread also derives keys when applying deltas, but the
+    // worker only uses this for its own row mirror (replay on
+    // resubscribe). It does NOT need to match the chapter's getRowId.
+    if (typeof row.position_id === 'string') return row.position_id;
+    if (typeof row.trade_id === 'string') return row.trade_id;
+    if (typeof row.cusip === 'string') return String(row.cusip);
+    // Fallback: stringify a stable subset.
+    return JSON.stringify(row);
   }
 
   private broadcast(msg: ServerMsg): void {
@@ -116,6 +134,8 @@ class Hub {
         refs: new Set(),
         sub: null,
         isLive: false,
+        rows: new Map(),
+        newcomers: [],
       };
       this.subs.set(key, shared);
     }
@@ -126,8 +146,8 @@ class Hub {
       // Only the FIRST refer opens the upstream subscription.
       if (!shared.sub) await this.openShared(shared, client);
       else if (shared.isLive) {
-        // Already live — Task 4 will replay the SOW for this newcomer.
-        // For Task 3 we just promote it; replay lands in Task 4.
+        // Replay the worker's mirrored rows so the newcomer paints in.
+        this.sendSowChunked({ portId: state.id, portSubId: msg.subId }, Array.from(shared.rows.values()));
         this.send(state.id, { kind: 'status', subId: msg.subId, status: 'live' });
       }
     } catch (err) {
@@ -145,24 +165,32 @@ class Hub {
       sql: shared.sql,
     });
     shared.sub = sub;
+    const sowBuffer: Row[] = [];
+    let sowDone = false;
     void sub.whenSnapshotComplete().then(() => {
+      sowDone = true;
+      this.flushSowChunks(shared, sowBuffer);
+      sowBuffer.length = 0;
       shared.isLive = true;
       for (const ref of shared.refs) {
-        this.send(ref.portId, {
-          kind: 'status',
-          subId: ref.portSubId,
-          status: 'live',
-        });
+        this.send(ref.portId, { kind: 'status', subId: ref.portSubId, status: 'live' });
       }
     });
-    // Drain deltas. Task 4 chunks the SOW; Task 5 coalesces live deltas.
-    // For Task 3 we just keep the loop alive so the SDK doesn't leak the sub.
     void (async () => {
       try {
-        for await (const _delta of sub) {
-          // intentionally empty in Task 3 — Tasks 4-5 install the
-          // actual delta routing.
-          void _delta;
+        for await (const d of sub) {
+          const row = d.data as Row;
+          const key = this.rowKey(row);
+          if (d.deltaType === 'remove' || d.deltaType === 'oof') {
+            shared.rows.delete(key);
+          } else {
+            shared.rows.set(key, row);
+          }
+          if (!sowDone) {
+            if (d.deltaType !== 'remove' && d.deltaType !== 'oof') sowBuffer.push(row);
+          } else {
+            this.enqueueDelta(shared, d.deltaType, row);
+          }
         }
       } catch (err) {
         for (const ref of shared.refs) {
@@ -174,6 +202,50 @@ class Hub {
         }
       }
     })();
+  }
+
+  /** Stream the in-memory row mirror out to every ref'd port in chunks. */
+  private flushSowChunks(shared: SharedSub, override?: Row[]): void {
+    const source = override ?? Array.from(shared.rows.values());
+    for (const ref of shared.refs) {
+      this.sendSowChunked(ref, source);
+    }
+  }
+
+  private sendSowChunked(
+    ref: { portId: string; portSubId: string },
+    rows: Row[],
+  ): void {
+    // Empty SOW still needs the terminating `more:false` so the main
+    // thread can flip to live without an awkward "did the snapshot
+    // ever land?" timeout.
+    if (rows.length === 0) {
+      this.send(ref.portId, {
+        kind: 'snapshot',
+        subId: ref.portSubId,
+        chunk: [],
+        more: false,
+      });
+      return;
+    }
+    for (let i = 0; i < rows.length; i += SOW_CHUNK_ROWS) {
+      const slice = rows.slice(i, i + SOW_CHUNK_ROWS);
+      const more = i + SOW_CHUNK_ROWS < rows.length;
+      this.send(ref.portId, {
+        kind: 'snapshot',
+        subId: ref.portSubId,
+        chunk: slice,
+        more,
+      });
+    }
+  }
+
+  /** Stub for Task 5. Task 4 only needs the function to exist so
+   *  `openShared`'s post-SOW branch compiles. */
+  private enqueueDelta(_shared: SharedSub, _kind: Delta['deltaType'], _row: Row): void {
+    void _shared;
+    void _kind;
+    void _row;
   }
 
   // ─── Unsubscribe path ────────────────────────────────────────
