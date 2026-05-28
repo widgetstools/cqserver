@@ -1,0 +1,110 @@
+/**
+ * Pulse — Chapter 01, Live Book. The first Atlas chapter on real
+ * cqserver data. Pattern:
+ *   - 4 view subscriptions seed KPIs + chip option lists
+ *   - 1 filtered subscription on /positions drives the data table
+ *   - `useChapterScope` owns the chip state and composes the WHERE
+ *     expression every chip toggle re-emits
+ */
+import { useMemo } from 'react';
+import { ChapterHead, HeroMetric } from '../components/ChapterHead';
+import { FilterRail } from '../components/FilterRail';
+import { KpiStrip, type Kpi } from '../components/KpiStrip';
+import { DataTable } from '../components/DataTable';
+import { useChapterScope, distinctValues } from '../hooks/useChapterScope';
+import { useSubscription, type Row } from '@/lib/use-subscription';
+import {
+  PULSE_CHIPS,
+  PULSE_KPIS,
+  PULSE_COL_DEFS,
+  fmtSignedMillions,
+  fmtMillions,
+  fmtCount,
+} from '../scopes/pulse';
+
+const positionRowId = (r: Row): string => String(r.position_id ?? '');
+
+export function PulseChapter() {
+  const scope = useChapterScope(PULSE_CHIPS);
+
+  // View subscriptions — small row counts, used to derive chip options
+  // and the aggregate KPI row.
+  const bookSub = useSubscription('/v_pnl_by_book', null);
+  const sectorSub = useSubscription('/v_pnl_by_sector', null);
+  const complianceSub = useSubscription('/v_compliance_counts', null);
+  const totalsSub = useSubscription('/v_book_totals', null);
+
+  // Primary subscription — /positions filtered server-side by the chip selection.
+  const positionsSub = useSubscription('/positions', scope.filterExpression, positionRowId);
+
+  // Derive chip option lists from the view snapshots.
+  const chipOptions = useMemo(
+    () => ({
+      BOOK: ['All', ...distinctValues(bookSub.rows, 'book_name')],
+      SECTOR: ['All', ...distinctValues(sectorSub.rows, 'issuer_sector')],
+      COMPLIANCE: ['All', ...distinctValues(complianceSub.rows, 'compliance_status')],
+    }),
+    [bookSub.rows, sectorSub.rows, complianceSub.rows],
+  );
+
+  // Derive KPI values from the aggregate row + breach count.
+  const kpis = useMemo<Kpi[]>(() => {
+    const t = (totalsSub.rows[0] ?? {}) as Record<string, unknown>;
+    const breachRow = complianceSub.rows.find((r) => r.compliance_status === 'BREACH');
+    const breaches = breachRow ? Number(breachRow.n_positions) : 0;
+    return PULSE_KPIS.map((def): Kpi => {
+      const raw =
+        def.source === '__breaches__' ? breaches : Number(t[def.source] ?? 0);
+      const value =
+        def.format === 'currency-m'
+          ? fmtMillions(raw)
+          : def.format === 'currency-m-signed'
+            ? fmtSignedMillions(raw)
+            : fmtCount(raw);
+      return {
+        label: def.label,
+        value,
+        caption: def.caption,
+        emphasis: def.emphasis,
+      };
+    });
+  }, [totalsSub.rows, complianceSub.rows]);
+
+  // Hero metric — unrealized PnL with the live tick count from the
+  // positions sub (poor man's stand-in until Phase 6's chapter scope).
+  const heroValue = useMemo(() => {
+    const t = (totalsSub.rows[0] ?? {}) as Record<string, unknown>;
+    return fmtSignedMillions(Number(t.unrealized_pnl ?? 0));
+  }, [totalsSub.rows]);
+
+  const status =
+    positionsSub.status === 'live'
+      ? `${positionsSub.size.toLocaleString()} rows · live`
+      : `${positionsSub.status}…`;
+
+  return (
+    <>
+      <ChapterHead
+        kicker="CHAPTER 01 — LIVE BOOK"
+        title="pulse."
+        sub="A continuous read of the firm's book — KPIs, sector ladder, book contribution, breaches. Every figure server-computed by a materialized view; nothing aggregated in the browser."
+        hero={<HeroMetric label="UNREALISED PnL" value={heroValue} detail="from /v_book_totals" />}
+      />
+      <FilterRail
+        chips={[...PULSE_CHIPS]}
+        state={scope.state}
+        options={chipOptions}
+        onChange={scope.setState}
+        subscriptionSummary={scope.summary}
+      />
+      <KpiStrip kpis={kpis} />
+      <DataTable<Row>
+        title={`POSITIONS · 8 of 206 cols`}
+        status={status}
+        colDefs={PULSE_COL_DEFS}
+        getRowId={positionRowId}
+        liveSubscription={positionsSub}
+      />
+    </>
+  );
+}
