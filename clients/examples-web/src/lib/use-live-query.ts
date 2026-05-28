@@ -12,6 +12,20 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import { makeSqlSub, type Sub, type SubscriptionHandle, type Row } from './use-subscription';
 import type { ConnectionStatus } from './worker/protocol';
 
+/**
+ * Stable identities for the fallback `useSyncExternalStore` slots used
+ * while `wrap === null`. The subscribe/getSnapshot/getServerSnapshot
+ * args must NOT change identity between renders — passing a fresh
+ * inline function each render makes `useSyncExternalStore` re-subscribe
+ * every commit, and the fresh empty `[]` snapshot trips React's
+ * Object.is change detection on every read, looping forever.
+ */
+const NOOP_SUB = (): (() => void) => () => {};
+const EMPTY_ROWS: Row[] = [];
+const EMPTY_SNAPSHOT = (): Row[] => EMPTY_ROWS;
+const IDLE_STATUS = (): ConnectionStatus => 'connecting';
+const NULL_ERROR = (): string | null => null;
+
 export interface LiveQuerySpec {
   topic: string;
   sql: string;
@@ -87,23 +101,20 @@ export function useLiveQuery(spec: LiveQuerySpec | null): LiveQueryHandle | null
     };
   }, [wrap]);
 
-  const noop = (): (() => void) => () => {};
-  const idleStatus = (): ConnectionStatus => 'connecting';
-  const empty = (): Row[] => [];
   const rows = useSyncExternalStore(
-    wrap ? wrap.sub.subscribe : noop,
-    wrap ? wrap.sub.getSnapshot : empty,
-    empty,
+    wrap ? wrap.sub.subscribe : NOOP_SUB,
+    wrap ? wrap.sub.getSnapshot : EMPTY_SNAPSHOT,
+    EMPTY_SNAPSHOT,
   );
   const status = useSyncExternalStore(
-    wrap ? wrap.sub.subscribeStatus : noop,
-    wrap ? wrap.sub.getStatus : idleStatus,
-    idleStatus,
+    wrap ? wrap.sub.subscribeStatus : NOOP_SUB,
+    wrap ? wrap.sub.getStatus : IDLE_STATUS,
+    IDLE_STATUS,
   );
   const error = useSyncExternalStore(
-    wrap ? wrap.subscribeError : noop,
-    wrap ? wrap.getError : () => null,
-    () => null,
+    wrap ? wrap.subscribeError : NOOP_SUB,
+    wrap ? wrap.getError : NULL_ERROR,
+    NULL_ERROR,
   );
 
   return useMemo<LiveQueryHandle | null>(() => {
