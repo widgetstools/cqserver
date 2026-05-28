@@ -80,6 +80,56 @@ fn wait_for<F: FnMut() -> bool>(mut f: F) {
     panic!("wait_for: predicate never held within budget");
 }
 
+fn view_totals(vtopic: &Topic) -> std::collections::HashMap<String, (i64, i64)> {
+    vtopic
+        .query("SELECT desk, total, n FROM t")
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter_map(|r| {
+            let d = r.get("desk").and_then(Value::as_str)?.to_string();
+            let t = r.get("total").and_then(Value::as_i64)?;
+            let n = r.get("n").and_then(Value::as_i64)?;
+            Some((d, (t, n)))
+        })
+        .collect()
+}
+
+#[test]
+fn debounce_coalesces_a_burst_into_few_refreshes() {
+    let src = make_source();
+    let (view, vtopic) = build_view(
+        src.clone(),
+        "SELECT desk, SUM(qty) AS total, COUNT(*) AS n FROM t GROUP BY desk",
+        "/trades_by_desk_burst",
+    );
+    let baseline = view.refresh_count(); // initial population pass
+
+    // Tight, continuous burst — no inter-row gap (microseconds each),
+    // so it all lands well inside one QUIET_WINDOW.
+    const N: i64 = 500;
+    for i in 0..N {
+        let desk = if i % 2 == 0 { "RATES" } else { "FX" };
+        publish(&src, &format!("t{i}"), desk, i);
+    }
+
+    let expect_rates: i64 = (0..N).filter(|i| i % 2 == 0).sum();
+    let expect_fx: i64 = (0..N).filter(|i| i % 2 == 1).sum();
+    wait_for(|| {
+        let m = view_totals(&vtopic);
+        m.get("RATES").copied() == Some((expect_rates, N / 2))
+            && m.get("FX").copied() == Some((expect_fx, N / 2))
+    });
+
+    // The debounce must collapse the 500-row burst into a handful of
+    // refreshes — emphatically NOT one per row.
+    let refreshes = view.refresh_count() - baseline;
+    assert!(
+        refreshes <= 10,
+        "expected burst to coalesce into <=10 refreshes, got {refreshes}"
+    );
+}
+
 #[test]
 fn view_initial_population_matches_source_aggregate() {
     let src = make_source();

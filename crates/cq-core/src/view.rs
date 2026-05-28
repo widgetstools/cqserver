@@ -37,11 +37,21 @@
 //! follow-up optimization that mirrors the S19 follow-up.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use parking_lot::Mutex;
+
+/// Idle gap with no new tap events that triggers a view refresh. During
+/// a continuous bulk seed events never pause until the end, so the
+/// runner refreshes ~once after the burst instead of per insert.
+const QUIET_WINDOW: Duration = Duration::from_millis(75);
+/// Upper bound on how stale a view may get under *unbroken* load: at
+/// most one full refresh per this interval per view.
+const MAX_REFRESH_DELAY: Duration = Duration::from_secs(1);
 
 use crate::query::{
     combined_join_schema, parse_query, peek_join, AggFn, ParsedQuery, QueryError,
@@ -68,6 +78,9 @@ pub struct View {
     /// "row identity in the view SOW" with "group identity in the source".
     pub view_key_names: Vec<String>,
     state: Mutex<ViewState>,
+    /// Count of completed refreshes. Observability + lets tests assert
+    /// the debounce coalesced a burst into few refreshes.
+    refresh_count: AtomicU64,
 }
 
 #[derive(Default)]
@@ -257,6 +270,7 @@ impl View {
             group_by_names,
             view_key_names,
             state: Mutex::new(ViewState::default()),
+            refresh_count: AtomicU64::new(0),
         });
         view.refresh()?;
         Ok(view)
@@ -317,7 +331,14 @@ impl View {
             "view" => self.view_topic.name().to_string()
         )
         .increment(1);
+        self.refresh_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Number of completed refreshes since construction (includes the
+    /// initial population in `View::new`).
+    pub fn refresh_count(&self) -> u64 {
+        self.refresh_count.load(Ordering::Relaxed)
     }
 
     /// Compose the view's primary-key string from a row map, using the
@@ -360,9 +381,31 @@ pub fn spawn_view_runner(view: Arc<View>, tap_rx: Receiver<MutationEvent>) -> Jo
         .name(format!("view:{}", view_name))
         .spawn(move || {
             tracing::info!(view = %view_name, "View runner started");
-            while let Ok(_event) = tap_rx.recv() {
-                // Drain any other queued events before the refresh.
-                while tap_rx.try_recv().is_ok() {}
+            // Debounce: block for the first event, then absorb the
+            // burst, refreshing once after QUIET_WINDOW of silence or
+            // MAX_REFRESH_DELAY since the first event — whichever comes
+            // first. `refresh()` re-reads current source state, so one
+            // pass after a burst is equivalent to one per event, but
+            // without re-scanning a growing source under the writer's
+            // lock (which is what collapses bulk-seed throughput).
+            'outer: loop {
+                // Block until the first event of a new burst (or exit
+                // when the source's tap senders are all dropped).
+                if tap_rx.recv().is_err() {
+                    break;
+                }
+                let deadline = Instant::now() + MAX_REFRESH_DELAY;
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break; // hit the staleness cap under unbroken load
+                    }
+                    match tap_rx.recv_timeout(QUIET_WINDOW.min(remaining)) {
+                        Ok(_) => continue,                       // burst ongoing; keep absorbing
+                        Err(RecvTimeoutError::Timeout) => break, // quiet (or capped) → refresh
+                        Err(RecvTimeoutError::Disconnected) => break 'outer,
+                    }
+                }
                 if let Err(e) = view.refresh() {
                     tracing::warn!(view = %view_name, error = %e, "View refresh failed");
                 }
