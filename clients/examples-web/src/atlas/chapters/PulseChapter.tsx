@@ -39,16 +39,25 @@ import {
 } from '../scopes/pulse';
 
 const positionRowId = (r: Row): string => String(r.position_id ?? '');
+// Aggregate-view rowId extractors. Without these, Sub's fallback would
+// JSON.stringify each row — including the live PnL value — so every
+// tick mints a fresh key, the old row stays in the Map, and React
+// renders the same book/sector twice.
+const bookRowId = (r: Row): string => String(r.book_name ?? '');
+const sectorRowId = (r: Row): string => String(r.issuer_sector ?? '');
+const complianceRowId = (r: Row): string => String(r.compliance_status ?? '');
+// Single-row degenerate aggregate — pin to a constant key.
+const totalsRowId = (_r: Row): string => 'totals';
 
 export function PulseChapter() {
   const scope = useChapterScope(PULSE_CHIPS);
 
   // View subscriptions — small row counts, used to derive chip options,
   // the aggregate KPI row, and the two visualisation columns.
-  const bookSub = useSubscription('/v_pnl_by_book', null);
-  const sectorSub = useSubscription('/v_pnl_by_sector', null);
-  const complianceSub = useSubscription('/v_compliance_counts', null);
-  const totalsSub = useSubscription('/v_book_totals', null);
+  const bookSub = useSubscription('/v_pnl_by_book', null, bookRowId);
+  const sectorSub = useSubscription('/v_pnl_by_sector', null, sectorRowId);
+  const complianceSub = useSubscription('/v_compliance_counts', null, complianceRowId);
+  const totalsSub = useSubscription('/v_book_totals', null, totalsRowId);
 
   // Primary subscription — /positions filtered server-side by the chip selection.
   const positionsSub = useSubscription('/positions', scope.filterExpression, positionRowId);

@@ -13,7 +13,7 @@ const exposureRowId = (r: Row): string =>
 export function ViewChapter() {
   const scope = useChapterScope(VIEW_CHIPS);
   // Unfiltered view sub: source for chip options.
-  const allSub = useSubscription('/v_net_exposure', null);
+  const allSub = useSubscription('/v_net_exposure', null, exposureRowId);
   // Filtered view sub: drives the table.
   const filteredSub = useSubscription('/v_net_exposure', scope.filterExpression, exposureRowId);
 

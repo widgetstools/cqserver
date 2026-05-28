@@ -30,7 +30,7 @@ const slipRowId = (r: Row): string =>
 
 export function SlipChapter() {
   const scope = useChapterScope(SLIP_CHIPS);
-  const allSub = useSubscription('/v_slippage_venue_algo', null);
+  const allSub = useSubscription('/v_slippage_venue_algo', null, slipRowId);
   const slipSub = useSubscription('/v_slippage_venue_algo', scope.filterExpression, slipRowId);
 
   const chipOptions = useMemo(
