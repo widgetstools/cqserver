@@ -262,3 +262,36 @@ export function makeSqlSub(topic: string, sql: string, rowIdKey?: (r: Row) => st
   return new Sub(topic, null, sql, rowIdKey);
 }
 export type { Sub };
+
+/**
+ * One-shot SQL fetch over the worker port. Resolves with the rows
+ * once the SOW completes; rejects on error. The temporary
+ * subscription is closed automatically before the promise resolves
+ * — no live deltas are streamed.
+ *
+ * Used by ex08-query-builder's "Run (static)" button, which mirrors
+ * the legacy `Client.sow(topic, { sql })` semantics.
+ */
+export function runOneShotSql(topic: string, sql: string): Promise<Row[]> {
+  return new Promise((resolve, reject) => {
+    const collected: Row[] = [];
+    const sub = makeSqlSub(topic, sql, () => `r${collected.length}`);
+    const offChunks = sub.subscribeSnapshotChunks((chunk, more) => {
+      for (const r of chunk) collected.push(r);
+      if (!more) {
+        offChunks();
+        offStatus();
+        sub.close();
+        resolve(collected);
+      }
+    });
+    const offStatus = sub.subscribeStatus(() => {
+      if (sub.getStatus() === 'error') {
+        offChunks();
+        offStatus();
+        sub.close();
+        reject(new Error('one-shot query failed'));
+      }
+    });
+  });
+}

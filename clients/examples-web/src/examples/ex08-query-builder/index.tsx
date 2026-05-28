@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils';
 import type { ColDef } from 'ag-grid-community';
 import { fmtCcy, fmtSigned, fmtBps } from '@/lib/format';
 import { useLiveQuery, type LiveQuerySpec } from '@/lib/use-live-query';
-import { getCqClient, type Row } from '@/lib/cq-store';
+import { runOneShotSql, type Row } from '@/lib/use-subscription';
 import { CatalogPanel } from './CatalogPanel';
 
 const FEATURE_LABEL: Record<QueryFeature, string> = {
@@ -317,9 +317,7 @@ export function QueryBuilderCanvas() {
     setRunningStatic(true);
     const start = performance.now();
     try {
-      const client = getCqClient();
-      if (!client) throw new Error('cqserver client not connected');
-      const rows = (await client.sow(topic, { sql })) as Row[];
+      const rows = await runOneShotSql(topic, sql);
       setRun({
         mode: 'static',
         rows,

@@ -7,10 +7,6 @@ import { EXAMPLES, exampleById } from '@/examples/registry';
 import type { ExampleId } from '@/examples/shared';
 import { ExampleCanvas } from '@/examples/ExampleCanvas';
 import { FEATURE_META, orderFeatures } from '@/lib/features';
-// Side-effect import: opens the cqserver WebSocket and starts streaming
-// positions / trades / securities / fi-market-data into the live store
-// before any example needs them.
-import '@/lib/cq-store';
 import { AtlasPreviewApp } from '@/atlas/preview/AtlasPreviewApp';
 
 /**
