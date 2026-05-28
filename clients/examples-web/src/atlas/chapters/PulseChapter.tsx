@@ -1,16 +1,32 @@
 /**
  * Pulse — Chapter 01, Live Book. The first Atlas chapter on real
  * cqserver data. Pattern:
- *   - 4 view subscriptions seed KPIs + chip option lists
+ *   - 4 view subscriptions seed KPIs + chip option lists + the two
+ *     left-column visualisations (sector ladder, book bars)
  *   - 1 filtered subscription on /positions drives the data table
  *   - `useChapterScope` owns the chip state and composes the WHERE
  *     expression every chip toggle re-emits
+ *
+ * Layout:
+ *   ┌────────────────────────────────────────────────┐
+ *   │ ChapterHead                                    │
+ *   ├────────────────────────────────────────────────┤
+ *   │ FilterRail                                     │
+ *   ├────────────────────────────────────────────────┤
+ *   │ KpiStrip (6 cards)                             │
+ *   ├──────────────────────┬─────────────────────────┤
+ *   │ Sector PnL ladder    │                         │
+ *   │ ───────              │  Positions grid         │
+ *   │ Book contribution    │                         │
+ *   └──────────────────────┴─────────────────────────┘
  */
 import { useMemo } from 'react';
 import { ChapterHead, HeroMetric } from '../components/ChapterHead';
 import { FilterRail } from '../components/FilterRail';
 import { KpiStrip, type Kpi } from '../components/KpiStrip';
 import { DataTable } from '../components/DataTable';
+import { SectorLadder } from '../components/SectorLadder';
+import { BookBars } from '../components/BookBars';
 import { useChapterScope, distinctValues } from '../hooks/useChapterScope';
 import { useSubscription, type Row } from '@/lib/use-subscription';
 import {
@@ -27,8 +43,8 @@ const positionRowId = (r: Row): string => String(r.position_id ?? '');
 export function PulseChapter() {
   const scope = useChapterScope(PULSE_CHIPS);
 
-  // View subscriptions — small row counts, used to derive chip options
-  // and the aggregate KPI row.
+  // View subscriptions — small row counts, used to derive chip options,
+  // the aggregate KPI row, and the two visualisation columns.
   const bookSub = useSubscription('/v_pnl_by_book', null);
   const sectorSub = useSubscription('/v_pnl_by_sector', null);
   const complianceSub = useSubscription('/v_compliance_counts', null);
@@ -70,8 +86,6 @@ export function PulseChapter() {
     });
   }, [totalsSub.rows, complianceSub.rows]);
 
-  // Hero metric — unrealized PnL with the live tick count from the
-  // positions sub (poor man's stand-in until Phase 6's chapter scope).
   const heroValue = useMemo(() => {
     const t = (totalsSub.rows[0] ?? {}) as Record<string, unknown>;
     return fmtSignedMillions(Number(t.unrealized_pnl ?? 0));
@@ -98,13 +112,59 @@ export function PulseChapter() {
         subscriptionSummary={scope.summary}
       />
       <KpiStrip kpis={kpis} />
-      <DataTable<Row>
-        title={`POSITIONS · 8 of 206 cols`}
-        status={status}
-        colDefs={PULSE_COL_DEFS}
-        getRowId={positionRowId}
-        liveSubscription={positionsSub}
-      />
+      <div
+        style={{
+          position: 'relative',
+          zIndex: 1,
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'row',
+          minHeight: 0,
+        }}
+      >
+        <div
+          style={{
+            width: '38%',
+            minWidth: 340,
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+            borderRight: '1px solid var(--atlas-rule)',
+          }}
+        >
+          <SectorLadder
+            title="SECTOR PnL · day_pnl"
+            rows={sectorSub.rows}
+            labelKey="issuer_sector"
+            valueKey="day_pnl"
+            limit={14}
+            format={fmtSignedMillions}
+          />
+          <BookBars
+            title="BOOK CONTRIBUTION · unrealized_pnl"
+            rows={bookSub.rows}
+            labelKey="book_name"
+            valueKey="unrealized_pnl"
+            format={fmtSignedMillions}
+          />
+        </div>
+        <div
+          style={{
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+          }}
+        >
+          <DataTable<Row>
+            title="POSITIONS · 8 of 206 cols"
+            status={status}
+            colDefs={PULSE_COL_DEFS}
+            getRowId={positionRowId}
+            liveSubscription={positionsSub}
+          />
+        </div>
+      </div>
     </>
   );
 }
