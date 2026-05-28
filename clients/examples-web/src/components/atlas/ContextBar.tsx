@@ -1,7 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
 import type { ExampleEntry } from '@/examples/registry';
 import { FEATURE_META, headlineFeature, orderFeatures } from '@/lib/features';
-import { cqStore, useTickCount } from '@/lib/cq-store';
 
 interface ContextBarProps {
   example: ExampleEntry;
@@ -22,24 +20,16 @@ interface ContextBarProps {
  *     letter glyph sits in a circle on the left.
  *
  *   RIGHT (telemetry)
- *     Live pulse + tick-rate readout (deltas/sec, ticks total). Hooked
- *     directly into the cq-store so the header acts as a system meter
- *     for whichever topic is most central to the visible example.
- *     Trailing path chip: `/heatmap`.
+ *     Live pulse + path chip. In Phase 2 the throughput / rows / ticks
+ *     readouts are stubbed to "—" because the global cq-store mirror is
+ *     gone; Phase 3 wires per-subscription stats through the chapter
+ *     scope.
  */
 export function ContextBar({ example }: ContextBarProps) {
   const features = orderFeatures(example.features);
   const headline = headlineFeature(example.features);
   const headlineMeta = FEATURE_META[headline];
   const isLive = example.features.includes('stream');
-
-  // Pick the topic this example leans on hardest so the throughput
-  // readout reflects what's actually visible. Trade-centric examples
-  // surface trade deltas; everything else uses positions.
-  const tradeCentric = example.id === 'trade-blotter' || example.id === 'slippage-agg';
-  const topic = tradeCentric ? 'trades' : 'positions';
-  const ticks = useTickCount(topic);
-  const rate = useTickRate(topic, ticks);
 
   return (
     <div className="atlas-context">
@@ -73,20 +63,16 @@ export function ContextBar({ example }: ContextBarProps) {
           <div className="atlas-context-stats">
             <div className="atlas-context-stat">
               <span className="atlas-context-stat-value atlas-context-stat-value--accent tabular-nums">
-                {Math.round(rate).toLocaleString()}
+                —
               </span>
-              <span className="atlas-context-stat-label">{topic}/sec</span>
+              <span className="atlas-context-stat-label">rows/sec</span>
             </div>
             <div className="atlas-context-stat">
-              <span className="atlas-context-stat-value tabular-nums">
-                {ticks.toLocaleString()}
-              </span>
+              <span className="atlas-context-stat-value tabular-nums">—</span>
               <span className="atlas-context-stat-label">ticks</span>
             </div>
             <div className="atlas-context-stat">
-              <span className="atlas-context-stat-value tabular-nums">
-                {cqStore[topic].getSize().toLocaleString()}
-              </span>
+              <span className="atlas-context-stat-value tabular-nums">—</span>
               <span className="atlas-context-stat-label">rows</span>
             </div>
           </div>
@@ -96,29 +82,4 @@ export function ContextBar({ example }: ContextBarProps) {
       </div>
     </div>
   );
-}
-
-/**
- * Sample tick counts every second to derive a deltas/sec rate. We hold
- * the previous reading + timestamp in a ref so React renders don't
- * reset the smoothing window. The hook still re-runs on every parent
- * render driven by `useTickCount`, but the rate maths is cheap and the
- * UI only re-renders the chrome strip — not the grid — so it's free.
- */
-function useTickRate(topic: 'positions' | 'trades', ticks: number): number {
-  const last = useRef({ t: Date.now(), ticks });
-  const [rate, setRate] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => {
-      const now = Date.now();
-      const dt = (now - last.current.t) / 1000;
-      if (dt <= 0) return;
-      const observed = cqStore[topic].getTickCount();
-      const dn = observed - last.current.ticks;
-      setRate(dn / dt);
-      last.current = { t: now, ticks: observed };
-    }, 1000);
-    return () => clearInterval(id);
-  }, [topic]);
-  return rate;
 }
