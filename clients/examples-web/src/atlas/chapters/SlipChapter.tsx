@@ -1,8 +1,26 @@
+/**
+ * Slip — Chapter 07. Execution-quality dashboard built on
+ * /v_slippage_venue_algo (server-aggregated venue × algo buckets).
+ *
+ * Layout:
+ *   ┌─────────────────────────────────────────────────────────────┐
+ *   │ ChapterHead                                                 │
+ *   ├─────────────────────────────────────────────────────────────┤
+ *   │ FilterRail (VENUE + ALGO)                                   │
+ *   ├─────────────────────────────────────────────────────────────┤
+ *   │ KpiStrip                                                    │
+ *   ├──────────────────────────────────┬──────────────────────────┤
+ *   │ Slippage grid (all bps cols)     │ SlippageBars             │
+ *   │                                  │  (ranked by |slip|;      │
+ *   │                                  │   red right, amber left) │
+ *   └──────────────────────────────────┴──────────────────────────┘
+ */
 import { useMemo } from 'react';
 import { ChapterHead, HeroMetric } from '../components/ChapterHead';
 import { FilterRail } from '../components/FilterRail';
 import { KpiStrip, type Kpi } from '../components/KpiStrip';
 import { DataTable } from '../components/DataTable';
+import { SlippageBars } from '../components/SlippageBars';
 import { useChapterScope, distinctValues } from '../hooks/useChapterScope';
 import { useSubscription, type Row } from '@/lib/use-subscription';
 import { SLIP_CHIPS, SLIP_COL_DEFS, fmtMillions, fmtBps, fmtCount } from '../scopes/slip';
@@ -59,7 +77,7 @@ export function SlipChapter() {
       <ChapterHead
         kicker="CHAPTER 07 — SLIP"
         title="slip."
-        sub="/v_slippage_venue_algo — execution-quality stats grouped by venue × algo, server-aggregated. Every row updates whenever its bucket sees a new fill."
+        sub="/v_slippage_venue_algo — execution-quality stats grouped by venue × algo, server-aggregated. Every row updates whenever its bucket sees a new fill. The right panel ranks buckets by absolute slippage: red bars mean we paid more than arrival, amber bars mean a favourable execution."
         hero={<HeroMetric label="WORST SLIP" value={fmtBps(totals.worst)} detail="arrival · current scope" />}
       />
       <FilterRail
@@ -70,13 +88,52 @@ export function SlipChapter() {
         subscriptionSummary={scope.summary}
       />
       <KpiStrip kpis={kpis} />
-      <DataTable<Row>
-        title={`SLIPPAGE · ${SLIP_COL_DEFS.length} cols`}
-        status={status}
-        colDefs={SLIP_COL_DEFS}
-        getRowId={slipRowId}
-        liveSubscription={slipSub}
-      />
+      <div
+        style={{
+          position: 'relative',
+          zIndex: 1,
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'row',
+          minHeight: 0,
+        }}
+      >
+        <div
+          style={{
+            flex: '0 0 60%',
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+            borderRight: '1px solid var(--atlas-rule)',
+          }}
+        >
+          <DataTable<Row>
+            title={`SLIPPAGE · ${SLIP_COL_DEFS.length} cols`}
+            status={status}
+            colDefs={SLIP_COL_DEFS}
+            getRowId={slipRowId}
+            liveSubscription={slipSub}
+          />
+        </div>
+        <div
+          style={{
+            flex: '1 1 40%',
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+          }}
+        >
+          <SlippageBars
+            title="SLIP RANK · |avg_slip_arr|"
+            rows={slipSub.rows}
+            venueKey="execution_venue"
+            algoKey="execution_algo"
+            slipKey="avg_slip_arr"
+            countKey="n_trades"
+            limit={20}
+          />
+        </div>
+      </div>
     </>
   );
 }
