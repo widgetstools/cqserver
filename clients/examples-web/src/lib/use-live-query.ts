@@ -49,7 +49,7 @@ class LiveQueryWrapper {
     // the message even after status transitions back.
     this.off = this.sub.subscribeStatus(() => {
       if (this.sub.getStatus() === 'error' && this.errMsg == null) {
-        this.errMsg = 'query failed';
+        this.errMsg = this.sub.getErrorMessage() ?? 'query failed';
         for (const cb of this.errListeners) cb();
       }
     });

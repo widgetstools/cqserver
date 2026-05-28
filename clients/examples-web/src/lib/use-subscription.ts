@@ -58,6 +58,7 @@ class Sub {
   private rows = new Map<string, Row>();
   private snap: Row[] = [];
   private status: ConnectionStatus = 'connecting';
+  private errMsg: string | null = null;
   private listeners = new Set<() => void>();
   private statusListeners = new Set<() => void>();
   private chunkListeners = new Set<(chunk: Row[], more: boolean) => void>();
@@ -114,15 +115,49 @@ class Sub {
         return;
       case 'delta':
         if (m.subId !== this.subId) return;
-        for (const r of m.add) this.rows.set(this.rowKey(r), r);
-        for (const r of m.update) this.rows.set(this.rowKey(r), r);
-        for (const r of m.remove) this.rows.delete(this.rowKey(r));
-        this.snap = Array.from(this.rows.values());
-        for (const cb of this.deltaListeners) cb({ add: m.add, update: m.update, remove: m.remove });
-        this.notifyRows();
+        // cqserver's `publish` messages don't always carry a `dt` field;
+        // when missing, the SDK defaults to deltaType='update' even for
+        // rows newly entering the filter. Reconcile against our local
+        // row mirror so AG-Grid never gets an update/remove for a key
+        // it hasn't seen, or an add for a key it already has.
+        {
+          const realAdds: Row[] = [];
+          const realUpdates: Row[] = [];
+          const realRemoves: Row[] = [];
+          for (const r of m.add) {
+            const key = this.rowKey(r);
+            const isNew = !this.rows.has(key);
+            this.rows.set(key, r);
+            (isNew ? realAdds : realUpdates).push(r);
+          }
+          for (const r of m.update) {
+            const key = this.rowKey(r);
+            const isNew = !this.rows.has(key);
+            this.rows.set(key, r);
+            (isNew ? realAdds : realUpdates).push(r);
+          }
+          for (const r of m.remove) {
+            const key = this.rowKey(r);
+            if (this.rows.has(key)) {
+              this.rows.delete(key);
+              realRemoves.push(r);
+            }
+            // else: server is removing a row we never saw — drop silently.
+          }
+          this.snap = Array.from(this.rows.values());
+          for (const cb of this.deltaListeners) {
+            cb({ add: realAdds, update: realUpdates, remove: realRemoves });
+          }
+          this.notifyRows();
+        }
         return;
       case 'error':
         if (m.subId && m.subId !== this.subId) return;
+        // Preserve the cqserver error string so the editor / status
+        // strip can show it. setStatus fires after errMsg is set so a
+        // status listener that reads getErrorMessage() sees the new
+        // value on the same notification.
+        this.errMsg = m.message;
         this.setStatus('error');
         return;
       case 'disconnected':
@@ -173,6 +208,7 @@ class Sub {
   getSnapshot = (): Row[] => this.snap;
   getStatus = (): ConnectionStatus => this.status;
   getSize = (): number => this.rows.size;
+  getErrorMessage = (): string | null => this.errMsg;
 
   close(): void {
     if (this.closed) return;
@@ -289,8 +325,9 @@ export function runOneShotSql(topic: string, sql: string): Promise<Row[]> {
       if (sub.getStatus() === 'error') {
         offChunks();
         offStatus();
+        const msg = sub.getErrorMessage() ?? 'one-shot query failed';
         sub.close();
-        reject(new Error('one-shot query failed'));
+        reject(new Error(msg));
       }
     });
   });
