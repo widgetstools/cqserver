@@ -22,12 +22,16 @@ import { AtlasPreviewApp } from '@/atlas/preview/AtlasPreviewApp';
  * a teal accent bar, feature dots, optional LIVE pulse.
  */
 export function App() {
-  // Phase 1 redesign preview — opt-in via #atlas hash. Existing app
-  // continues to render at every other URL.
+  // Phase 1 redesign preview — opt-in via #atlas hash. The legacy app
+  // continues to render at every other URL. Routing is decided outside
+  // any hook so the two branches never share a hook frame.
   if (typeof window !== 'undefined' && window.location.hash === '#atlas') {
     return <AtlasPreviewApp />;
   }
+  return <LegacyApp />;
+}
 
+function LegacyApp() {
   const [active, setActive] = useState<ExampleId>('live-pnl');
   const ex = exampleById(active);
 
