@@ -13,6 +13,7 @@ import { getAgGridTheme } from '@/lib/aggrid-theme';
 import { PanelChrome } from './PanelChrome';
 import { cqStore, useTickCount, type CqTopic, type DeltaBatch, type Row } from '@/lib/cq-store';
 import type { FilteredSubscription } from '@/lib/use-filtered-subscription';
+import type { SubscriptionHandle } from '@/lib/use-subscription';
 
 // Enterprise module unlocks the bottom status bar (`statusBar` prop +
 // `ag*Component` panels) and the row-range / aggregation widgets that
@@ -78,7 +79,7 @@ interface GridPanelProps<T> {
    * This is the right binding for any tab whose data shape matches
    * the underlying topic but is filtered/sliced server-side.
    */
-  liveSubscription?: FilteredSubscription;
+  liveSubscription?: FilteredSubscription | SubscriptionHandle;
 }
 
 /**
