@@ -20,6 +20,7 @@ import {
 import { AllEnterpriseModule } from 'ag-grid-enterprise';
 import { getAtlasGridTheme } from '../aggrid';
 import {
+  ATLAS_GRID_SIDEBAR,
   ATLAS_LIVE_DEFAULT_COL_DEF,
   ATLAS_LIVE_GRID_PROPS,
   ATLAS_STATUS_BAR,
@@ -298,6 +299,7 @@ export function QueryPivotResult({
           headerHeight={28}
           onGridReady={handleGridReady}
           statusBar={ATLAS_STATUS_BAR}
+          sideBar={ATLAS_GRID_SIDEBAR}
           {...ATLAS_LIVE_GRID_PROPS}
         />
       </div>

@@ -19,6 +19,16 @@ import { SOW_CHUNK_ROWS, COALESCE_MS } from './protocol';
 const DEFAULT_WS_URL = 'ws://127.0.0.1:9008/cq/json';
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 8_000;
+/**
+ * Grace period before an idle (zero-subscriber) shared sub is actually
+ * torn down. While lingering, the upstream cqserver sub stays open and
+ * keeps the worker's row mirror up to date, so a tab that re-subscribes
+ * to the same `(topic, filter, sql)` — switching chapters, or a backgrounded
+ * tab coming forward — replays from the warm cache instead of firing a
+ * fresh SOW at the server. Bounded so genuinely abandoned views (e.g.
+ * one-off ad-hoc queries) eventually release their server sub.
+ */
+const SUB_LINGER_MS = 5 * 60_000;
 
 export interface HubPort {
   postMessage(msg: ServerMsg): void;
@@ -64,6 +74,9 @@ interface SharedSub {
    *  wins; an add cancelled by a remove in the same window drops entirely. */
   pending: Map<string, { kind: 'add' | 'update' | 'remove'; row: Row }>;
   coalesceTimer: ReturnType<typeof setTimeout> | null;
+  /** Set when refs hit zero; tears the sub down after SUB_LINGER_MS unless
+   *  a new subscriber arrives first and cancels it (warm-cache reuse). */
+  lingerTimer: ReturnType<typeof setTimeout> | null;
 }
 
 class Hub {
@@ -229,8 +242,15 @@ class Hub {
         rows: new Map(),
         pending: new Map(),
         coalesceTimer: null,
+        lingerTimer: null,
       };
       this.subs.set(key, shared);
+    }
+    // A subscriber arrived — cancel any pending idle teardown so the warm,
+    // still-updating cache is reused instead of re-fetched.
+    if (shared.lingerTimer != null) {
+      clearTimeout(shared.lingerTimer);
+      shared.lingerTimer = null;
     }
     shared.refs.add({ portId: state.id, portSubId: msg.subId });
     this.send(state.id, { kind: 'status', subId: msg.subId, status: 'snapshotting' });
@@ -363,6 +383,9 @@ class Hub {
   }
 
   private enqueueDelta(shared: SharedSub, kind: Delta['deltaType'], row: Row): void {
+    // No viewers (lingering): `shared.rows` was already updated by the drain
+    // loop, so the cache stays warm — skip the per-port coalesce machinery.
+    if (shared.refs.size === 0) return;
     // Conflate per key so N updates to the same row in one window collapse
     // to the latest value, matching AMPS conflation. The key is unstable
     // only on the JSON.stringify fallback, where distinct values key
@@ -423,17 +446,40 @@ class Hub {
         break;
       }
     }
-    if (shared.refs.size === 0) {
+    if (shared.refs.size === 0 && shared.lingerTimer == null) {
+      // Don't tear down immediately — keep the upstream sub and its row
+      // mirror warm for SUB_LINGER_MS so a quick re-subscribe (chapter
+      // switch / tab refocus) replays from cache instead of re-SOWing.
+      // Stop the coalesce flush (no viewers to send to); the drain loop
+      // still updates `shared.rows` so the cache stays current.
       if (shared.coalesceTimer != null) {
         clearTimeout(shared.coalesceTimer);
         shared.coalesceTimer = null;
       }
-      const upstreamId = shared.sub?.subId;
-      this.subs.delete(key);
-      shared.sub = null;
-      if (this.client && upstreamId) {
-        void this.client.unsubscribe(upstreamId).catch(() => {});
-      }
+      shared.pending = new Map();
+      shared.lingerTimer = setTimeout(() => this.teardownShared(key), SUB_LINGER_MS);
+    }
+  }
+
+  /** Actually release an idle shared sub once its linger window expires.
+   *  No-ops if a subscriber rejoined in the meantime (refs > 0). */
+  private teardownShared(key: string): void {
+    const shared = this.subs.get(key);
+    if (!shared) return;
+    if (shared.lingerTimer != null) {
+      clearTimeout(shared.lingerTimer);
+      shared.lingerTimer = null;
+    }
+    if (shared.refs.size > 0) return; // re-subscribed during linger — keep it.
+    if (shared.coalesceTimer != null) {
+      clearTimeout(shared.coalesceTimer);
+      shared.coalesceTimer = null;
+    }
+    const upstreamId = shared.sub?.subId;
+    this.subs.delete(key);
+    shared.sub = null;
+    if (this.client && upstreamId) {
+      void this.client.unsubscribe(upstreamId).catch(() => {});
     }
   }
 
@@ -493,7 +539,21 @@ class Hub {
     this.client = null;
     this.clientPromise = null;
     // Tear down every shared sub's upstream handle but keep the port refs.
-    for (const shared of this.subs.values()) {
+    for (const [key, shared] of this.subs) {
+      if (shared.lingerTimer != null) {
+        clearTimeout(shared.lingerTimer);
+        shared.lingerTimer = null;
+      }
+      // An idle sub that was only lingering has no viewers and the socket
+      // just dropped — don't keep it around to re-open on reconnect.
+      if (shared.refs.size === 0) {
+        if (shared.coalesceTimer != null) {
+          clearTimeout(shared.coalesceTimer);
+          shared.coalesceTimer = null;
+        }
+        this.subs.delete(key);
+        continue;
+      }
       shared.sub = null;
       shared.isLive = false;
       shared.rows.clear();

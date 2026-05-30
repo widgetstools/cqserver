@@ -4,6 +4,7 @@
  */
 import type { ColDef, GridOptions } from 'ag-grid-community';
 import type { DeltaBatch, Row } from '@/lib/use-subscription';
+import { AtlasGridSettingsPanel } from './components/AtlasGridSettingsPanel';
 
 /** Unwrap AG Grid aggFunc result objects before comparing. */
 export function unwrapCellValue(raw: unknown): unknown {
@@ -85,4 +86,18 @@ export const ATLAS_STATUS_BAR: GridOptions['statusBar'] = {
     { statusPanel: 'agSelectedRowCountComponent', align: 'center' },
     { statusPanel: 'agAggregationComponent', align: 'right' },
   ],
+};
+
+/** Right side bar — custom scrollable grid settings (column visibility + layout). */
+export const ATLAS_GRID_SIDEBAR: GridOptions['sideBar'] = {
+  toolPanels: [
+    {
+      id: 'atlasGridSettings',
+      labelDefault: 'Grid Settings',
+      labelKey: 'gridSettings',
+      iconKey: 'columns',
+      toolPanel: AtlasGridSettingsPanel,
+    },
+  ],
+  defaultToolPanel: '',
 };

@@ -172,6 +172,219 @@ html[data-theme="light"] {
   display: flex;
 }
 
+/* AG Grid side bar — custom Grid Settings panel layout + scroll. */
+.atlas-root .ag-side-bar .ag-tool-panel-wrapper {
+  height: 100%;
+  overflow: hidden;
+}
+
+.atlas-root .ag-side-bar .ag-react-container {
+  height: 100%;
+  min-height: 0;
+}
+
+.atlas-root .atlas-grid-settings {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--atlas-ink-2);
+  color: var(--atlas-fg);
+  font-family: var(--atlas-font);
+  font-size: 11px;
+}
+
+.atlas-root .atlas-grid-settings__header {
+  flex-shrink: 0;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--atlas-rule);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.atlas-root .atlas-grid-settings__title {
+  font-size: 9px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--atlas-amber);
+}
+
+.atlas-root .atlas-grid-settings__meta {
+  font-size: 10px;
+  color: var(--atlas-fg-faint);
+}
+
+.atlas-root .atlas-grid-settings__search {
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  border: 1px solid var(--atlas-rule);
+  color: var(--atlas-fg);
+  font-family: var(--atlas-font);
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+
+.atlas-root .atlas-grid-settings__search:focus {
+  border-color: var(--atlas-amber);
+}
+
+.atlas-root .atlas-grid-settings__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.atlas-root .atlas-grid-settings__actions button,
+.atlas-root .atlas-grid-settings__section-actions button {
+  all: unset;
+  cursor: pointer;
+  font-family: var(--atlas-font);
+  font-size: 9px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  border: 1px solid var(--atlas-rule);
+  border-radius: 3px;
+  color: var(--atlas-fg-dim);
+}
+
+.atlas-root .atlas-grid-settings__actions button:hover,
+.atlas-root .atlas-grid-settings__section-actions button:hover {
+  color: var(--atlas-fg);
+  border-color: var(--atlas-amber);
+  background: var(--atlas-amber-soft);
+}
+
+.atlas-root .atlas-grid-settings__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 0 10px;
+}
+
+.atlas-root .atlas-grid-settings__empty {
+  padding: 16px 12px;
+  color: var(--atlas-fg-faint);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.atlas-root .atlas-grid-settings__section {
+  border-bottom: 1px solid var(--atlas-rule-soft);
+}
+
+.atlas-root .atlas-grid-settings__section-head {
+  all: unset;
+  box-sizing: border-box;
+  cursor: pointer;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  color: var(--atlas-fg);
+}
+
+.atlas-root .atlas-grid-settings__section-head:hover {
+  background: var(--atlas-hover-surface);
+}
+
+.atlas-root .atlas-grid-settings__section-chevron {
+  width: 10px;
+  color: var(--atlas-fg-faint);
+  flex-shrink: 0;
+}
+
+.atlas-root .atlas-grid-settings__section-label {
+  flex: 1;
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.atlas-root .atlas-grid-settings__section-count {
+  font-size: 9px;
+  color: var(--atlas-fg-faint);
+  font-feature-settings: 'tnum';
+}
+
+.atlas-root .atlas-grid-settings__section-hint {
+  padding: 0 12px 4px 30px;
+  font-size: 9px;
+  color: var(--atlas-fg-faint);
+}
+
+.atlas-root .atlas-grid-settings__section-actions {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 6px 30px;
+}
+
+.atlas-root .atlas-grid-settings__list {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 8px 24px;
+}
+
+.atlas-root .atlas-grid-settings__row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.atlas-root .atlas-grid-settings__row:hover {
+  background: var(--atlas-hover-surface);
+}
+
+.atlas-root .atlas-grid-settings__row input {
+  margin: 0;
+  accent-color: var(--atlas-amber);
+}
+
+.atlas-root .atlas-grid-settings__row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--atlas-fg);
+}
+
+.atlas-root .atlas-grid-settings__row-field {
+  font-size: 9px;
+  color: var(--atlas-fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 88px;
+}
+
+.atlas-root .atlas-grid-settings__footer {
+  flex-shrink: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--atlas-rule);
+  font-size: 9px;
+  letter-spacing: .08em;
+  color: var(--atlas-fg-faint);
+  line-height: 1.4;
+}
+
+.atlas-root .atlas-grid-settings__scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.atlas-root .atlas-grid-settings__scroll::-webkit-scrollbar-thumb {
+  background: var(--atlas-scrollbar-thumb);
+  border-radius: 999px;
+}
+
 .atlas-root.atlas-app {
   position: relative;
   min-height: 100vh;
