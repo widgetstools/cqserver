@@ -27,6 +27,21 @@ export type ClientMsg =
       filter?: string;
       /** Inline SQL — mutually exclusive with `filter`. */
       sql?: string;
+      /**
+       * Row-identity columns, so the worker keys its SOW mirror exactly
+       * the way the main thread keys rows. Three cases:
+       *   - omitted   → worker falls back to its id-column heuristic
+       *                 (position_id / trade_id / cusip / JSON.stringify).
+       *                 Back-compat for callers that can't name their key.
+       *   - [col, …]  → composite key = those columns joined.
+       *   - []        → single-row collapse (continuous aggregates). Every
+       *                 row maps to one slot so the re-emitted group never
+       *                 accumulates a fresh mirror entry per tick.
+       * Without this the heuristic JSON.stringify's the whole row, so any
+       * topic whose identity isn't one of the three hardcoded columns
+       * grows the mirror unboundedly on every value change.
+       */
+      keyCols?: string[];
     }
   | { kind: 'unsubscribe'; subId: string }
   | {

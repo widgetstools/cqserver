@@ -53,11 +53,16 @@ interface SharedSub {
   generation: number;
   /** Set after `whenSnapshotComplete()`. */
   isLive: boolean;
+  /** Keys a row the way the main thread does — built from the subscribe
+   *  message's `keyCols` (or the legacy heuristic when absent). The mirror
+   *  and the conflation buffer both go through this so a re-emitted
+   *  aggregate group collapses to one slot instead of leaking one per tick. */
+  keyer: (row: Row) => string;
   /** Worker-side row mirror for SOW replay on late join + Task 6 resub. */
   rows: Map<string, Row>;
-  pendingAdd: Row[];
-  pendingUpdate: Row[];
-  pendingRemove: Row[];
+  /** Per-key conflation buffer for the coalesce window. Last write per key
+   *  wins; an add cancelled by a remove in the same window drops entirely. */
+  pending: Map<string, { kind: 'add' | 'update' | 'remove'; row: Row }>;
   coalesceTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -89,6 +94,19 @@ class Hub {
     if (typeof row.cusip === 'string') return String(row.cusip);
     // Fallback: stringify a stable subset.
     return JSON.stringify(row);
+  }
+
+  /** Build a shared sub's row keyer from the subscribe message's
+   *  `keyCols`. See the protocol's `keyCols` doc for the three cases. */
+  private buildKeyer(keyCols: string[] | undefined): (row: Row) => string {
+    if (keyCols) {
+      // `[]` → every row collapses to one slot (continuous aggregates).
+      if (keyCols.length === 0) return () => '\x00agg';
+      return (row: Row) =>
+        keyCols.map((c) => (row[c] == null ? '' : String(row[c]))).join('\x00');
+    }
+    // No key named — keep the legacy id-column heuristic.
+    return (row: Row) => this.rowKey(row);
   }
 
   private broadcast(msg: ServerMsg): void {
@@ -207,10 +225,9 @@ class Hub {
         openingPromise: null,
         generation: 0,
         isLive: false,
+        keyer: this.buildKeyer(msg.keyCols),
         rows: new Map(),
-        pendingAdd: [],
-        pendingUpdate: [],
-        pendingRemove: [],
+        pending: new Map(),
         coalesceTimer: null,
       };
       this.subs.set(key, shared);
@@ -284,7 +301,7 @@ class Hub {
           // Stop touching `shared` and let the loop unwind.
           if (shared.generation !== gen) break;
           const row = d.data as Row;
-          const key = this.rowKey(row);
+          const key = shared.keyer(row);
           if (d.deltaType === 'remove' || d.deltaType === 'oof') {
             shared.rows.delete(key);
           } else {
@@ -346,9 +363,24 @@ class Hub {
   }
 
   private enqueueDelta(shared: SharedSub, kind: Delta['deltaType'], row: Row): void {
-    if (kind === 'remove' || kind === 'oof') shared.pendingRemove.push(row);
-    else if (kind === 'add') shared.pendingAdd.push(row);
-    else shared.pendingUpdate.push(row);
+    // Conflate per key so N updates to the same row in one window collapse
+    // to the latest value, matching AMPS conflation. The key is unstable
+    // only on the JSON.stringify fallback, where distinct values key
+    // distinctly and this degrades to the old append behaviour — never to
+    // anything wrong.
+    const key = shared.keyer(row);
+    const prev = shared.pending.get(key);
+    if (kind === 'remove' || kind === 'oof') {
+      // add → remove within the window cancels: the main thread never saw
+      // the row (its add hasn't been flushed yet), so emit neither.
+      if (prev && prev.kind === 'add') shared.pending.delete(key);
+      else shared.pending.set(key, { kind: 'remove', row });
+    } else {
+      // Preserve a still-pending 'add' so a newly-entered row stays an add
+      // even after later updates in the same window.
+      const nextKind = prev && prev.kind === 'add' ? 'add' : kind === 'add' ? 'add' : 'update';
+      shared.pending.set(key, { kind: nextKind, row });
+    }
     if (shared.coalesceTimer == null) {
       shared.coalesceTimer = setTimeout(() => this.flushPending(shared), COALESCE_MS);
     }
@@ -356,19 +388,17 @@ class Hub {
 
   private flushPending(shared: SharedSub): void {
     shared.coalesceTimer = null;
-    if (
-      shared.pendingAdd.length === 0 &&
-      shared.pendingUpdate.length === 0 &&
-      shared.pendingRemove.length === 0
-    ) {
-      return;
+    if (shared.pending.size === 0) return;
+    const add: Row[] = [];
+    const update: Row[] = [];
+    const remove: Row[] = [];
+    for (const { kind, row } of shared.pending.values()) {
+      if (kind === 'add') add.push(row);
+      else if (kind === 'remove') remove.push(row);
+      else update.push(row);
     }
-    const add = shared.pendingAdd;
-    const update = shared.pendingUpdate;
-    const remove = shared.pendingRemove;
-    shared.pendingAdd = [];
-    shared.pendingUpdate = [];
-    shared.pendingRemove = [];
+    shared.pending = new Map();
+    if (add.length === 0 && update.length === 0 && remove.length === 0) return;
     for (const ref of shared.refs) {
       this.send(ref.portId, {
         kind: 'delta',
@@ -467,9 +497,7 @@ class Hub {
       shared.sub = null;
       shared.isLive = false;
       shared.rows.clear();
-      shared.pendingAdd = [];
-      shared.pendingUpdate = [];
-      shared.pendingRemove = [];
+      shared.pending = new Map();
       if (shared.coalesceTimer != null) {
         clearTimeout(shared.coalesceTimer);
         shared.coalesceTimer = null;

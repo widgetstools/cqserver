@@ -31,9 +31,13 @@ class AggregateSub {
   private off: (() => void) | null = null;
 
   constructor(topic: string, sql: string) {
-    // The aggregate sub is always single-row by design — use a
-    // constant rowKey so the worker mirror collapses to one entry.
-    this.sub = makeSqlSub(topic, sql, () => 'AGG');
+    // The aggregate sub is always single-row by design. The constant
+    // rowKey collapses the MAIN-thread mirror to one entry; the empty
+    // `keyCols` makes the WORKER mirror collapse the same way. Without the
+    // latter the worker heuristic JSON.stringify's each re-emitted group,
+    // so its mirror grew one entry per tick, unbounded, for the life of
+    // the subscription (and replayed that whole history on late join).
+    this.sub = makeSqlSub(topic, sql, () => 'AGG', []);
     // Mirror snapshot/deltas into our `row`.
     this.off = this.sub.subscribe(() => {
       const snap = this.sub.getSnapshot();

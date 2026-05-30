@@ -24,6 +24,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { getCqPort } from './worker/port';
 import type {
+  ClientMsg,
   ConnectionStatus,
   Row,
   ServerMsg,
@@ -74,6 +75,10 @@ class Sub {
     private readonly filter: string | null,
     private readonly sql: string | null,
     rowIdKey: ((r: Row) => string) | undefined,
+    /** Key-column names sent to the worker so its SOW mirror keys rows the
+     *  same way we do. `[]` = single-row collapse (aggregates). Omit to let
+     *  the worker fall back to its id-column heuristic. */
+    private readonly keyCols: string[] | null = null,
   ) {
     this.rowKey = rowIdKey ?? ((r) => {
       // Best-effort fallback so legacy chapters compile. Server-side
@@ -89,12 +94,14 @@ class Sub {
     if (this.closed) return;
     const port = getCqPort();
     this.off = port.onMessage((m) => this.onMsg(m));
-    const req =
-      this.sql != null
-        ? { kind: 'subscribe' as const, subId: this.subId, topic: this.topic, sql: this.sql }
-        : this.filter != null
-          ? { kind: 'subscribe' as const, subId: this.subId, topic: this.topic, filter: this.filter }
-          : { kind: 'subscribe' as const, subId: this.subId, topic: this.topic };
+    const req: Extract<ClientMsg, { kind: 'subscribe' }> = {
+      kind: 'subscribe',
+      subId: this.subId,
+      topic: this.topic,
+    };
+    if (this.sql != null) req.sql = this.sql;
+    else if (this.filter != null) req.filter = this.filter;
+    if (this.keyCols != null) req.keyCols = this.keyCols;
     port.send(req);
   }
 
@@ -242,19 +249,21 @@ export function useSubscription(
   topic: string,
   filter: string | null,
   rowIdKey?: (r: Row) => string,
+  /** Optional key columns forwarded to the worker mirror (see `Sub`). */
+  keyCols?: string[],
 ): SubscriptionHandle {
-  const [sub, setSub] = useState<Sub>(() => new Sub(topic, filter, null, rowIdKey));
+  const [sub, setSub] = useState<Sub>(() => new Sub(topic, filter, null, rowIdKey, keyCols ?? null));
   const keyRef = useRef<{ topic: string; filter: string | null }>({ topic, filter });
 
   useEffect(() => {
     if (keyRef.current.topic === topic && keyRef.current.filter === filter) return;
-    const next = new Sub(topic, filter, null, rowIdKey);
+    const next = new Sub(topic, filter, null, rowIdKey, keyCols ?? null);
     keyRef.current = { topic, filter };
     setSub((prev) => {
       prev.close();
       return next;
     });
-  }, [topic, filter, rowIdKey]);
+  }, [topic, filter, rowIdKey, keyCols]);
 
   useEffect(() => {
     sub.cancelDeferredClose();
@@ -294,8 +303,13 @@ export function useSubscription(
 /** SQL-flavour subscription used by `useLiveQuery` and
  *  `useFilteredAggregate`. Same `Sub` class, distinct entry point so the
  *  call sites read naturally. */
-export function makeSqlSub(topic: string, sql: string, rowIdKey?: (r: Row) => string): Sub {
-  return new Sub(topic, null, sql, rowIdKey);
+export function makeSqlSub(
+  topic: string,
+  sql: string,
+  rowIdKey?: (r: Row) => string,
+  keyCols?: string[],
+): Sub {
+  return new Sub(topic, null, sql, rowIdKey, keyCols ?? null);
 }
 export type { Sub };
 

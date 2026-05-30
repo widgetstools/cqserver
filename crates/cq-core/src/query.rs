@@ -4257,23 +4257,27 @@ impl Default for QueryLimits {
             max_view_chain_depth: 3,
             reject_degenerate_groupby: true,
             reject_passthrough_views: true,
-            // G3 hard caps. 1M rows / 100 MB / 10x fanout / 100K
-            // groups are conservative but never zero — operators
-            // who want the guardrails OFF should set the field to 0.
-            max_sow_estimated_rows: 1_000_000,
-            max_sow_estimated_bytes: 100_000_000,
-            max_join_estimated_fanout: 10,
-            max_group_estimated_cardinality: 100_000,
-            // Soft warnings at 1/10 of the hard cap so operators
-            // see "you're approaching" before "you're rejected."
-            warn_sow_rows_threshold: 100_000,
-            warn_sow_bytes_threshold: 10_000_000,
-            // G4 runtime caps. Generous defaults — these are
-            // the catch-all when an estimate-time check missed.
-            // 5M rows or 500MB stops a runaway SOW; raise for
-            // bulk-export workloads or set 0 to disable.
-            hard_max_sow_result_rows: 5_000_000,
-            hard_max_sow_result_bytes: 500_000_000,
+            // AMPS parity: AMPS imposes NO size/cost cap on a SOW query —
+            // it streams the entire result and relies on slow-consumer
+            // capacity management (offline-to-disk → disconnect) to protect
+            // the instance, never a pre-flight rejection or a hard result
+            // cap. So the G3 estimate caps and G4 runtime caps default to 0
+            // (disabled). They remain fully wired and configurable via
+            // `[query_limits]` for operators who want a stricter-than-AMPS
+            // guardrail; `0` means "no cap" everywhere they're checked.
+            //
+            // The structural guardrails above (PIVOT IN-list size, view
+            // chain depth, degenerate GROUP BY, pass-through views) are
+            // parse-time *validity* checks, not egress caps, so they keep
+            // their protective defaults.
+            max_sow_estimated_rows: 0,
+            max_sow_estimated_bytes: 0,
+            max_join_estimated_fanout: 0,
+            max_group_estimated_cardinality: 0,
+            warn_sow_rows_threshold: 0,
+            warn_sow_bytes_threshold: 0,
+            hard_max_sow_result_rows: 0,
+            hard_max_sow_result_bytes: 0,
         }
     }
 }

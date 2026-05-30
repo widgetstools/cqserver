@@ -30,6 +30,14 @@ export interface LiveQuerySpec {
   topic: string;
   sql: string;
   getRowId: (row: Row) => string;
+  /**
+   * Optional key columns forwarded to the worker so its SOW mirror keys
+   * rows the same way `getRowId` does. Pass these for GROUP BY / aggregate
+   * queries whose rows lack a stable id column — otherwise the worker
+   * heuristic JSON.stringify's the whole row and the mirror grows on every
+   * re-emit. `[]` collapses to a single row. Omit for keyed topics.
+   */
+  keyCols?: string[];
 }
 
 export interface LiveQueryHandle extends SubscriptionHandle {
@@ -44,7 +52,7 @@ class LiveQueryWrapper {
   private off: (() => void) | null = null;
 
   constructor(spec: LiveQuerySpec) {
-    this.sub = makeSqlSub(spec.topic, spec.sql, spec.getRowId);
+    this.sub = makeSqlSub(spec.topic, spec.sql, spec.getRowId, spec.keyCols);
     // Mirror status='error' into a separate errMsg so the UI can surface
     // the message even after status transitions back.
     this.off = this.sub.subscribeStatus(() => {
@@ -85,7 +93,8 @@ export function useLiveQuery(spec: LiveQuerySpec | null): LiveQueryHandle | null
     const same =
       keyRef.current?.topic === spec?.topic &&
       keyRef.current?.sql === spec?.sql &&
-      keyRef.current?.getRowId === spec?.getRowId;
+      keyRef.current?.getRowId === spec?.getRowId &&
+      (keyRef.current?.keyCols ?? []).join('\x00') === (spec?.keyCols ?? []).join('\x00');
     if (same) return;
     keyRef.current = spec;
     setWrap((prev) => {
