@@ -216,6 +216,41 @@ This is the **C++/Java/Python/.NET/JS surface** AMPS publishes. Each row is eith
 
 ---
 
+## 3.7 SOW caps & slow-consumer capacity (aligned 2026-05-30)
+
+AMPS imposes **no size or cost cap** on a SOW query — it streams the entire
+result and protects the instance purely through slow-consumer capacity
+management: it offlines a backed-up client's messages to disk, then
+**disconnects** the client when the disk cushion (`MessageDiskLimit`) is
+exhausted. It never rejects a query pre-flight on size, and never silently
+desyncs a subscriber.
+
+cqserver now matches this:
+
+| Concern | AMPS | cqserver |
+|---|---|---|
+| Hard cap on SOW result rows/bytes | none | `hard_max_sow_result_rows/_bytes` **default 0 = disabled**; opt-in only |
+| Pre-flight estimate rejection | none | `max_sow_estimated_*` (G3) **default 0 = disabled**; opt-in only |
+| Memory full → offline to disk | `MessageMemoryLimit` | per-sub `outbound_queue_capacity` → `[transport.spillover]` |
+| Disk cushion full → **disconnect** | `MessageDiskLimit` | spillover over-cap → connection closed (`cq_slow_consumer_disconnect_total`) |
+| Client-bounded result | `top_n` / `skip_n` | SQL `LIMIT` / `OFFSET` + TopN subs |
+| Per-client capacity share | `ClientMaxCapacity` (50%) | ✗ (per-sub queue only) — open gap |
+
+Notes:
+- The G1 **structural** guardrails (PIVOT IN-list size, view-chain depth,
+  degenerate GROUP BY, pass-through views) are query *validity* checks, not
+  egress caps, and keep their protective defaults.
+- The disk-full→disconnect parity applies to routes **with** spillover
+  configured. Without spillover (no disk cushion) and for conflated routes,
+  overflow falls back to a best-effort drop + `degraded` flag (the
+  slow-consumer watcher can force-resync). **For full parity, configure
+  `[transport.spillover]`.**
+- Earlier same-day fix: an as-of/historical SOW truncated to zero rows when
+  `hard_max_sow_result_rows = 0` (the "disabled" value) — now gated on
+  `cap > 0`, matching the live-streaming path.
+
+---
+
 ## 4. Known cqserver bugs (server-side, not parser)
 
 Hit while wiring Atlas:

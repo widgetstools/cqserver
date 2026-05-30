@@ -1317,29 +1317,45 @@ useful series:
 ### 14.4 Query guardrails
 
 The G1–G5 guardrails (`QUERY_GUARDRAILS_WORKLOG.md`) enforce
-structural + cost-based limits on subscribe queries:
+structural + cost-based limits on subscribe queries.
+
+**AMPS parity (default behaviour).** AMPS imposes no size or cost cap on a
+SOW query — it streams the entire result and protects the instance through
+slow-consumer capacity management (offline-to-disk, then disconnect — see
+"Slow consumers" under Troubleshooting), never a pre-flight rejection or a
+hard result cap. To match that, the
+**G3 estimate caps and G4 runtime caps default to `0` (disabled)**. They are
+fully wired and configurable for operators who want a stricter-than-AMPS
+guardrail; `0` means "no cap" everywhere a limit is checked. The parse-time
+**G1 structural** guardrails (PIVOT IN-list size, view-chain depth, degenerate
+GROUP BY, pass-through views) keep their protective defaults — they are query
+*validity* checks, not egress caps.
 
 ```toml
 [query_limits]
-# Parse-time (G1):
+# Parse-time structural guardrails (G1) — protective defaults (NOT egress caps):
 max_pivot_in_list_size           = 100
 max_view_chain_depth             = 3
 reject_degenerate_groupby        = true
 reject_passthrough_views         = true
 
-# Estimate-based (G3):
-max_sow_estimated_rows           = 1_000_000
-max_sow_estimated_bytes          = 100_000_000
-max_join_estimated_fanout        = 10
-max_group_estimated_cardinality  = 100_000
+# Estimate-based pre-flight caps (G3) — default 0 = disabled (AMPS parity).
+# Set non-zero to reject a subscribe whose cost estimate exceeds the cap.
+max_sow_estimated_rows           = 0   # e.g. 1_000_000 to cap
+max_sow_estimated_bytes          = 0   # e.g. 100_000_000
+max_join_estimated_fanout        = 0   # e.g. 10
+max_group_estimated_cardinality  = 0   # e.g. 100_000
 
-# Soft warnings (G3):
-warn_sow_rows_threshold          = 100_000
-warn_sow_bytes_threshold         = 10_000_000
+# Soft warnings (G3) — default 0 = off. Log + metric when an estimate crosses
+# the threshold but stays under the (optional) hard cap.
+warn_sow_rows_threshold          = 0   # e.g. 100_000
+warn_sow_bytes_threshold         = 0   # e.g. 10_000_000
 
-# Runtime caps (G4):
-hard_max_sow_result_rows         = 5_000_000
-hard_max_sow_result_bytes        = 500_000_000
+# Runtime caps (G4) — default 0 = disabled (AMPS parity). When non-zero, a
+# live SOW stream that blows past the cap aborts with a partial result + error
+# frame; an as-of/historical SOW truncates to the cap.
+hard_max_sow_result_rows         = 0   # e.g. 5_000_000
+hard_max_sow_result_bytes        = 0   # e.g. 500_000_000
 ```
 
 `POST /admin/explain` previews any subscribe query's cost before
@@ -1657,13 +1673,16 @@ is flapping.
 
 ### "Query rejected: estimated_result_rows exceeds…"
 
-A query guardrail (G3) fired. The error message names the specific
-limit — see §14.4. Either:
+A query guardrail (G3) fired — which only happens if an operator
+**enabled** it: the SOW size/cost caps default to `0` (disabled, AMPS
+parity), so out of the box no query is rejected on size. If you see this,
+a non-zero `[query_limits]` (or per-user `query_budget`) cap is set. The
+error message names the specific limit — see §14.4. Either:
 
 1. Add a more selective WHERE filter.
 2. Switch to a continuous aggregate.
-3. Have ops raise the limit in `[query_limits]` for everyone, or
-   in `[[auth.users]].query_budget` for one user.
+3. Have ops raise (or zero out) the limit in `[query_limits]` for
+   everyone, or in `[[auth.users]].query_budget` for one user.
 
 ### Out-of-memory under load
 
@@ -1675,6 +1694,28 @@ limit — see §14.4. Either:
   `CQSERVER_SNAPSHOT_CACHE_MAX_BYTES` env var.
 - Profile: `perf` / `Instruments` / `dhat` against the running
   process.
+
+### Slow consumers (capacity management)
+
+When a subscriber can't keep up, the server protects itself like AMPS:
+
+1. **Offline to disk.** When the per-subscription outbound queue fills,
+   frames spill to a per-route disk file (configure
+   `[transport.spillover]` with `max_bytes_per_sub`). The subscriber keeps
+   its place and drains the backlog when it catches up. Watch
+   `cq_spillover_writes_total`.
+2. **Disconnect on over-cap.** If the disk spillover itself over-caps (the
+   AMPS `MessageDiskLimit` equivalent), the server **closes the
+   connection** rather than silently dropping — the client is never left
+   with a quietly incomplete view; it reconnects and re-SOWs. Watch
+   `cq_slow_consumer_disconnect_total{reason}`.
+
+For full AMPS slow-consumer parity, **configure `[transport.spillover]`**.
+Without it there is no disk cushion: an overflow falls back to a
+best-effort drop (`cq_deltas_dropped_total`) and flags the subscription
+`degraded`, which the `[transport.slow_consumer]` watcher can force-resync
+(`auto_disconnect`). The watcher can also widen conflation intervals
+adaptively to keep slow subscribers under the cap before any overflow.
 
 ---
 
