@@ -746,6 +746,35 @@ impl ColumnStore {
         row
     }
 
+    /// Overwrite every column of an existing slot with a full row of
+    /// values, treating `Value::Null` as an explicit null (unlike
+    /// `update_row`, which skips nulls). Does NOT touch `row_count` — the
+    /// slot already exists. Used by the SOW free-list to refill a slot
+    /// reclaimed from a prior delete; that slot was `null_out_row`-ed when
+    /// freed, so unwritten columns are already null.
+    pub fn write_row_at(&mut self, slot: u32, values: Vec<Value>) {
+        let r = slot as usize;
+        debug_assert!(r < self.capacity, "write_row_at slot {slot} out of range");
+        let v = self.row_versions[r].load(Ordering::Relaxed);
+        debug_assert!(
+            v % 2 == 0,
+            "write_row_at on slot {slot}: version {v} is odd (concurrent writer?)"
+        );
+        self.row_versions[r].store(v + 1, Ordering::Release);
+        fence(Ordering::Release);
+
+        let ncols = self.mappings.len();
+        for (col_idx, value) in values.into_iter().enumerate() {
+            if col_idx < ncols {
+                self.set_owned(col_idx, slot, value);
+            }
+        }
+
+        fence(Ordering::Release);
+        self.row_versions[r].store(v + 2, Ordering::Release);
+        self.global_version.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Reset every column of `row` to its null sentinel. Used by `delete`
     /// — distinct from `update_row` which interprets `Value::Null` as
     /// "skip this field".

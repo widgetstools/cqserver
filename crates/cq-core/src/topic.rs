@@ -116,6 +116,12 @@ struct StoreState {
     /// `append_row`, refreshed on `update_row`. Used by the TTL
     /// sweeper to decide which rows have expired.
     last_touched: Vec<std::time::Instant>,
+    /// SOW slot reclamation: store row indices freed by `delete` (the slot
+    /// was `null_out_row`-ed and dropped from `key_to_row`). A later insert
+    /// of a new key reuses one of these before growing the store, bounding
+    /// store memory to the live-set high-water instead of leaking a slot per
+    /// delete (AMPS-style slot reuse).
+    free_slots: Vec<u32>,
 }
 
 impl StoreState {
@@ -139,6 +145,7 @@ impl StoreState {
             key_col_indices,
             secondary_index: crate::sec_index::SecondaryIndex::new(indexed_cols),
             last_touched: Vec::with_capacity(capacity),
+            free_slots: Vec::new(),
             schema,
         }
     }
@@ -580,6 +587,7 @@ impl Topic {
             }
         }
         state.store.null_out_row(row);
+        state.free_slots.push(row);
 
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(log) = &self.txlog {
@@ -933,6 +941,21 @@ impl Topic {
                     *slot = now;
                 }
                 existing_row
+            } else if let Some(slot) = state.free_slots.pop() {
+                // SOW slot reclamation: refill a slot freed by a prior
+                // delete instead of growing the store. `write_row_at` does a
+                // full overwrite (the slot was null_out_row-ed when freed),
+                // and the slot's secondary-index entries were already removed
+                // by the delete, so indexing the new occupant is clean.
+                state.store.write_row_at(slot, values);
+                state.key_to_row.insert(key.clone(), slot);
+                Self::index_new_row_from_store(state, slot);
+                if let Some(t) = state.last_touched.get_mut(slot as usize) {
+                    *t = now;
+                } else {
+                    Self::push_last_touched(state, slot, now);
+                }
+                slot
             } else {
                 let row = state.store.append_row_owned(values);
                 state.key_to_row.insert(key.clone(), row);
@@ -1468,6 +1491,7 @@ impl Topic {
             }
         }
         state.store.null_out_row(row);
+        state.free_slots.push(row);
 
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(log) = &self.txlog {
@@ -1573,6 +1597,7 @@ impl Topic {
                     }
                 }
                 state.store.null_out_row(row);
+                state.free_slots.push(row);
             }
         }
         self.replay_note_applied(origin, sequence);

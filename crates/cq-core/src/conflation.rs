@@ -9,9 +9,21 @@
 //! | Add  + Remove     | cancel — drop both              |
 //! | Update + Update   | Update with the latest row_data |
 //! | Update + Remove   | Remove                          |
-//! | Remove + Add      | Add (republished after delete)  |
+//! | Remove + Add      | both emitted (see below)        |
 //! | Remove + Update   | Update (treat as still-present) |
 //! | anything + Oof    | Oof (consumer must evict)       |
+//!
+//! **Remove + Add and SOW slot reuse.** The conflator keys on the store
+//! *row index*, but a deleted slot can be reclaimed and refilled with a
+//! *different* SOW key (slot reuse). When a pending `Remove` for a slot is
+//! followed by an `Add` for the same slot, the conflator cannot tell "same
+//! key republished" from "different key reusing the slot", so it preserves
+//! **both** — the `Remove` is moved to a `ready` buffer and the `Add`
+//! becomes pending. Collapsing to a single `Add` (the old behaviour) would,
+//! under reuse, silently lose the prior occupant's removal and leave a
+//! stale row in the consumer's view. Emitting both is correct either way:
+//! for a genuine same-key republish the consumer removes then re-adds the
+//! key, ending in the same state.
 //!
 //! The conflator is pure data structure: callers submit deltas as they're
 //! computed; a separate flush loop drains them at the configured interval
@@ -21,45 +33,69 @@ use crate::subscription::{Delta, DeltaType};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
+#[derive(Default)]
+struct ConflatorInner {
+    /// At most one coalesced delta per live slot.
+    pending: HashMap<u32, Delta>,
+    /// Deltas that must be emitted verbatim and not coalesced further —
+    /// currently a `Remove` that was superseded by an `Add` for a reused
+    /// slot. Drained ahead of `pending` so a removal precedes the add.
+    ready: Vec<Delta>,
+}
+
 pub struct Conflator {
-    pending: Mutex<HashMap<u32, Delta>>,
+    inner: Mutex<ConflatorInner>,
 }
 
 impl Conflator {
     pub fn new() -> Self {
         Conflator {
-            pending: Mutex::new(HashMap::new()),
+            inner: Mutex::new(ConflatorInner::default()),
         }
     }
 
     /// Submit a delta. Coalesces with any prior pending delta for the same row.
     pub fn submit(&self, delta: Delta) {
-        let mut pending = self.pending.lock();
-        match pending.remove(&delta.row) {
+        let mut inner = self.inner.lock();
+        match inner.pending.remove(&delta.row) {
             None => {
-                pending.insert(delta.row, delta);
+                inner.pending.insert(delta.row, delta);
             }
             Some(prev) => {
-                if let Some(merged) = merge(prev, delta) {
-                    pending.insert(merged.row, merged);
+                // Reused slot: a removal followed by an add for the same
+                // slot is two distinct records (possibly different SOW
+                // keys). Preserve the Remove verbatim and let the Add
+                // become the new pending delta for the slot.
+                if prev.delta_type == DeltaType::Remove
+                    && delta.delta_type == DeltaType::Add
+                {
+                    inner.ready.push(prev);
+                    inner.pending.insert(delta.row, delta);
+                } else if let Some(merged) = merge(prev, delta) {
+                    inner.pending.insert(merged.row, merged);
                 }
                 // None → Add+Remove cancelled
             }
         }
     }
 
-    /// Drain all pending deltas. Returns them in unspecified order.
+    /// Drain all pending deltas. `ready` deltas (preserved removals) come
+    /// first so a slot's removal is delivered before its reuse add.
     pub fn drain(&self) -> Vec<Delta> {
-        let mut pending = self.pending.lock();
-        pending.drain().map(|(_, d)| d).collect()
+        let mut inner = self.inner.lock();
+        let mut out = std::mem::take(&mut inner.ready);
+        out.extend(inner.pending.drain().map(|(_, d)| d));
+        out
     }
 
     pub fn len(&self) -> usize {
-        self.pending.lock().len()
+        let inner = self.inner.lock();
+        inner.pending.len() + inner.ready.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pending.lock().is_empty()
+        let inner = self.inner.lock();
+        inner.pending.is_empty() && inner.ready.is_empty()
     }
 }
 
@@ -156,14 +192,36 @@ mod tests {
     }
 
     #[test]
-    fn remove_then_add_is_republish() {
+    fn remove_then_add_on_reused_slot_emits_both() {
+        // SOW slot reuse: slot 1's old occupant ("old") was deleted and the
+        // slot refilled with a different record ("new"). Both the Remove and
+        // the Add must survive — collapsing to a single Add would leak the
+        // old occupant into the consumer's view forever.
         let c = Conflator::new();
-        c.submit(delta(1, DeltaType::Remove, "v1"));
-        c.submit(delta(1, DeltaType::Add, "v2"));
+        c.submit(delta(1, DeltaType::Remove, "old"));
+        c.submit(delta(1, DeltaType::Add, "new"));
         let out = c.drain();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].delta_type, DeltaType::Add);
-        assert_eq!(out[0].row_data.get("v").unwrap(), "v2");
+        assert_eq!(out.len(), 2, "expected both Remove and Add, got {out:?}");
+        // Remove is delivered before the reuse Add.
+        assert_eq!(out[0].delta_type, DeltaType::Remove);
+        assert_eq!(out[0].row_data.get("v").unwrap(), "old");
+        assert_eq!(out[1].delta_type, DeltaType::Add);
+        assert_eq!(out[1].row_data.get("v").unwrap(), "new");
+    }
+
+    #[test]
+    fn reused_slot_then_updated_keeps_remove_and_latest_add() {
+        // Remove(old) -> Add(new) -> Update(new'): the preserved Remove plus
+        // a single Add carrying the latest data.
+        let c = Conflator::new();
+        c.submit(delta(1, DeltaType::Remove, "old"));
+        c.submit(delta(1, DeltaType::Add, "new"));
+        c.submit(delta(1, DeltaType::Update, "new2"));
+        let out = c.drain();
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert_eq!(out[0].delta_type, DeltaType::Remove);
+        assert_eq!(out[1].delta_type, DeltaType::Add);
+        assert_eq!(out[1].row_data.get("v").unwrap(), "new2");
     }
 
     #[test]
