@@ -29,6 +29,7 @@ async fn dlq_routes_messages_after_max_delivery_exceeded() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -111,6 +112,7 @@ async fn dlq_after_three_delivery_attempts() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -168,6 +170,7 @@ async fn dlq_does_not_route_acked_messages() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -227,6 +230,7 @@ async fn dlq_delivery_kind_is_add() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;

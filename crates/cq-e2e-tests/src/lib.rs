@@ -205,6 +205,10 @@ pub struct ServerOpts {
     /// `[replication]` section to the generated TOML. `None` keeps
     /// the server in standalone mode (default).
     pub replication: Option<ReplicationOpts>,
+    /// When `Some(_)`, emit `[query_limits].hard_max_sow_result_rows`.
+    /// `Some(0)` exercises the "cap disabled" path. `None` leaves the
+    /// server default (5M).
+    pub hard_max_sow_result_rows: Option<u64>,
 }
 
 /// Replication config for the e2e harness. Mirrors
@@ -464,6 +468,7 @@ impl Default for ServerOpts {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         }
     }
 }
@@ -638,6 +643,12 @@ fn build_toml(
     writeln!(out, "heartbeat_interval_s = 60").unwrap();
     writeln!(out, "heartbeat_idle_timeout_s = 600").unwrap();
     writeln!(out).unwrap();
+
+    if let Some(rows) = opts.hard_max_sow_result_rows {
+        writeln!(out, "[query_limits]").unwrap();
+        writeln!(out, "hard_max_sow_result_rows = {rows}").unwrap();
+        writeln!(out).unwrap();
+    }
     writeln!(out, "[transport]").unwrap();
     writeln!(out, "outbound_queue_capacity = {}", opts.outbound_queue_capacity).unwrap();
     if let Some(sc) = opts.slow_consumer {

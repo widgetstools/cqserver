@@ -29,6 +29,7 @@ async fn archived_segments_replay_on_restart() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -87,6 +88,7 @@ async fn restart_with_no_archived_segments_recovers_from_live_log() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -129,6 +131,7 @@ async fn restart_mixes_archived_and_live_segments() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;

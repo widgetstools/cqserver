@@ -7,7 +7,7 @@
 //! to replay.
 
 use cq_client::Client;
-use cq_e2e_tests::{start_server, TopicSpec};
+use cq_e2e_tests::{start_server, start_server_with, ServerOpts, TopicSpec};
 use serde_json::json;
 use std::time::Duration;
 
@@ -15,6 +15,38 @@ fn px_of(rows: &[serde_json::Map<String, serde_json::Value>], id: &str) -> Optio
     rows.iter()
         .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id))
         .and_then(|r| r.get("px").and_then(|v| v.as_i64()))
+}
+
+/// Regression: `hard_max_sow_result_rows = 0` means "cap disabled" (as the
+/// docs state and the live-streaming path honors). The as-of/historical SOW
+/// path must NOT truncate the result to zero rows when the cap is disabled.
+#[tokio::test]
+async fn sow_as_of_with_disabled_hard_cap_returns_all_rows() {
+    let topic = TopicSpec::new("/asof_cap0", "id")
+        .with_inline_columns([("id", "string"), ("px", "long")])
+        .with_persist();
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            // 0 = disabled. Pre-fix, the as-of path truncated to 0 rows.
+            hard_max_sow_result_rows: Some(0),
+            ..Default::default()
+        },
+    )
+    .await;
+    let c = Client::connect(&server.tcp_url()).await.expect("connect");
+
+    c.publish("/asof_cap0", json!({ "id": "A", "px": 10 })).await.unwrap();
+    c.publish("/asof_cap0", json!({ "id": "B", "px": 20 })).await.unwrap();
+    let s_c = c.publish("/asof_cap0", json!({ "id": "C", "px": 30 })).await.unwrap();
+
+    // As-of the latest write: all three keys must come back, not zero.
+    let r = c.sow_as_of_sequence("/asof_cap0", s_c, None).await.unwrap();
+    assert_eq!(
+        r.len(),
+        3,
+        "disabled cap (0) must not truncate the as-of SOW to zero rows; got {r:?}"
+    );
 }
 
 #[tokio::test]

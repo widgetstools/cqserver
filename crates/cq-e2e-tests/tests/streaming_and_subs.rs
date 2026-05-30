@@ -79,6 +79,7 @@ async fn snapshot_beyond_queue_capacity_completes() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -129,6 +130,7 @@ async fn many_concurrent_subscribes_no_ack_drops() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;

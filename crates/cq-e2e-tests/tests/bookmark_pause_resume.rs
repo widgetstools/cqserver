@@ -45,6 +45,7 @@ async fn pause_then_resume_resumes_replay_from_same_point() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;

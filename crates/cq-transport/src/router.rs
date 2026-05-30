@@ -1978,8 +1978,12 @@ fn handle_sow(
                 }
             };
             let mut result_rows = result_rows;
+            // G4 runtime cap. `hard_max_rows == 0` means "disabled" (matches
+            // the live streaming path and the documented semantics), so only
+            // truncate when a non-zero cap is actually exceeded — otherwise
+            // a cap of 0 would truncate the whole as-of result to nothing.
             let cap = hard_max_rows as usize;
-            if result_rows.len() > cap {
+            if cap > 0 && result_rows.len() > cap {
                 result_rows.truncate(cap);
             }
 

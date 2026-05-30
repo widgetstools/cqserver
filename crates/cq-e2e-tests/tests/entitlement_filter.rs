@@ -54,6 +54,7 @@ async fn row_filter_restricts_alice_to_rates_desk() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -152,6 +153,7 @@ async fn row_filter_intersects_with_client_filter() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -214,6 +216,7 @@ async fn row_filter_matching_no_rows_is_empty() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -272,6 +275,7 @@ async fn per_action_entitlements_are_independent() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
@@ -329,6 +333,7 @@ async fn bad_password_rejects_logon() {
             spillover: None,
             logging_sinks: Vec::new(),
             replication: None,
+            hard_max_sow_result_rows: None,
         },
     )
     .await;
