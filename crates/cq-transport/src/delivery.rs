@@ -203,35 +203,31 @@ pub fn deliver_delta_cached(
             }
         }
     }
-    // Either the queue was Full or the route already has spillover
-    // backlog. If spillover is wired up, append; otherwise count as a
-    // hard drop (legacy behaviour).
+    // Capacity exceeded. AMPS parity: a subscriber that can't keep up is
+    // offlined to disk (spillover, the AMPS disk cushion) if configured, and
+    // DISCONNECTED when even that overflows its cap — never silently dropped
+    // past the cushion (AMPS disconnects on `MessageDiskLimit`, never leaving
+    // the client with a quietly incomplete view).
+    //
+    // Without spillover configured there is no disk cushion, so this falls
+    // back to the legacy best-effort drop (+ degraded-route flag for the
+    // slow-consumer watcher). For full AMPS slow-consumer parity, configure
+    // `[transport.spillover]`.
     if let Some(sp) = route.spillover.as_ref() {
         match sp.write_frame(&frame) {
             Ok(()) => {
                 metrics::counter!("cq_spillover_writes_total").increment(1);
             }
             Err(crate::spillover::SpilloverError::OverCap { .. }) => {
-                route.dropped.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!(
-                    "cq_deltas_dropped_total",
-                    "reason" => "spillover_over_cap"
-                )
-                .increment(1);
-                mark_state_loss_if_removing(&route, delta);
+                disconnect_slow_consumer(&route, delta, "spillover_over_cap");
             }
             Err(e) => {
-                route.dropped.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!(
-                    "cq_deltas_dropped_total",
-                    "reason" => "spillover_io"
-                )
-                .increment(1);
                 tracing::warn!(
                     sub = %delta.subscription_id,
                     error = %e,
-                    "Spillover write failed; dropping frame"
+                    "Spillover write failed"
                 );
+                disconnect_slow_consumer(&route, delta, "spillover_io");
             }
         }
     } else {
@@ -241,17 +237,40 @@ pub fn deliver_delta_cached(
         tracing::warn!(
             sub = %delta.subscription_id,
             topic = %route.topic,
-            "Delta queue full; dropping (consumer can't keep up)"
+            "Delta queue full; dropping (consumer can't keep up — configure \
+             [transport.spillover] for AMPS-style offline-then-disconnect)"
         );
         mark_state_loss_if_removing(&route, delta);
     }
 }
 
-/// Flag a route degraded when the delta we just dropped was a Remove or
-/// OOF. Add/Update drops are self-correcting (a later delta overwrites
-/// the stale row), but a dropped Remove/OOF leaves the client with a
-/// phantom row it can never reconcile — permanent corruption. The
-/// slow-consumer watcher force-resyncs degraded routes.
+/// AMPS-parity slow-consumer disconnect: a subscriber's outbound capacity
+/// was exhausted (queue full with no spillover, or spillover over its disk
+/// cap). Signal the owning connection to close rather than silently dropping
+/// the frame — AMPS never leaves a subscriber with an incomplete view; it
+/// disconnects the client, which then reconnects and re-SOWs.
+fn disconnect_slow_consumer(
+    route: &crate::session::DeliveryRoute,
+    delta: &Delta,
+    reason: &'static str,
+) {
+    route.dropped.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("cq_slow_consumer_disconnect_total", "reason" => reason).increment(1);
+    tracing::warn!(
+        sub = %delta.subscription_id,
+        topic = %route.topic,
+        session = %route.session_id,
+        reason,
+        "Slow consumer exceeded outbound capacity; disconnecting connection (AMPS parity)"
+    );
+    route.request_disconnect();
+}
+
+/// Flag a route degraded when a Remove/OOF delta was dropped on the legacy
+/// (no-spillover) drop path. Add/Update drops self-correct; a lost
+/// Remove/OOF leaves the client with a phantom row, so the slow-consumer
+/// watcher force-resyncs degraded routes. (The spillover path disconnects
+/// instead of dropping, so this only fires when no spillover is configured.)
 fn mark_state_loss_if_removing(route: &crate::session::DeliveryRoute, delta: &Delta) {
     if !matches!(delta.delta_type, DeltaType::Remove | DeltaType::Oof) {
         return;
@@ -267,7 +286,7 @@ fn mark_state_loss_if_removing(route: &crate::session::DeliveryRoute, delta: &De
             sub = %delta.subscription_id,
             topic = %route.topic,
             delta_type = dt_label(delta.delta_type),
-            "Dropped a Remove/OOF delta (queue full / spillover over cap); \
+            "Dropped a Remove/OOF delta (queue full, no spillover); \
              subscription degraded — client must resync"
         );
     }

@@ -154,11 +154,20 @@ async fn handle_ws_connection(
         heartbeat_cfg,
     );
 
+    // AMPS-parity slow-consumer disconnect: the delivery path notifies this
+    // when a subscription's outbound capacity is exhausted, so we close the
+    // connection instead of silently dropping frames.
+    let disconnect = session.disconnect.clone();
+
     loop {
         tokio::select! {
             biased;
             _ = cancel.notified() => {
                 info!(session = %session.id, "Idle timeout — disconnecting");
+                break;
+            }
+            _ = disconnect.notified() => {
+                warn!(session = %session.id, "Slow consumer capacity exceeded — disconnecting");
                 break;
             }
             maybe_msg = ws_rx.next() => {

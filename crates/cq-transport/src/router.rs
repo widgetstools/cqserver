@@ -2382,6 +2382,7 @@ fn handle_sow_and_subscribe(
                             .or_else(|| session.username.clone()),
                         Some(ctx.bookmark_store.clone()),
                         ctx.spillover.as_ref(),
+                        session.disconnect.clone(),
                     ),
                 );
                 metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
@@ -2550,6 +2551,7 @@ fn handle_bookmark_subscribe(
             client_name,
             Some(bookmark_store),
             spillover_ctx,
+            session.disconnect.clone(),
         ),
     );
     metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone()).increment(1.0);
@@ -2745,6 +2747,7 @@ fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) 
                             .or_else(|| session.username.clone()),
                         Some(ctx.bookmark_store.clone()),
                         ctx.spillover.as_ref(),
+                        session.disconnect.clone(),
                     ),
                 );
                 metrics::gauge!("cq_subscriptions_active", "topic" => topic_name.clone())
@@ -2868,6 +2871,7 @@ fn build_route_with_spillover(
     client_name: Option<String>,
     bookmark_store: Option<BookmarkStore>,
     spillover_ctx: Option<&SpilloverContext>,
+    disconnect: std::sync::Arc<tokio::sync::Notify>,
 ) -> DeliveryRoute {
     let route = match conflation_ms {
         Some(ms) if ms > 0 => DeliveryRoute::with_conflation_codec(
@@ -2883,7 +2887,8 @@ fn build_route_with_spillover(
     };
     let route = route
         .with_client_name(client_name)
-        .with_bookmark_store(bookmark_store);
+        .with_bookmark_store(bookmark_store)
+        .with_disconnect(disconnect);
 
     // S21: opt-in disk spillover. Create a fresh per-route file
     // under the configured directory, attach it to the route, and

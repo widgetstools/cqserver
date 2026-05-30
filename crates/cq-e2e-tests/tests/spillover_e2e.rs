@@ -175,6 +175,79 @@ async fn spillover_absorbs_drops_for_silent_consumer() {
     );
 }
 
+/// AMPS parity: when a silent consumer overflows even the disk spillover
+/// (the AMPS disk cushion), the server DISCONNECTS the connection instead of
+/// silently dropping frames — the client is never left with an incomplete
+/// view. Uses a tiny `max_bytes_per_sub` so the spillover over-caps quickly.
+#[tokio::test]
+async fn spillover_over_cap_disconnects_slow_consumer() {
+    let topic = TopicSpec::new("/spill-cut", "k").with_inline_columns([
+        ("k", "string"),
+        ("v", "long"),
+    ]);
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            outbound_queue_capacity: 16,
+            spillover: Some(SpilloverOpts {
+                // Tiny disk cushion → over-caps almost immediately.
+                max_bytes_per_sub: 4 * 1024,
+            }),
+            ..ServerOpts::default()
+        },
+    )
+    .await;
+
+    let producer = Client::connect(&server.tcp_url()).await.expect("producer");
+    let _silent = open_silent_subscriber(server.tcp_port, "/spill-cut").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Flood enough to overflow the mpsc queue + OS socket buffer + the 4KB
+    // spillover. Once the spillover over-caps, the connection is cut.
+    for i in 0..40_000 {
+        let _ = producer
+            .publish("/spill-cut", json!({ "k": format!("k{i:05}"), "v": i }))
+            .await;
+    }
+
+    // Poll for the disconnect: the slow-consumer disconnect counter fires and
+    // the silent subscription is reaped from the registry once the connection
+    // closes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut disconnected = false;
+    loop {
+        let m = metrics_lines(&server).await;
+        let cuts = counter_value(&m, "cq_slow_consumer_disconnect_total");
+        let still_subscribed = subscriptions(&server)
+            .await
+            .iter()
+            .any(|s| s.get("topic").and_then(|v| v.as_str()) == Some("/spill-cut"));
+        if cuts > 0 && !still_subscribed {
+            disconnected = true;
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "slow consumer was not disconnected on spillover over-cap \
+                 (disconnect_total={cuts}, still_subscribed={still_subscribed})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(disconnected);
+
+    // And it was a *disconnect*, not a silent drop: the legacy delta-drop
+    // counter must not have fired for this topic (spillover absorbed frames
+    // until the cap, then we cut the connection).
+    let m = metrics_lines(&server).await;
+    let dropped = counter_value(&m, "cq_deltas_dropped_total");
+    assert_eq!(
+        dropped, 0,
+        "expected disconnect (not silent drop) on spillover over-cap; \
+         cq_deltas_dropped_total={dropped}"
+    );
+}
+
 #[tokio::test]
 async fn silent_consumer_drains_spilled_backlog_when_it_starts_reading() {
     let topic = TopicSpec::new("/spill-drain", "k").with_inline_columns([

@@ -196,12 +196,21 @@ async fn handle_tcp_connection<S>(
         heartbeat_cfg,
     );
 
+    // AMPS-parity slow-consumer disconnect (see websocket.rs): the delivery
+    // path notifies this when a subscription's outbound capacity is
+    // exhausted, so we close the connection instead of dropping frames.
+    let disconnect = session.disconnect.clone();
+
     let mut buf = BytesMut::with_capacity(8192);
     'outer: loop {
         tokio::select! {
             biased;
             _ = cancel.notified() => {
                 info!(session = %session.id, "Idle timeout — disconnecting");
+                break 'outer;
+            }
+            _ = disconnect.notified() => {
+                warn!(session = %session.id, "Slow consumer capacity exceeded — disconnecting");
                 break 'outer;
             }
             read_result = read_half.read_buf(&mut buf) => {

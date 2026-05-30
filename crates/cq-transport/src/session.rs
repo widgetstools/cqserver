@@ -233,6 +233,13 @@ pub struct DeliveryRoute {
     /// watcher treats a degraded route as a force-resync candidate
     /// (evict → client reconnects and re-SOWs) regardless of drop rate.
     pub degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// AMPS-parity capacity disconnect. Shared with the owning session's
+    /// read loop; when the delivery path can no longer buffer for this
+    /// subscriber (queue full with no spillover, or spillover over its
+    /// disk cap), it notifies this so the connection is closed rather than
+    /// silently dropping frames. A route built standalone (tests) gets its
+    /// own unsignaled `Notify` and never triggers a disconnect.
+    pub disconnect: Arc<tokio::sync::Notify>,
 }
 
 impl DeliveryRoute {
@@ -257,6 +264,7 @@ impl DeliveryRoute {
             resume_notify: Arc::new(tokio::sync::Notify::new()),
             spillover: None,
             degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            disconnect: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -303,6 +311,18 @@ impl DeliveryRoute {
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = session_id.into();
         self
+    }
+
+    /// Attach the owning session's disconnect signal so a capacity
+    /// overflow on this route can close the connection (AMPS parity).
+    pub fn with_disconnect(mut self, disconnect: Arc<tokio::sync::Notify>) -> Self {
+        self.disconnect = disconnect;
+        self
+    }
+
+    /// Signal the owning connection to disconnect (capacity exceeded).
+    pub fn request_disconnect(&self) {
+        self.disconnect.notify_one();
     }
 
     /// Number of frames currently sitting in the outbound queue.
@@ -388,6 +408,9 @@ impl DeliveryRoute {
             resume_notify: Arc::new(tokio::sync::Notify::new()),
             spillover: None,
             degraded,
+            // Placeholder; build_route_with_spillover overwrites this with
+            // the owning session's signal via `.with_disconnect(..)`.
+            disconnect: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -817,6 +840,12 @@ pub struct Session {
     /// audit logs and surfaced via `/admin/clients`. Distinct from
     /// `username` (auth identity) and `id` (per-connection auto-id).
     pub client_name: Option<String>,
+    /// AMPS-parity capacity disconnect signal. The read loop selects on
+    /// this; a delivery-path capacity overflow on any of this session's
+    /// subscriptions notifies it to close the connection (rather than
+    /// silently dropping frames). Each `DeliveryRoute` for this session
+    /// is built with a clone of this.
+    pub disconnect: Arc<tokio::sync::Notify>,
 }
 
 impl Session {
@@ -838,6 +867,7 @@ impl Session {
                 compression_to_u8(cq_protocol::compression::DEFAULT_LEGACY_COMPRESSION),
             )),
             client_name: None,
+            disconnect: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
