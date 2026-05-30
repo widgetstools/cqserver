@@ -1109,9 +1109,23 @@ impl SubscriptionEngine {
                 });
             } else if !matches && was_active {
                 sub.active_set.remove(row);
+                // SOW slot-reclamation safety: a Delete nulls the row in
+                // place *before* this event is enqueued, so reading the
+                // store here always yielded an empty `{}` body. Build that
+                // empty body directly instead of reading the slot — which a
+                // later write may have reclaimed and refilled with a
+                // different key's data. Behaviour-identical to the previous
+                // `get_row_map`/`project_row` of a nulled row. The Oof case
+                // (predicate flip on an Upsert) keeps reading the store: the
+                // row is still live and never freed.
+                let is_delete = kind == crate::topic::MutationKind::Delete;
                 let row_data = if sub.sparse {
+                    // Sparse Remove keys off the captured `last_snapshot`,
+                    // not live row data, so it is already reuse-safe.
                     let prev = sub.last_snapshot.remove(&row).unwrap_or_default();
                     std::sync::Arc::new(key_only_payload(&prev, &sub.key_cols, store))
+                } else if is_delete {
+                    std::sync::Arc::new(serde_json::Map::new())
                 } else if sub.query.projection.is_empty() {
                     full_row(&mut shared_full_row)
                 } else {
