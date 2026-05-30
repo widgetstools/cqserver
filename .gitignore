@@ -60,3 +60,6 @@ coverage/
 lcov.info
 tarpaulin-report.html
 .superpowers/
+
+# Playwright MCP tooling output (console logs / traces)
+.playwright-mcp/

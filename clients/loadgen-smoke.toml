@@ -1,0 +1,19 @@
+# Config for cq-loadgen payload-size stress runs.
+tcp_addr = "127.0.0.1:9007"
+websocket_addr = "127.0.0.1:9006"
+websocket_path = "/cq/json"
+admin_addr = "127.0.0.1:8085"
+
+# Raise the SOW guardrails so the deliberately-oversized 30k×400 (~145 MB)
+# stress snapshot is allowed through. Production defaults are ~100 MB.
+[query_limits]
+max_sow_estimated_rows = 10000000
+max_sow_estimated_bytes = 2000000000
+hard_max_sow_result_rows = 10000000
+hard_max_sow_result_bytes = 2000000000
+
+[[topics]]
+name = "/loadgen"
+key = ["k"]
+persist = false
+initial_capacity = 100000

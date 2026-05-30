@@ -407,14 +407,21 @@ export class Client {
 
   async subscribe(
     topic: string,
-    opts: { filter?: string; sql?: string } = {},
+    opts: { filter?: string; sql?: string; conflationMs?: number } = {},
   ): Promise<Subscription> {
-    return this.subscribeInternal('subscribe', topic, opts.filter, opts.sql, undefined);
+    return this.subscribeInternal(
+      'subscribe',
+      topic,
+      opts.filter,
+      opts.sql,
+      undefined,
+      opts.conflationMs,
+    );
   }
 
   async sowAndSubscribe(
     topic: string,
-    opts: { filter?: string; sql?: string; bookmark?: number } = {},
+    opts: { filter?: string; sql?: string; bookmark?: number; conflationMs?: number } = {},
   ): Promise<Subscription> {
     return this.subscribeInternal(
       'sow_and_subscribe',
@@ -422,14 +429,22 @@ export class Client {
       opts.filter,
       opts.sql,
       opts.bookmark,
+      opts.conflationMs,
     );
   }
 
   async deltaSubscribe(
     topic: string,
-    opts: { filter?: string; sql?: string } = {},
+    opts: { filter?: string; sql?: string; conflationMs?: number } = {},
   ): Promise<Subscription> {
-    return this.subscribeInternal('delta_subscribe', topic, opts.filter, opts.sql, undefined);
+    return this.subscribeInternal(
+      'delta_subscribe',
+      topic,
+      opts.filter,
+      opts.sql,
+      undefined,
+      opts.conflationMs,
+    );
   }
 
   private async subscribeInternal(
@@ -438,11 +453,17 @@ export class Client {
     filter: string | undefined,
     sql: string | undefined,
     bookmark: number | undefined,
+    // Request server-side delta conflation at this interval (ms). The
+    // server coalesces per-row updates (latest-value) and flushes every
+    // `conflationMs`, clamped to the server's ceiling. `0` opts out even
+    // if the topic configures a baseline. Omit to use the topic default.
+    conflationMs?: number,
   ): Promise<Subscription> {
     const msg: CqMessage = { c: command, t: topic };
     if (filter !== undefined) msg.f = filter;
     if (sql !== undefined) msg.sql = sql;
     if (bookmark !== undefined) msg.bm = bookmark;
+    if (conflationMs !== undefined) msg.o = `conflation=${conflationMs}`;
     const ack = await this.rpc(msg);
     const subId = ack.sid;
     if (!subId) throw new ClientError('server did not return a sub_id');

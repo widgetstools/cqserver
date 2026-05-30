@@ -32,6 +32,22 @@ use std::time::{Duration, Instant};
 struct QueueMessage {
     sequence: u64,
     data: serde_json::Value,
+    /// Higher values are delivered first. Default 0. Messages of equal
+    /// priority preserve FIFO (publish) order.
+    priority: i64,
+    /// Optional grouping key. All messages sharing a group are pinned
+    /// to the same consumer (sticky routing) so their relative order is
+    /// preserved at that consumer — the AMPS "message grouping" model.
+    group: Option<String>,
+}
+
+/// Per-publish delivery options. Defaults give the historical
+/// behavior (priority 0, no group) so existing call sites are
+/// unaffected.
+#[derive(Clone, Copy, Default)]
+pub struct PublishOpts<'a> {
+    pub priority: i64,
+    pub group: Option<&'a str>,
 }
 
 /// One in-flight delivery awaiting `Ack` from the consumer.
@@ -48,6 +64,53 @@ struct QueueInner {
     consumers: VecDeque<String>,
     in_flight: HashMap<u64, LeaseRecord>,
     next_delivery_id: u64,
+    /// Sticky group → consumer routing. A grouped message is delivered
+    /// to the consumer its group is pinned to; the pin is established
+    /// on first delivery and cleared when that consumer disconnects.
+    group_routes: HashMap<String, String>,
+}
+
+impl QueueInner {
+    /// Insert `msg` into `buffer` keeping it ordered by descending
+    /// priority, FIFO within a priority class. The all-equal-priority
+    /// case (the overwhelmingly common one) stays O(1): a message whose
+    /// priority is `<=` the current tail just appends.
+    fn insert_by_priority(&mut self, msg: QueueMessage) {
+        let buf = &mut self.buffer;
+        match buf.back() {
+            Some(tail) if msg.priority <= tail.priority => buf.push_back(msg),
+            None => buf.push_back(msg),
+            Some(_) => {
+                // Some buffered message has lower priority than `msg`.
+                // Insert before the first such message.
+                let pos = buf
+                    .iter()
+                    .position(|m| m.priority < msg.priority)
+                    .unwrap_or(buf.len());
+                buf.insert(pos, msg);
+            }
+        }
+    }
+
+    /// Evict one message to make room under the buffer cap: the oldest
+    /// message of the lowest-priority class. The buffer is sorted
+    /// descending by priority (FIFO within a class), so the lowest
+    /// priority sits at the tail; among that class the oldest is the
+    /// first occurrence scanning from the front. For the all-equal
+    /// (priority-disabled) case this reduces to dropping the oldest —
+    /// the original ring-buffer semantics.
+    fn evict_one_for_cap(&mut self) -> bool {
+        let buf = &mut self.buffer;
+        let Some(lowest) = buf.back().map(|m| m.priority) else {
+            return false;
+        };
+        let pos = buf
+            .iter()
+            .position(|m| m.priority == lowest)
+            .expect("back() exists, so some element has lowest priority");
+        buf.remove(pos);
+        true
+    }
 }
 
 pub struct Queue {
@@ -68,7 +131,20 @@ pub struct Queue {
     /// name, so the DLQ can be any other queue (typically another
     /// `Queue` with no lease — a pure inspection queue).
     dlq_name: Option<String>,
+    /// Hard cap on buffered (undelivered) messages. When a publish would
+    /// push the backlog past this, the *oldest* buffered message is
+    /// evicted first (ring-buffer semantics) so memory stays bounded even
+    /// when no consumer is connected. Eviction is counted via
+    /// `cq_queue_buffer_overflow_drops_total`. Defaults to
+    /// [`DEFAULT_MAX_QUEUE_BUFFER`].
+    max_buffer: usize,
 }
+
+/// Default ceiling on a queue's undelivered backlog. Large enough to
+/// ride out a transient consumer outage, small enough that a publisher
+/// with no consumer can't exhaust memory. Override per queue via
+/// [`Queue::with_max_buffer`].
+const DEFAULT_MAX_QUEUE_BUFFER: usize = 1_000_000;
 
 impl Queue {
     pub fn new(name: impl Into<String>) -> Self {
@@ -87,11 +163,20 @@ impl Queue {
                 consumers: VecDeque::new(),
                 in_flight: HashMap::new(),
                 next_delivery_id: 0,
+                group_routes: HashMap::new(),
             }),
             lease_ms,
             max_delivery_count: 8,
             dlq_name: None,
+            max_buffer: DEFAULT_MAX_QUEUE_BUFFER,
         }
+    }
+
+    /// Builder: cap the undelivered backlog. Values are floored at 1 so a
+    /// queue can always hold at least one message. See `max_buffer`.
+    pub fn with_max_buffer(mut self, cap: usize) -> Self {
+        self.max_buffer = cap.max(1);
+        self
     }
 
     /// Builder: cap on redelivery attempts. After this many redeliveries
@@ -122,18 +207,32 @@ impl Queue {
         self.lease_ms
     }
 
-    /// Publish `data`. Returns the assigned sequence. Delivers to one
-    /// consumer in round-robin order if any are connected; otherwise
-    /// buffers the message until a consumer subscribes.
+    /// Publish `data` with default options (priority 0, no group).
+    /// Returns the assigned sequence.
     pub fn publish(
         &self,
         data: serde_json::Value,
+        registry: &SessionRegistry,
+    ) -> u64 {
+        self.publish_with_opts(data, PublishOpts::default(), registry)
+    }
+
+    /// Publish `data`, honoring per-message `opts`. Delivers to one
+    /// consumer if any are connected (a grouped message sticks to its
+    /// group's pinned consumer); otherwise buffers the message in
+    /// priority order until a consumer subscribes.
+    pub fn publish_with_opts(
+        &self,
+        data: serde_json::Value,
+        opts: PublishOpts<'_>,
         registry: &SessionRegistry,
     ) -> u64 {
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let msg = QueueMessage {
             sequence: seq,
             data,
+            priority: opts.priority,
+            group: opts.group.map(|s| s.to_string()),
         };
 
         // Opportunistic sweep: cheap to check on every publish if
@@ -144,11 +243,22 @@ impl Queue {
 
         let target = {
             let mut g = self.inner.lock();
-            if let Some(sub_id) = g.consumers.pop_front() {
-                g.consumers.push_back(sub_id.clone());
+            if let Some(sub_id) = self.pick_consumer_for(&mut g, msg.group.as_deref()) {
                 Some(sub_id)
             } else {
-                g.buffer.push_back(msg.clone());
+                // No consumer: buffer it, but bound memory. When at cap,
+                // evict the lowest-priority/newest (buffer tail) so a
+                // publisher can't OOM the process during a consumer
+                // outage without ever starving high-priority work.
+                while g.buffer.len() >= self.max_buffer {
+                    g.evict_one_for_cap();
+                    metrics::counter!(
+                        "cq_queue_buffer_overflow_drops_total",
+                        "queue" => self.name.clone()
+                    )
+                    .increment(1);
+                }
+                g.insert_by_priority(msg.clone());
                 None
             }
         };
@@ -160,6 +270,37 @@ impl Queue {
         metrics::counter!("cq_queue_publish_total", "queue" => self.name.clone())
             .increment(1);
         seq
+    }
+
+    /// Choose the consumer that should receive a message in `group`.
+    /// Ungrouped messages round-robin across consumers. A grouped
+    /// message sticks to the consumer its group is pinned to (if still
+    /// connected); otherwise it picks the next consumer round-robin and
+    /// pins the group there. Returns `None` when no consumer is
+    /// connected.
+    fn pick_consumer_for(
+        &self,
+        g: &mut QueueInner,
+        group: Option<&str>,
+    ) -> Option<String> {
+        if g.consumers.is_empty() {
+            return None;
+        }
+        if let Some(group) = group {
+            if let Some(pinned) = g.group_routes.get(group) {
+                if g.consumers.contains(pinned) {
+                    return Some(pinned.clone());
+                }
+            }
+            // Unpinned (or pinned consumer gone): assign round-robin.
+            let sub_id = g.consumers.pop_front()?;
+            g.consumers.push_back(sub_id.clone());
+            g.group_routes.insert(group.to_string(), sub_id.clone());
+            return Some(sub_id);
+        }
+        let sub_id = g.consumers.pop_front()?;
+        g.consumers.push_back(sub_id.clone());
+        Some(sub_id)
     }
 
     /// Deliver `msg` to `sub_id`. If leases are enabled, allocate a
@@ -214,6 +355,34 @@ impl Queue {
             .increment(1);
         }
         removed
+    }
+
+    /// Extend the lease on an in-flight delivery by `extra_ms` from
+    /// now, giving a slow consumer more time to finish before the
+    /// message is redelivered. Returns `true` if a matching live lease
+    /// was found and extended. A consumer that knows a task will take a
+    /// while sends this instead of letting the lease lapse.
+    pub fn extend_lease(&self, delivery_id: u64, extra_ms: u64) -> bool {
+        if self.lease_ms.is_none() {
+            return false;
+        }
+        let extended = {
+            let mut g = self.inner.lock();
+            if let Some(lease) = g.in_flight.get_mut(&delivery_id) {
+                lease.expires_at = Instant::now() + Duration::from_millis(extra_ms);
+                true
+            } else {
+                false
+            }
+        };
+        if extended {
+            metrics::counter!(
+                "cq_queue_lease_extended_total",
+                "queue" => self.name.clone()
+            )
+            .increment(1);
+        }
+        extended
     }
 
     /// Find every in-flight lease whose `expires_at` is in the past
@@ -312,7 +481,7 @@ impl Queue {
                     );
                 }
                 None => {
-                    self.inner.lock().buffer.push_front(lease.msg);
+                    self.inner.lock().insert_by_priority(lease.msg);
                 }
             }
             acted += 1;
@@ -351,9 +520,13 @@ impl Queue {
             let mut g = self.inner.lock();
             g.consumers.push_back(sub_id);
             let mut out = Vec::new();
+            // Drain in priority order (buffer is already priority-sorted),
+            // routing each message through the group-aware selector so
+            // grouped messages pin to a single consumer.
             while let Some(msg) = g.buffer.pop_front() {
-                let consumer = g.consumers.pop_front().expect("just pushed");
-                g.consumers.push_back(consumer.clone());
+                let consumer = self
+                    .pick_consumer_for(&mut g, msg.group.as_deref())
+                    .expect("just pushed a consumer");
                 out.push((consumer, msg));
             }
             out
@@ -373,6 +546,9 @@ impl Queue {
             let mut g = self.inner.lock();
             let len = g.consumers.len();
             g.consumers.retain(|s| s != sub_id);
+            // Drop any group pins held by the departing consumer so the
+            // next grouped message reassigns to a live consumer.
+            g.group_routes.retain(|_, owner| owner != sub_id);
             len != g.consumers.len()
         };
         if removed {
@@ -502,6 +678,27 @@ mod tests {
         // Nothing delivered yet — no consumers.
         let stats = q.stats();
         assert_eq!(stats.get("buffered").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn buffer_cap_evicts_oldest() {
+        let q = Queue::new("/q").with_max_buffer(3);
+        let registry = new_registry();
+        // Publish 5 with no consumer; cap is 3 so the 2 oldest evict.
+        for i in 0..5 {
+            q.publish(serde_json::json!({"i": i}), &registry);
+        }
+        assert_eq!(*q.stats().get("buffered").unwrap(), 3);
+
+        // The survivors must be the 3 newest (i = 2,3,4), in order.
+        let mut rx = add_route(&registry, "sub-1");
+        q.add_consumer("sub-1".into(), &registry);
+        let mut got = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let m = parse(frame);
+            got.push(m.data.unwrap()["i"].as_i64().unwrap());
+        }
+        assert_eq!(got, vec![2, 3, 4]);
     }
 
     #[tokio::test]
@@ -671,6 +868,100 @@ mod tests {
         let dlq_stats = dlq.stats();
         let buffered = dlq_stats.get("buffered").and_then(|v| v.as_u64()).unwrap_or(0);
         assert_eq!(buffered, 1, "DLQ should hold 1 dead-lettered message");
+    }
+
+    #[tokio::test]
+    async fn buffered_messages_drain_in_priority_order() {
+        let q = Queue::new("/q");
+        let registry = new_registry();
+        // Publish out of priority order with no consumer connected.
+        for (i, prio) in [(0, 0), (1, 5), (2, 0), (3, 10), (4, 5)] {
+            q.publish_with_opts(
+                serde_json::json!({ "i": i }),
+                PublishOpts { priority: prio, group: None },
+                &registry,
+            );
+        }
+        let mut rx = add_route(&registry, "sub-1");
+        q.add_consumer("sub-1".into(), &registry);
+
+        let mut got = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            got.push(parse(frame).data.unwrap()["i"].as_i64().unwrap());
+        }
+        // Highest priority first; FIFO within a priority class:
+        // prio10 -> i3; prio5 -> i1 then i4; prio0 -> i0 then i2.
+        assert_eq!(got, vec![3, 1, 4, 0, 2]);
+    }
+
+    #[tokio::test]
+    async fn grouped_messages_stick_to_one_consumer() {
+        let q = Queue::new("/q");
+        let registry = new_registry();
+        let mut rx_a = add_route(&registry, "a");
+        let mut rx_b = add_route(&registry, "b");
+        q.add_consumer("a".into(), &registry);
+        q.add_consumer("b".into(), &registry);
+
+        // Six messages, all group "G" — must all land on one consumer.
+        for i in 0..6 {
+            q.publish_with_opts(
+                serde_json::json!({ "i": i }),
+                PublishOpts { priority: 0, group: Some("G") },
+                &registry,
+            );
+        }
+        let mut from_a = Vec::new();
+        while let Ok(f) = rx_a.try_recv() {
+            from_a.push(parse(f).data.unwrap()["i"].as_i64().unwrap());
+        }
+        let mut from_b = Vec::new();
+        while let Ok(f) = rx_b.try_recv() {
+            from_b.push(parse(f).data.unwrap()["i"].as_i64().unwrap());
+        }
+        // One consumer got all 6 (in order), the other got none.
+        let (winner, loser) = if from_a.len() == 6 {
+            (from_a, from_b)
+        } else {
+            (from_b, from_a)
+        };
+        assert_eq!(winner, vec![0, 1, 2, 3, 4, 5]);
+        assert!(loser.is_empty());
+    }
+
+    #[tokio::test]
+    async fn extend_lease_defers_redelivery() {
+        let q = Arc::new(Queue::with_lease("/q", Some(100)));
+        let registry = new_registry();
+        let mut rx_a = add_route(&registry, "a");
+        let mut rx_b = add_route(&registry, "b");
+        q.add_consumer("a".into(), &registry);
+        q.add_consumer("b".into(), &registry);
+
+        q.publish(serde_json::json!({ "x": 1 }), &registry);
+        let frame_a = tokio::time::timeout(Duration::from_millis(100), rx_a.recv())
+            .await
+            .unwrap()
+            .expect("a got nothing");
+        let did = parse(frame_a).delivery_id.expect("missing did");
+
+        // Just before expiry, extend the lease by another 500ms.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(q.extend_lease(did, 500), "extend should find live lease");
+
+        // Past the ORIGINAL window — sweep must NOT redeliver.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        q.sweep_expired(&registry);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), rx_b.recv())
+                .await
+                .is_err(),
+            "extended lease must not be redelivered yet"
+        );
+
+        // A real ack still commits the (extended) lease.
+        assert!(q.ack(did));
+        assert!(!q.extend_lease(did, 100), "no lease left to extend");
     }
 
     #[tokio::test]

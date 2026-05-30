@@ -1,7 +1,7 @@
 import type { ColDef } from 'ag-grid-community';
 
 export const HEAT_COL_DEFS: ColDef[] = [
-  { field: 'issuer_sector', headerName: 'sector', width: 160, cellStyle: { color: '#f4a52b' } },
+  { field: 'issuer_sector', headerName: 'sector', width: 160, cellStyle: { color: 'var(--atlas-amber)' } },
   { field: 'issuer_region', headerName: 'region', width: 140 },
   { field: 'n_positions', headerName: 'n_positions', width: 120, type: 'numericColumn',
     valueFormatter: (p) => (p.value as number)?.toLocaleString('en-US') ?? '—' },
@@ -11,7 +11,7 @@ export const HEAT_COL_DEFS: ColDef[] = [
     valueFormatter: (p) => fmtSignedMillions(p.value as number),
     cellStyle: (p) =>
       typeof p.value === 'number' && p.value < 0 ? { color: '#ff6062' } :
-      typeof p.value === 'number' ? { color: '#f4a52b' } : null },
+      typeof p.value === 'number' ? { color: 'var(--atlas-amber)' } : null },
 ];
 
 export function fmtPct(n: number | null | undefined): string {

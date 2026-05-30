@@ -8,9 +8,11 @@
 //! planner uses that as a candidate-row hint: it iterates the
 //! index's bitmap instead of every row in the store, then evaluates
 //! the *whole* predicate on each candidate (the index is just a fast
-//! pre-filter; OR / NOT branches still need full eval). Two
-//! Prometheus counters expose the savings:
+//! pre-filter; `NOT` and partially-indexed `OR` branches still need a
+//! full eval). Prometheus counters expose the savings:
 //!   - `cq_query_index_hits_total` — queries that took the index path
+//!   - `cq_query_range_index_hits_total` — range (`<`/`>`/`BETWEEN`) hits
+//!   - `cq_query_set_index_hits_total` — `IN (...)` / fully-indexed `OR` hits
 //!   - `cq_query_full_scans_total` — queries that fell back to full scan
 
 use crate::predicate::{compile_expr, CompiledPredicate, PredicateError};
@@ -2741,6 +2743,15 @@ pub fn plan_candidates<'a>(
             metrics::counter!("cq_query_range_index_hits_total").increment(1);
             return CandidateRows::OwnedBitmap(bm);
         }
+        // S47 — `IN (...)` lists and fully-indexed `OR` trees. Builds an
+        // owned superset bitmap by unioning per-value / per-branch
+        // lookups. Only fires when the single-eq and range fast paths
+        // miss, so plain `col = x` keeps its zero-copy borrowed path.
+        if let Some(bm) = find_set_hint(&query.predicate, ix) {
+            metrics::counter!("cq_query_index_hits_total").increment(1);
+            metrics::counter!("cq_query_set_index_hits_total").increment(1);
+            return CandidateRows::OwnedBitmap(bm);
+        }
     }
     metrics::counter!("cq_query_full_scans_total").increment(1);
     CandidateRows::Full(store.row_count())
@@ -2825,6 +2836,148 @@ fn find_range_hint(
         // hint. Skip OR / NOT (need full eval); skip non-range leaves.
         CompiledPredicate::And(a, b) => {
             find_range_hint(a, index).or_else(|| find_range_hint(b, index))
+        }
+        _ => None,
+    }
+}
+
+/// Clone an index bitmap, or yield an empty one when the lookup missed.
+/// A missing key means "no rows have this value" — an empty candidate
+/// set, which is the correct (and exact) superset for that leaf.
+#[inline]
+fn clone_or_empty(b: Option<&roaring::RoaringBitmap>) -> roaring::RoaringBitmap {
+    b.cloned().unwrap_or_default()
+}
+
+/// S47 — General index planner for `IN (...)` lists and `OR` trees.
+///
+/// Returns a row bitmap guaranteed to be a **superset** of the
+/// predicate's true matches (the per-row `matches()` pass still runs on
+/// every candidate, so a superset is safe), or `None` when the index
+/// can't bound the predicate — in which case the caller falls back to a
+/// full scan.
+///
+/// Correctness rules:
+///   - A leaf `col = lit` / `col IN (...)` / range over an *indexed*
+///     column resolves to the exact rows for that leaf.
+///   - `AND`: intersect whichever sides resolve. Any one resolved side
+///     is already a valid superset (`matches(a AND b) ⊆ matches(a)`);
+///     intersecting both is just tighter.
+///   - `OR`: union — but **both** sides must resolve. If either branch
+///     is unindexed we can't bound the rows it would contribute
+///     (`matches(a OR b) ⊄ candidate(a)` alone), so we bail to `None`
+///     and take the full scan.
+///   - `NOT` / everything else: `None`. The index doesn't track nulls,
+///     so a complement can't be cheaply or correctly derived.
+fn find_set_hint(
+    pred: &CompiledPredicate,
+    index: &SecondaryIndex,
+) -> Option<roaring::RoaringBitmap> {
+    match pred {
+        // ---- equality leaves ----
+        CompiledPredicate::EqString { col, value } if index.covers(*col) => {
+            Some(clone_or_empty(
+                index.rows_for_key(*col, &IxKey::String(value.clone())),
+            ))
+        }
+        CompiledPredicate::EqLong { col, value } if index.covers(*col) => {
+            Some(clone_or_empty(
+                index.rows_for_key(*col, &IxKey::Long(*value)),
+            ))
+        }
+        CompiledPredicate::EqDouble { col, value } if index.covers(*col) && !value.is_nan() => {
+            Some(clone_or_empty(
+                index.rows_for_key(*col, &IxKey::DoubleBits(value.to_bits())),
+            ))
+        }
+        CompiledPredicate::EqBool { col, value } if index.covers(*col) => {
+            Some(clone_or_empty(
+                index.rows_for_key(*col, &IxKey::Bool(*value)),
+            ))
+        }
+        CompiledPredicate::EqTimestamp { col, value } if index.covers(*col) => {
+            Some(clone_or_empty(
+                index.rows_for_key(*col, &IxKey::Timestamp(*value)),
+            ))
+        }
+        // ---- IN leaves: union of per-value bitmaps ----
+        CompiledPredicate::InString { col, values } if index.covers(*col) => {
+            let mut out = roaring::RoaringBitmap::new();
+            for v in values {
+                if let Some(b) = index.rows_for_key(*col, &IxKey::String(v.clone())) {
+                    out |= b;
+                }
+            }
+            Some(out)
+        }
+        CompiledPredicate::InLong { col, values } if index.covers(*col) => {
+            let mut out = roaring::RoaringBitmap::new();
+            for v in values {
+                if let Some(b) = index.rows_for_key(*col, &IxKey::Long(*v)) {
+                    out |= b;
+                }
+            }
+            Some(out)
+        }
+        CompiledPredicate::InDouble { col, values } if index.covers(*col) => {
+            let mut out = roaring::RoaringBitmap::new();
+            for bits in values {
+                if let Some(b) = index.rows_for_key(*col, &IxKey::DoubleBits(*bits)) {
+                    out |= b;
+                }
+            }
+            Some(out)
+        }
+        CompiledPredicate::InBool { col, values } if index.covers(*col) => {
+            let mut out = roaring::RoaringBitmap::new();
+            for v in values {
+                if let Some(b) = index.rows_for_key(*col, &IxKey::Bool(*v)) {
+                    out |= b;
+                }
+            }
+            Some(out)
+        }
+        CompiledPredicate::InTimestamp { col, values } if index.covers(*col) => {
+            let mut out = roaring::RoaringBitmap::new();
+            for v in values {
+                if let Some(b) = index.rows_for_key(*col, &IxKey::Timestamp(*v)) {
+                    out |= b;
+                }
+            }
+            Some(out)
+        }
+        // ---- range leaves: reuse the range maps ----
+        CompiledPredicate::BetweenLong { .. }
+        | CompiledPredicate::BetweenDouble { .. }
+        | CompiledPredicate::GtLong { .. }
+        | CompiledPredicate::GtDouble { .. }
+        | CompiledPredicate::GeLong { .. }
+        | CompiledPredicate::GeDouble { .. }
+        | CompiledPredicate::LtLong { .. }
+        | CompiledPredicate::LtDouble { .. }
+        | CompiledPredicate::LeLong { .. }
+        | CompiledPredicate::LeDouble { .. } => find_range_hint(pred, index),
+        // ---- combinators ----
+        CompiledPredicate::And(a, b) => {
+            match (find_set_hint(a, index), find_set_hint(b, index)) {
+                (Some(mut x), Some(y)) => {
+                    x &= &y;
+                    Some(x)
+                }
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+        CompiledPredicate::Or(a, b) => {
+            match (find_set_hint(a, index), find_set_hint(b, index)) {
+                (Some(mut x), Some(y)) => {
+                    x |= &y;
+                    Some(x)
+                }
+                // Any unindexed branch could contribute matches we'd
+                // miss — fall back to a full scan.
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -3766,6 +3919,153 @@ fn execute_aggregate_query(
     }
 }
 
+/// S19-incremental — recompute the aggregate output row for ONE
+/// group from the exact set of source rows that belong to it.
+///
+/// Returns `None` when the group fails the query's `HAVING` clause
+/// (the caller treats that as "this group is not currently visible").
+/// `member_rows` must be non-empty and must all share the same group
+/// key — the incremental evaluator guarantees this via its
+/// per-subscription group-membership bitmaps.
+///
+/// This mirrors the per-group logic in `execute_aggregate_query`; the
+/// two MUST stay in lockstep. The equivalence is asserted by
+/// `incremental_aggregate_matches_full_recompute` in the subscription
+/// integration tests.
+pub fn aggregate_one_group(
+    query: &ParsedQuery,
+    store: &ColumnStore,
+    member_rows: &roaring::RoaringBitmap,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    debug_assert!(!member_rows.is_empty(), "aggregate_one_group on empty group");
+    let schema = store.schema();
+    let group_cols = &query.group_by;
+    let group_names: Vec<String> = group_cols
+        .iter()
+        .map(|&c| schema.column_name(c).to_string())
+        .collect();
+    let agg_col_types: Vec<Option<crate::schema::ColumnType>> = query
+        .aggregates
+        .iter()
+        .map(|a| {
+            if a.expr.is_some() {
+                Some(crate::schema::ColumnType::Double)
+            } else {
+                a.col.map(|c| schema.column_type(c))
+            }
+        })
+        .collect();
+
+    let mut states: Vec<AggState> = query
+        .aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, a)| AggState::init_with_q(a.func, agg_col_types[i], a.percentile_q))
+        .collect();
+
+    let mut anchor: Option<u32> = None;
+    for row in member_rows {
+        if anchor.is_none() {
+            anchor = Some(row);
+        }
+        for (i, spec) in query.aggregates.iter().enumerate() {
+            if let Some(num_expr) = &spec.expr {
+                let v = num_expr.eval(store, row);
+                if v.is_nan() {
+                    states[i].update(None);
+                } else {
+                    let val = crate::store::Value::Double(v);
+                    states[i].update(Some(&val));
+                }
+                continue;
+            }
+            match spec.col {
+                None => states[i].update(None),
+                Some(c) => {
+                    let v = store.get(c, row);
+                    states[i].update(Some(&v));
+                }
+            }
+        }
+    }
+    let anchor = anchor.expect("non-empty group has at least one row");
+
+    let mut row_map = serde_json::Map::new();
+    for (i, &c) in group_cols.iter().enumerate() {
+        let part = GroupKeyPart::from_value(&store.get(c, anchor));
+        row_map.insert(group_names[i].clone(), part.to_json());
+    }
+    for (i, spec) in query.aggregates.iter().enumerate() {
+        row_map.insert(spec.alias.clone(), states[i].finalize());
+    }
+    if let Some(h) = query.having.as_ref() {
+        if !h.matches(&row_map) {
+            return None;
+        }
+    }
+    Some(row_map)
+}
+
+/// S19-incremental — compute the canonical group-key string for a
+/// single source row directly from the store, identical to the key
+/// `execute_aggregate_query` output rows hash to via
+/// `subscription::group_key_canonical`. Used by the incremental
+/// aggregate evaluator to route a mutated row to its group bitmap.
+pub fn group_key_canonical_from_store(
+    store: &ColumnStore,
+    row: u32,
+    group_cols: &[usize],
+) -> String {
+    let schema = store.schema();
+    let mut names: Vec<String> = Vec::with_capacity(group_cols.len());
+    let mut m = serde_json::Map::new();
+    for &c in group_cols {
+        let name = schema.column_name(c).to_string();
+        let part = GroupKeyPart::from_value(&store.get(c, row));
+        m.insert(name.clone(), part.to_json());
+        names.push(name);
+    }
+    crate::subscription::group_key_canonical(&m, &names)
+}
+
+/// S19-incremental — build the per-group source-row membership maps
+/// for a `GROUP BY` query: `(group key → matching rows, row → group
+/// key)`. Uses the same candidate planning + predicate + group-key
+/// canonicalisation as `execute_aggregate_query`, so the buckets are
+/// exactly the rows that path would aggregate. `live_rows`, when set,
+/// excludes tombstoned source rows (same filter
+/// `execute_query_with_index_filtered` applies) so deleted rows don't
+/// seed a phantom null-key group. One full scan; the incremental
+/// evaluator is seeded with this once at subscribe time, then
+/// maintains the maps event-by-event.
+pub fn build_group_membership(
+    query: &ParsedQuery,
+    store: &ColumnStore,
+    live_rows: Option<&roaring::RoaringBitmap>,
+) -> (
+    HashMap<String, roaring::RoaringBitmap>,
+    HashMap<u32, String>,
+) {
+    let candidates = plan_candidates(query, store, None);
+    let group_cols = &query.group_by;
+    let mut group_rows: HashMap<String, roaring::RoaringBitmap> = HashMap::new();
+    let mut row_group: HashMap<u32, String> = HashMap::new();
+    candidates.for_each(|row| {
+        if let Some(live) = live_rows {
+            if !live.contains(row) {
+                return;
+            }
+        }
+        if !query.predicate.matches(store, row) {
+            return;
+        }
+        let key = group_key_canonical_from_store(store, row, group_cols);
+        group_rows.entry(key.clone()).or_default().insert(row);
+        row_group.insert(row, key);
+    });
+    (group_rows, row_group)
+}
+
 /// Lexicographic compare over JSON values; tolerant of mixed types
 /// and nulls in the same column (defensive — shouldn't happen in
 /// well-formed group output).
@@ -3799,7 +4099,16 @@ fn compare_values(store: &ColumnStore, col: usize, row_a: u32, row_b: u32) -> Or
         ColumnType::Double => {
             let a = store.get_double(col, row_a);
             let b = store.get_double(col, row_b);
-            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+            // NaN is the NULL sentinel for doubles. Sort NULLs first so
+            // ordering is consistent with Long/Timestamp/Bool (SQL
+            // NULLS FIRST) instead of the arbitrary placement that
+            // `partial_cmp(...).unwrap_or(Equal)` produced for NaN.
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            }
         }
         ColumnType::Long => {
             let a = store.get_long(col, row_a);
@@ -4312,13 +4621,15 @@ pub fn execute_join_query(
         Some(out)
     }
     let right_row_count = right_store.row_count();
-    let mut right_index: HashMap<String, u32> = HashMap::with_capacity(right_row_count as usize);
+    // Multimap: a USING key may map to multiple right rows. An INNER
+    // (or OUTER) equi-join must fan out across all of them — a 1:N
+    // join emits N rows. (review C3: the previous last-write-wins
+    // HashMap silently dropped duplicate-key right rows.)
+    let mut right_index: HashMap<String, Vec<u32>> =
+        HashMap::with_capacity(right_row_count as usize);
     for r in 0..right_row_count {
         if let Some(k) = key_for(right_store, r, &right_using) {
-            // Last-write-wins on duplicate join keys (the right side
-            // is expected to be unique on the USING columns; if it
-            // isn't, we silently dedupe rather than fan-out).
-            right_index.insert(k, r);
+            right_index.entry(k).or_default().push(r);
         }
     }
 
@@ -4406,56 +4717,78 @@ pub fn execute_join_query(
                 continue;
             }
         };
-        // Q12 — AS OF JOIN: find the largest right ts ≤ left.ts among
-        // entries with the matching USING key. Falls through to the
-        // normal `right_index` lookup for all other join kinds.
-        let resolved_rr: Option<u32> = if is_asof {
+        // AS OF JOIN resolves to at most ONE right row (the latest
+        // ts ≤ left.ts for the key). Equi-joins fan out across EVERY
+        // right row sharing the USING key.
+        if is_asof {
+            // Q12 — find the largest right ts ≤ left.ts among entries
+            // with the matching USING key.
             let left_ts = match left_store.get(asof_left_ts_idx.unwrap(), lr) {
                 Value::Timestamp(t) if t != crate::store::NULL_TIMESTAMP => t,
                 Value::Long(t) if t != crate::store::NULL_LONG => t,
                 _ => i64::MIN,
             };
-            asof_index
+            let resolved_rr = asof_index
                 .as_ref()
                 .and_then(|idx| idx.get(&key))
                 .and_then(|entries| {
-                    // Binary-search for largest entry with ts ≤ left_ts.
                     let pos = entries.partition_point(|(ts, _)| *ts <= left_ts);
                     if pos == 0 {
                         None
                     } else {
                         Some(entries[pos - 1].1)
                     }
-                })
-        } else {
-            right_index.get(&key).copied()
-        };
-        match resolved_rr {
-            Some(rr) => {
-                right_matched.insert(rr);
-                row_buf.clear();
-                for (side, src) in &combined_sources {
-                    let v = match side {
-                        Side::Left => left_store.get(*src, lr),
-                        Side::Right => right_store.get(*src, rr),
-                    };
-                    row_buf.push(v);
+                });
+            match resolved_rr {
+                Some(rr) => {
+                    right_matched.insert(rr);
+                    row_buf.clear();
+                    for (side, src) in &combined_sources {
+                        row_buf.push(match side {
+                            Side::Left => left_store.get(*src, lr),
+                            Side::Right => right_store.get(*src, rr),
+                        });
+                    }
+                    combined.append_row(&row_buf);
                 }
-                combined.append_row(&row_buf);
+                None if keep_left_misses => {
+                    row_buf.clear();
+                    for (side, src) in &combined_sources {
+                        row_buf.push(match side {
+                            Side::Left => left_store.get(*src, lr),
+                            Side::Right => Value::Null,
+                        });
+                    }
+                    combined.append_row(&row_buf);
+                }
+                None => {}
             }
-            None => {
-                if !keep_left_misses {
-                    continue;
+        } else {
+            match right_index.get(&key) {
+                Some(rrs) if !rrs.is_empty() => {
+                    for &rr in rrs {
+                        right_matched.insert(rr);
+                        row_buf.clear();
+                        for (side, src) in &combined_sources {
+                            row_buf.push(match side {
+                                Side::Left => left_store.get(*src, lr),
+                                Side::Right => right_store.get(*src, rr),
+                            });
+                        }
+                        combined.append_row(&row_buf);
+                    }
                 }
-                row_buf.clear();
-                for (side, src) in &combined_sources {
-                    let v = match side {
-                        Side::Left => left_store.get(*src, lr),
-                        Side::Right => Value::Null,
-                    };
-                    row_buf.push(v);
+                _ if keep_left_misses => {
+                    row_buf.clear();
+                    for (side, src) in &combined_sources {
+                        row_buf.push(match side {
+                            Side::Left => left_store.get(*src, lr),
+                            Side::Right => Value::Null,
+                        });
+                    }
+                    combined.append_row(&row_buf);
                 }
-                combined.append_row(&row_buf);
+                _ => {}
             }
         }
     }
@@ -4663,6 +4996,125 @@ mod tests {
             ix.add(desk_col, &v, row);
         }
         let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert!(indexed.rows.is_empty());
+    }
+
+    // S47 — `IN (...)` / `OR` index acceleration.
+
+    fn index_on<'a>(schema: &Schema, store: &ColumnStore, cols: &[&str]) -> SecondaryIndex {
+        let col_ids: Vec<usize> = cols.iter().map(|c| schema.index_of(c).unwrap()).collect();
+        let mut ix = SecondaryIndex::new(col_ids.clone());
+        for &col in &col_ids {
+            for row in 0..store.row_count() {
+                ix.add(col, &store.get(col, row), row);
+            }
+        }
+        ix
+    }
+
+    fn syms(res: &QueryResult) -> Vec<String> {
+        let mut v: Vec<String> = res
+            .rows
+            .iter()
+            .map(|r| r.get("symbol").unwrap().as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn indexed_in_string_matches_full_scan() {
+        let (schema, store) = make_store();
+        let query =
+            parse_query("SELECT symbol FROM trades WHERE desk IN ('RATES', 'TECH')", &schema)
+                .unwrap();
+        let ix = index_on(&schema, &store, &["desk"]);
+        let full = execute_query(&query, &store);
+        let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert_eq!(syms(&full), syms(&indexed));
+        assert_eq!(syms(&indexed), vec!["AAPL", "AMZN", "GOOGL"]);
+    }
+
+    #[test]
+    fn indexed_in_numeric_matches_full_scan() {
+        let (schema, store) = make_store();
+        let query =
+            parse_query("SELECT symbol FROM trades WHERE quantity IN (100, 200)", &schema).unwrap();
+        let ix = index_on(&schema, &store, &["quantity"]);
+        let full = execute_query(&query, &store);
+        let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert_eq!(syms(&full), syms(&indexed));
+        assert_eq!(syms(&indexed), vec!["AAPL", "NVDA"]);
+    }
+
+    #[test]
+    fn indexed_or_both_sides_matches_full_scan() {
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT symbol FROM trades WHERE desk = 'RATES' OR desk = 'EQUITIES'",
+            &schema,
+        )
+        .unwrap();
+        let ix = index_on(&schema, &store, &["desk"]);
+        let full = execute_query(&query, &store);
+        let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert_eq!(syms(&full), syms(&indexed));
+        assert_eq!(syms(&indexed), vec!["AAPL", "GOOGL", "MSFT", "NVDA"]);
+    }
+
+    #[test]
+    fn or_with_unindexed_side_falls_back_but_correct() {
+        // `desk` is indexed, `price` is not — the OR can't be bounded by
+        // the index, so we must fall back to a full scan and still return
+        // the correct rows.
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT symbol FROM trades WHERE desk = 'RATES' OR price > 1000",
+            &schema,
+        )
+        .unwrap();
+        let ix = index_on(&schema, &store, &["desk"]);
+        let full = execute_query(&query, &store);
+        let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert_eq!(syms(&full), syms(&indexed));
+        // RATES: AAPL, GOOGL. price>1000: GOOGL(2800), AMZN(3400).
+        assert_eq!(syms(&indexed), vec!["AAPL", "AMZN", "GOOGL"]);
+    }
+
+    #[test]
+    fn in_with_and_intersects_correctly() {
+        // `desk IN ('RATES','EQUITIES') AND quantity IN (100, 200)` —
+        // both columns indexed, candidate is the intersection.
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT symbol FROM trades \
+             WHERE desk IN ('RATES', 'EQUITIES') AND quantity IN (100, 200)",
+            &schema,
+        )
+        .unwrap();
+        let ix = index_on(&schema, &store, &["desk", "quantity"]);
+        let full = execute_query(&query, &store);
+        let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert_eq!(syms(&full), syms(&indexed));
+        // RATES∪EQUITIES = {AAPL,GOOGL,MSFT,NVDA}; qty∈{100,200} = {AAPL,NVDA}.
+        // Intersection: AAPL(RATES,100), NVDA(EQUITIES,200).
+        assert_eq!(syms(&indexed), vec!["AAPL", "NVDA"]);
+    }
+
+    #[test]
+    fn empty_in_list_matches_nothing() {
+        // Defensive: an IN that resolves to no indexed values yields an
+        // empty candidate set — and an empty result.
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT symbol FROM trades WHERE desk IN ('NOPE', 'ALSO_NOPE')",
+            &schema,
+        )
+        .unwrap();
+        let ix = index_on(&schema, &store, &["desk"]);
+        let full = execute_query(&query, &store);
+        let indexed = execute_query_with_index(&query, &store, Some(&ix));
+        assert_eq!(syms(&full), syms(&indexed));
         assert!(indexed.rows.is_empty());
     }
 
@@ -6150,6 +6602,53 @@ mod tests {
         assert!(cusips.contains("AAPL"));
         assert!(!cusips.contains("ORPHAN"));
         assert!(!cusips.contains("UNUSED"));
+    }
+
+    #[test]
+    fn join_fans_out_on_duplicate_right_keys() {
+        // review C3: a 1:N inner join must emit N rows, not silently
+        // collapse to the last-written right row.
+        let left_schema = Arc::new(Schema::from_strs(
+            &["cusip", "qty"],
+            &[ColumnType::String, ColumnType::Long],
+        ));
+        let right_schema = Arc::new(Schema::from_strs(
+            &["cusip", "tag"],
+            &[ColumnType::String, ColumnType::String],
+        ));
+        let mut left = ColumnStore::new(left_schema.clone(), 8);
+        let mut right = ColumnStore::new(right_schema.clone(), 8);
+        left.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::Long(100),
+        ]);
+        // Two right rows with the same USING key.
+        right.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::String(Some(CompactString::new("tagA"))),
+        ]);
+        right.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::String(Some(CompactString::new("tagB"))),
+        ]);
+        let combined = Arc::new(combined_join_schema(
+            &left_schema,
+            &right_schema,
+            &["cusip".to_string()],
+        ));
+        let query = parse_query(
+            "SELECT cusip, tag, qty FROM positions JOIN securities USING (cusip)",
+            &combined,
+        )
+        .unwrap();
+        let result = execute_join_query(&query, &left, &right).unwrap();
+        assert_eq!(result.rows.len(), 2, "1:N join must fan out to 2 rows");
+        let tags: std::collections::HashSet<String> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("tag").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(tags.contains("tagA") && tags.contains("tagB"));
     }
 
     #[test]

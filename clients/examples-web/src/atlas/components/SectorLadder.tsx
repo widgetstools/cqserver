@@ -125,7 +125,7 @@ export function SectorLadder({
                         style={{
                           height: '100%',
                           width: `${pct * 100}%`,
-                          background: 'rgba(255, 96, 98, .65)',
+                          background: 'var(--atlas-neg-bar)',
                           transition: 'width 600ms ease',
                         }}
                       />
@@ -137,7 +137,7 @@ export function SectorLadder({
                         style={{
                           height: '100%',
                           width: `${pct * 100}%`,
-                          background: 'rgba(244, 165, 43, .65)',
+                          background: 'var(--atlas-pos-bar)',
                           transition: 'width 600ms ease',
                         }}
                       />

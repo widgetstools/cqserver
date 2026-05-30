@@ -63,6 +63,9 @@ pub struct TcpConfig {
     /// Query Guardrails (G1+) structural limits. Defaults to
     /// `cq_core::query::QueryLimits::default()`.
     pub query_limits: cq_core::query::QueryLimits,
+    /// S11 synchronous-replication policy for `AckType::Replicated`
+    /// publishes. See [`crate::router::SyncReplication`].
+    pub sync_replication: crate::router::SyncReplication,
 }
 
 impl Default for TcpConfig {
@@ -76,6 +79,7 @@ impl Default for TcpConfig {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         }
     }
 }
@@ -112,6 +116,7 @@ pub async fn start_tcp_server(
             spillover: config.spillover.clone(),
             read_only: config.read_only,
             query_limits: config.query_limits,
+            sync_replication: config.sync_replication,
         };
         let queue_capacity = config.outbound_queue_capacity;
         let tls_acceptor = config.tls_acceptor.clone();
@@ -214,7 +219,12 @@ async fn handle_tcp_connection<S>(
                 loop {
                     match decode_frame(&mut buf) {
                         Ok(Some(payload)) => {
-                            match serde_json::from_slice::<CqMessage>(&payload) {
+                            // S30 — decode with the session's negotiated
+                            // codec. The Logon frame arrives in JSON (the
+                            // default), and handle_logon switches the
+                            // codec during dispatch, so subsequent frames
+                            // are decoded with the negotiated codec.
+                            match session.codec().decode(&payload) {
                                 Ok(cq_msg) => dispatch(&mut session, cq_msg, &ctx),
                                 Err(e) => {
                                     let _ = session.send_message(&CqMessage::error(
@@ -297,6 +307,7 @@ mod tests {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -438,6 +449,7 @@ mod tests {
             spillover: None,
             read_only: true,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -587,6 +599,7 @@ mod tests {
             spillover: None,
             read_only: false,
             query_limits: limits,
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -707,6 +720,7 @@ mod tests {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -816,6 +830,7 @@ mod tests {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             loop {
@@ -1011,6 +1026,7 @@ mod tests {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -1159,6 +1175,7 @@ mod tests {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: crate::router::SyncReplication::default(),
         };
         let server = tokio::spawn(async move {
             loop {

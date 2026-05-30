@@ -71,6 +71,9 @@ async fn spawn_pair(
         let _ = receiver::run(
             receiver::ReceiverConfig {
                 listen_addr: addr.to_string(),
+                token: None,
+                instance_name: String::new(),
+                concurrent: false,
             },
             recv_topics,
         )
@@ -88,6 +91,8 @@ async fn spawn_pair(
             filter,
             transform,
             topic_refs: Default::default(),
+            token: None,
+            instance_name: String::new(),
         })
         .await;
     });

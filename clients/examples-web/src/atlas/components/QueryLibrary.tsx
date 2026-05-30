@@ -16,9 +16,10 @@ import {
 interface QueryLibraryProps {
   selectedId: string;
   onSelect: (q: QueryEntry) => void;
+  compact?: boolean;
 }
 
-export function QueryLibrary({ selectedId, onSelect }: QueryLibraryProps) {
+export function QueryLibrary({ selectedId, onSelect, compact }: QueryLibraryProps) {
   const [filter, setFilter] = useState('');
   const filtered = useMemo<QueryEntry[]>(() => {
     const needle = filter.trim().toLowerCase();
@@ -47,8 +48,8 @@ export function QueryLibrary({ selectedId, onSelect }: QueryLibraryProps) {
       style={{
         position: 'relative',
         zIndex: 1,
-        width: 280,
-        minWidth: 280,
+        width: compact ? 248 : 280,
+        minWidth: compact ? 248 : 280,
         display: 'flex',
         flexDirection: 'column',
         borderRight: '1px solid var(--atlas-rule)',
@@ -57,7 +58,7 @@ export function QueryLibrary({ selectedId, onSelect }: QueryLibraryProps) {
     >
       <div
         style={{
-          padding: '14px 16px 10px',
+          padding: compact ? '10px 12px 8px' : '14px 16px 10px',
           borderBottom: '1px solid var(--atlas-rule)',
         }}
       >

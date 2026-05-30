@@ -7,7 +7,7 @@
 //! the replay.
 
 use crate::segment::list_segments;
-use crate::{TxEntry, TxLogError, MAX_ENTRY_SIZE};
+use crate::{TxEntry, TxLogError, MAX_ENTRY_SIZE, TXLOG_FORMAT_V2};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -86,6 +86,22 @@ impl TxLogReader {
         self.current = None;
     }
 
+    /// Segment id the reader is currently positioned in — the segment the
+    /// next `read_next` will read from, or, once fully drained, the id of
+    /// the last (active) segment. `None` only when the directory has no
+    /// segments at all.
+    ///
+    /// The replication shipper persists this between poll cycles as a
+    /// resume point so it can `skip_to_segment` past already-shipped
+    /// sealed segments instead of rescanning the whole log every tick
+    /// (AMPS keeps an equivalent per-destination journal cursor).
+    pub fn current_segment_id(&self) -> Option<u64> {
+        self.segments
+            .get(self.cursor)
+            .map(|(id, _)| *id)
+            .or_else(|| self.segments.last().map(|(id, _)| *id))
+    }
+
     /// Read every entry from the start of the directory. Stops at the
     /// end of the last segment or a tail-truncation in the last segment.
     pub fn read_all(&mut self) -> Result<Vec<TxEntry>, TxLogError> {
@@ -99,15 +115,17 @@ impl TxLogReader {
     /// Read the next entry, advancing across segment boundaries.
     pub fn read_next(&mut self) -> Result<Option<TxEntry>, TxLogError> {
         loop {
-            if self.current.is_none() {
-                if self.cursor >= self.segments.len() {
-                    return Ok(None);
+            let reader = match self.current.as_mut() {
+                Some(r) => r,
+                None => {
+                    if self.cursor >= self.segments.len() {
+                        return Ok(None);
+                    }
+                    let (_, ref path) = self.segments[self.cursor];
+                    self.current.insert(SegmentReader::open(path)?)
                 }
-                let (_, ref path) = self.segments[self.cursor];
-                self.current = Some(SegmentReader::open(path)?);
-            }
+            };
             let is_last_segment = self.cursor + 1 >= self.segments.len();
-            let reader = self.current.as_mut().expect("just set");
             match reader.read_next(is_last_segment)? {
                 Some(entry) => {
                     self.global_offset += entry.frame_bytes;
@@ -299,6 +317,14 @@ fn parse_body(body: &[u8], offset: u64) -> Result<TxEntry, TxLogError> {
         Ok(slice)
     };
 
+    // Detect V2 (origin-tagged) bodies by the leading marker byte. Legacy V1
+    // bodies begin with the high byte of `sequence` (0x00 in practice), so the
+    // 0x01 marker is unambiguous.
+    let v2 = body.first() == Some(&TXLOG_FORMAT_V2);
+    if v2 {
+        cur += 1;
+    }
+
     let seq_bytes = take(&mut cur, 8)?;
     let sequence = u64::from_be_bytes([
         seq_bytes[0], seq_bytes[1], seq_bytes[2], seq_bytes[3], seq_bytes[4], seq_bytes[5],
@@ -325,6 +351,17 @@ fn parse_body(body: &[u8], offset: u64) -> Result<TxEntry, TxLogError> {
         .map_err(|_| TxLogError::Utf8 { offset })?
         .to_string();
 
+    let origin = if v2 {
+        let origin_len_bytes = take(&mut cur, 2)?;
+        let origin_len = u16::from_be_bytes([origin_len_bytes[0], origin_len_bytes[1]]) as usize;
+        let origin_bytes = take(&mut cur, origin_len)?;
+        std::str::from_utf8(origin_bytes)
+            .map_err(|_| TxLogError::Utf8 { offset })?
+            .to_string()
+    } else {
+        String::new()
+    };
+
     let payload = body[cur..].to_vec();
 
     Ok(TxEntry {
@@ -332,6 +369,7 @@ fn parse_body(body: &[u8], offset: u64) -> Result<TxEntry, TxLogError> {
         timestamp_ms,
         topic,
         key,
+        origin,
         payload,
     })
 }
@@ -362,6 +400,59 @@ mod tests {
         assert_eq!(entries[0].key, "AAPL");
         assert_eq!(entries[0].payload, b"{\"price\":150}");
         assert!(!entries[0].is_tombstone());
+    }
+
+    #[test]
+    fn legacy_entry_has_empty_origin() {
+        let dir = tempdir().unwrap();
+        {
+            let mut w = TxLogWriter::open(dir.path(), FsyncPolicy::None).unwrap();
+            w.append(1, "/trades", "AAPL", b"{\"price\":150}").unwrap();
+            w.sync().unwrap();
+        }
+        let entries = TxLogReader::open(dir.path()).unwrap().read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].origin, "");
+    }
+
+    #[test]
+    fn origin_tagged_entry_roundtrips() {
+        let dir = tempdir().unwrap();
+        {
+            let mut w = TxLogWriter::open(dir.path(), FsyncPolicy::None).unwrap();
+            w.append_with_origin(1, "/trades", "AAPL", "node-a", b"{\"price\":150}")
+                .unwrap();
+            w.append_with_origin(2, "/trades", "MSFT", "node-b", b"")
+                .unwrap();
+            w.sync().unwrap();
+        }
+        let entries = TxLogReader::open(dir.path()).unwrap().read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].topic, "/trades");
+        assert_eq!(entries[0].key, "AAPL");
+        assert_eq!(entries[0].origin, "node-a");
+        assert_eq!(entries[0].payload, b"{\"price\":150}");
+        assert_eq!(entries[1].origin, "node-b");
+        assert!(entries[1].is_tombstone());
+    }
+
+    #[test]
+    fn mixed_legacy_and_origin_entries_roundtrip() {
+        let dir = tempdir().unwrap();
+        {
+            let mut w = TxLogWriter::open(dir.path(), FsyncPolicy::None).unwrap();
+            w.append(1, "/t", "k1", b"v1").unwrap();
+            w.append_with_origin(2, "/t", "k2", "origin-x", b"v2")
+                .unwrap();
+            w.sync().unwrap();
+        }
+        let entries = TxLogReader::open(dir.path()).unwrap().read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].origin, "");
+        assert_eq!(entries[0].payload, b"v1");
+        assert_eq!(entries[1].origin, "origin-x");
+        assert_eq!(entries[1].payload, b"v2");
     }
 
     #[test]

@@ -1,18 +1,10 @@
 /**
  * QueryResult — result grid for Chapter 08, dual-mode.
  *
- *   - live mode  : bound to a SubscriptionHandle from useLiveQuery;
- *                  seeds rowData from getSnapshot() then ticks via
- *                  applyTransactionAsync — same race-safe pattern
- *                  DataTable uses.
- *   - static mode: takes a flat Row[] (the SOW result of a one-shot
- *                  multi-topic JOIN) and renders frozen.
- *
- * Column defs are inferred per Run from the first row: number cols
- * get a thousands-separator formatter; *_bps gets bps; *_usd / pnl /
- * fees / notional get currency.
+ * Live: SOW seeds rowData once; ticks via gridApi.applyTransaction.
+ * Static: rowData set once per query run.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import {
   AllCommunityModule,
@@ -20,9 +12,18 @@ import {
   type ColDef,
   type GridApi,
   type GridReadyEvent,
+  type GetRowIdParams,
 } from 'ag-grid-community';
 import { AllEnterpriseModule } from 'ag-grid-enterprise';
 import { getAtlasGridTheme } from '../aggrid';
+import {
+  ATLAS_LIVE_DEFAULT_COL_DEF,
+  ATLAS_LIVE_GRID_PROPS,
+  ATLAS_STATUS_BAR,
+  enrichColDefsForLiveFlash,
+} from '../aggridLive';
+import { useLiveGridSync } from '../hooks/useLiveGridSync';
+import { useAtlasTheme } from '../theme/ThemeContext';
 import type { SubscriptionHandle, Row } from '@/lib/use-subscription';
 
 ModuleRegistry.registerModules([AllCommunityModule, AllEnterpriseModule]);
@@ -30,12 +31,11 @@ ModuleRegistry.registerModules([AllCommunityModule, AllEnterpriseModule]);
 interface QueryResultProps {
   title?: string;
   status?: string;
-  /** Set in live mode. Ignored in static mode. */
   liveSubscription?: SubscriptionHandle;
-  /** Set in static mode. Ignored in live mode. */
   staticRows?: Row[];
-  /** Stable row id extractor. Required in live mode. */
-  getRowId?: (row: Row) => string;
+  getRowId: (row: Row) => string;
+  /** Hide the title/status strip — status lives in the SQL toolbar instead. */
+  compact?: boolean;
 }
 
 export function QueryResult({
@@ -44,75 +44,69 @@ export function QueryResult({
   liveSubscription,
   staticRows,
   getRowId,
+  compact,
 }: QueryResultProps) {
-  const theme = useMemo(() => getAtlasGridTheme(), []);
+  const { theme } = useAtlasTheme();
+  const gridTheme = useMemo(() => getAtlasGridTheme(theme), [theme]);
   const apiRef = useRef<GridApi<Row> | null>(null);
-  const seededRef = useRef<SubscriptionHandle | null>(null);
-  const [boundRows, setBoundRows] = useState<Row[] | null>(null);
 
-  // Live-mode seed + delta wiring — mirrors DataTable race-safe
-  // pattern. Identity change wipes; getSnapshot drives the seed;
-  // subscribeSnapshotChunks + subscribeStatus retrigger seed checks;
-  // subscribeDeltas does applyTransactionAsync.
-  useEffect(() => {
-    if (!liveSubscription) return;
-    if (seededRef.current !== liveSubscription) {
-      seededRef.current = liveSubscription;
-      setBoundRows(null);
-      apiRef.current?.setGridOption('rowData', []);
-    }
-    const trySeed = () => {
-      if (seededRef.current !== liveSubscription) return;
-      if (boundRows !== null) return;
-      const snap = liveSubscription.getSnapshot();
-      if (liveSubscription.getStatus() !== 'live' && snap.length === 0) return;
-      setBoundRows(snap as Row[]);
-    };
-    trySeed();
-    const offS = liveSubscription.subscribeStatus(trySeed);
-    const offC = liveSubscription.subscribeSnapshotChunks(() => trySeed());
-    const offD = liveSubscription.subscribeDeltas((batch) => {
-      const api = apiRef.current;
-      if (!api) return;
-      api.applyTransactionAsync({
-        add: batch.add as Row[],
-        update: batch.update as Row[],
-        remove: batch.remove as Row[],
-      });
-    });
-    return () => { offS(); offC(); offD(); };
-    // boundRows intentionally excluded — see DataTable for rationale.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveSubscription]);
-
-  // Effective rows — live mode reads from boundRows; static mode
-  // takes the prop array directly.
-  const effective = liveSubscription
-    ? (boundRows ?? [])
-    : (staticRows ?? []);
-
-  // Cols inferred from the first row of the current dataset.
-  const sampleRow = effective.length > 0 ? effective[0] : null;
-  const colDefs = useMemo<ColDef[]>(
-    () => inferColDefs(effective),
-    // Recompute only when the sample row's identity changes — most
-    // tick batches reuse the same prototype shape so this is cheap.
-    [sampleRow],
+  const { sowRowData, onGridReady: syncOnGridReady } = useLiveGridSync(
+    liveSubscription,
+    apiRef,
+    getRowId,
   );
 
-  // Inject per-column flash when bound to a live sub — same AG-Grid
-  // v35 requirement DataTable handles.
+  const staticSeedRef = useRef<Row[] | undefined>(undefined);
+  useEffect(() => {
+    if (liveSubscription) {
+      staticSeedRef.current = undefined;
+      return;
+    }
+    const next = staticRows ?? [];
+    if (next === staticSeedRef.current) return;
+    staticSeedRef.current = next;
+    apiRef.current?.setGridOption('rowData', next);
+  }, [staticRows, liveSubscription]);
+
+  const rowData = liveSubscription ? sowRowData : staticRows;
+
+  const colKeySig = useMemo(() => {
+    const sample = rowData?.[0];
+    if (!sample) return '';
+    return Object.keys(sample).sort().join('\0');
+  }, [rowData]);
+
+  // Keyed on the column signature only: the column shape is what drives
+  // the defs, and in live mode `rowData` (the SOW seed) is set once but
+  // its reference can churn — re-running the O(rows×cols) inference on a
+  // mere reference change is wasted work. `colKeySig` already captures
+  // every structural change we care about.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const colDefs = useMemo<ColDef[]>(() => inferColDefs(rowData ?? []), [colKeySig]);
+
   const flashColDefs = useMemo<ColDef[]>(
-    () =>
-      liveSubscription
-        ? colDefs.map((c) => ({ ...c, enableCellChangeFlash: true }))
-        : colDefs,
+    () => (liveSubscription ? enrichColDefsForLiveFlash(colDefs) : colDefs),
     [colDefs, liveSubscription],
   );
 
+  const defaultColDef = useMemo<ColDef>(
+    () => (liveSubscription ? ATLAS_LIVE_DEFAULT_COL_DEF : {}),
+    [liveSubscription],
+  );
+
   const agGetRowId = useMemo(
-    () => (getRowId ? ({ data }: { data: Row }) => getRowId(data) : undefined),
+    () => (params: GetRowIdParams<Row>) => getRowId(params.data),
     [getRowId],
+  );
+
+  const handleGridReady = useCallback(
+    (e: GridReadyEvent<Row>) => {
+      syncOnGridReady(e.api);
+      if (!liveSubscription && staticRows && staticRows.length > 0) {
+        e.api.setGridOption('rowData', staticRows);
+      }
+    },
+    [syncOnGridReady, liveSubscription, staticRows],
   );
 
   return (
@@ -122,10 +116,10 @@ export function QueryResult({
         display: 'flex',
         flexDirection: 'column',
         minHeight: 0,
-        padding: '12px 18px 0',
+        padding: compact ? '6px 14px 0' : '12px 18px 0',
       }}
     >
-      {(title || status) && (
+      {!compact && (title || status) && (
         <div
           style={{
             display: 'flex',
@@ -142,16 +136,18 @@ export function QueryResult({
           ) : null}
         </div>
       )}
-      <div style={{ flex: 1, minHeight: 180, width: '100%', height: '100%' }}>
+      <div style={{ flex: 1, minHeight: compact ? 0 : 180, width: '100%', height: '100%' }}>
         <AgGridReact<Row>
-          theme={theme}
-          rowData={effective}
+          theme={gridTheme}
+          rowData={rowData}
           columnDefs={flashColDefs}
+          defaultColDef={defaultColDef}
           rowHeight={26}
           headerHeight={28}
-          animateRows={false}
           getRowId={agGetRowId}
-          onGridReady={(e: GridReadyEvent<Row>) => { apiRef.current = e.api; }}
+          onGridReady={handleGridReady}
+          statusBar={ATLAS_STATUS_BAR}
+          {...(liveSubscription ? ATLAS_LIVE_GRID_PROPS : { animateRows: false })}
         />
       </div>
     </div>
@@ -161,8 +157,13 @@ export function QueryResult({
 function inferColDefs(rows: Row[]): ColDef[] {
   if (!rows || rows.length === 0) return [];
   const sample = rows[0];
+  // Probe only a bounded prefix for type inference: scanning the whole
+  // result set (worst case O(rows) per column when a column is mostly
+  // null) is pointless — the first non-null in the first ~100 rows is a
+  // reliable type witness.
+  const probeRows = rows.length > 100 ? rows.slice(0, 100) : rows;
   return Object.keys(sample).map((k): ColDef => {
-    const probe = rows.find((r) => r[k] != null)?.[k];
+    const probe = probeRows.find((r) => r[k] != null)?.[k];
     const isNumber = typeof probe === 'number';
     const lk = k.toLowerCase();
     let valueFormatter: ColDef['valueFormatter'];

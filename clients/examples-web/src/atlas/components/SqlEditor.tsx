@@ -11,15 +11,14 @@ interface SqlEditorProps {
   value: string;
   onChange: (v: string) => void;
   onRun: () => void;
-  /** Right-side status, e.g. '5,210 rows · 32 ms · live' or '—'. */
   status?: string;
-  /** Error message; renders red when set. */
   error?: string | null;
-  /** Disables the Run button while a query is opening. */
   busy?: boolean;
+  /** Tighter layout for the Query tab — shorter editor, less chrome. */
+  compact?: boolean;
 }
 
-export function SqlEditor({ value, onChange, onRun, status, error, busy }: SqlEditorProps) {
+export function SqlEditor({ value, onChange, onRun, status, error, busy, compact }: SqlEditorProps) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Cmd/Ctrl+Enter to run.
@@ -41,7 +40,9 @@ export function SqlEditor({ value, onChange, onRun, status, error, busy }: SqlEd
       style={{
         display: 'flex',
         flexDirection: 'column',
+        flexShrink: compact ? 0 : undefined,
         minHeight: 0,
+        maxHeight: compact ? 'min(28vh, 168px)' : undefined,
         borderBottom: '1px solid var(--atlas-rule)',
       }}
     >
@@ -50,13 +51,30 @@ export function SqlEditor({ value, onChange, onRun, status, error, busy }: SqlEd
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          padding: '10px 18px',
+          padding: compact ? '6px 14px' : '10px 18px',
           borderBottom: '1px solid var(--atlas-rule)',
+          gap: 12,
         }}
       >
-        <div style={{ fontSize: 11, letterSpacing: '.22em', color: 'var(--atlas-fg-dim)' }}>
-          SQL · editable · ⌘↩ to run
+        <div style={{ fontSize: compact ? 10 : 11, letterSpacing: '.22em', color: 'var(--atlas-fg-dim)', flexShrink: 0 }}>
+          SQL · ⌘↩ run
         </div>
+        {status ? (
+          <div
+            style={{
+              flex: 1,
+              textAlign: compact ? 'left' : 'right',
+              fontSize: 10,
+              color: error ? 'var(--atlas-neg)' : 'var(--atlas-fg-faint)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              minWidth: 0,
+            }}
+          >
+            {error ?? status}
+          </div>
+        ) : null}
         <button
           onClick={onRun}
           disabled={busy}
@@ -82,10 +100,10 @@ export function SqlEditor({ value, onChange, onRun, status, error, busy }: SqlEd
         onChange={(e) => onChange(e.target.value)}
         spellCheck={false}
         style={{
-          flex: 1,
-          minHeight: 180,
+          flex: compact ? '1 1 auto' : 1,
+          minHeight: compact ? 72 : 180,
           width: '100%',
-          padding: '12px 18px',
+          padding: compact ? '8px 14px' : '12px 18px',
           background: 'var(--atlas-ink-2)',
           color: 'var(--atlas-fg)',
           border: 'none',
@@ -97,21 +115,23 @@ export function SqlEditor({ value, onChange, onRun, status, error, busy }: SqlEd
           tabSize: 2,
         }}
       />
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '8px 18px',
-          fontSize: 10,
-          borderTop: '1px solid var(--atlas-rule)',
-          background: 'var(--atlas-surface)',
-        }}
-      >
-        <div style={{ color: error ? 'var(--atlas-neg)' : 'var(--atlas-fg-faint)' }}>
-          {error ?? status ?? '—'}
+      {!compact ? (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '8px 18px',
+            fontSize: 10,
+            borderTop: '1px solid var(--atlas-rule)',
+            background: 'var(--atlas-surface)',
+          }}
+        >
+          <div style={{ color: error ? 'var(--atlas-neg)' : 'var(--atlas-fg-faint)' }}>
+            {error ?? status ?? '—'}
+          </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }

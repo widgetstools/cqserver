@@ -63,7 +63,7 @@ fn build_view(
         None,
     )
     .expect("new view");
-    let _ = spawn_view_runner(view.clone(), tap_rx);
+    let _ = spawn_view_runner(view.clone(), tap_rx).expect("spawn view runner");
     (view, view_topic_arc)
 }
 
@@ -213,6 +213,69 @@ fn view_removes_group_when_source_delete_empties_it() {
             .collect();
         desks.contains("RATES") && !desks.contains("FX")
     });
+}
+
+#[test]
+fn incremental_view_converges_under_spaced_single_events() {
+    // Each publish is separated by more than QUIET_WINDOW so the runner
+    // wakes per event with a batch of size 1 — forcing the incremental
+    // path (not the large-burst full-refresh fallback). The view must
+    // still equal a from-scratch aggregate, and refresh_count must stay
+    // at the baseline (incremental updates don't bump it).
+    let src = make_source();
+    let (view, vtopic) = build_view(
+        src.clone(),
+        "SELECT desk, SUM(qty) AS total, COUNT(*) AS n FROM t GROUP BY desk",
+        "/trades_by_desk_incr",
+    );
+    assert!(view.supports_incremental());
+    let baseline = view.refresh_count();
+
+    let step = |k: &str, desk: &str, qty: i64| {
+        publish(&src, k, desk, qty);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    };
+    step("alice", "RATES", 100);
+    step("bob", "RATES", 200); // RATES total 300, n2
+    step("carol", "FX", 50);
+    step("alice", "EQUITIES", 75); // alice leaves RATES → RATES 200/n1, EQUITIES 75/n1
+    src.delete("bob").expect("delete"); // RATES empties → group removed
+    std::thread::sleep(std::time::Duration::from_millis(120));
+
+    wait_for(|| {
+        let view_rows = vtopic.query("SELECT desk FROM t").unwrap();
+        let desks: std::collections::HashSet<String> = view_rows
+            .rows
+            .iter()
+            .filter_map(|r| r.get("desk").and_then(Value::as_str).map(String::from))
+            .collect();
+        desks == ["FX", "EQUITIES"].iter().map(|s| s.to_string()).collect()
+    });
+
+    let source_agg = src
+        .query("SELECT desk, SUM(qty) AS total, COUNT(*) AS n FROM t GROUP BY desk")
+        .expect("source aggregate");
+    let view_rows = vtopic
+        .query("SELECT desk, total, n FROM t")
+        .expect("view query");
+    let canon = |rows: Vec<Map<String, Value>>| -> std::collections::BTreeMap<String, (i64, i64)> {
+        rows.into_iter()
+            .filter_map(|r| {
+                let d = r.get("desk").and_then(Value::as_str)?.to_string();
+                let t = r.get("total").and_then(Value::as_i64)?;
+                let n = r.get("n").and_then(Value::as_i64)?;
+                Some((d, (t, n)))
+            })
+            .collect()
+    };
+    assert_eq!(canon(source_agg.rows), canon(view_rows.rows));
+    // The whole run went through the incremental path: no full refreshes
+    // beyond the initial population.
+    assert_eq!(
+        view.refresh_count(),
+        baseline,
+        "spaced single-event stream should not trigger any full refresh"
+    );
 }
 
 #[test]

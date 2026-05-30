@@ -35,6 +35,18 @@ export function hasJoin(sql) {
   return /\bjoin\b/i.test(sql);
 }
 
+// Mirror of detectRunMode() in src/atlas/scopes/query.ts: the query
+// builder runs JOINs and derived-table queries (`FROM (subquery)`) as
+// one-shot static SOW, everything else as a live subscription. A live
+// subscribe on a derived-table query returns an empty snapshot, so the
+// builder must route those to static.
+export function isStaticQuery(sql) {
+  const stripped = sql
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ');
+  return /\bjoin\b/i.test(stripped) || /\bfrom\s*\(/i.test(stripped);
+}
+
 export function stripAliases(sql) {
   const aliasRe = /(?:from|join)\s+(\w+)\s+(\w+)\b/gi;
   const aliases = [];

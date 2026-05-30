@@ -8,7 +8,7 @@ export const VIEW_CHIPS: readonly ChipSpec[] = [
 ];
 
 export const VIEW_COL_DEFS: ColDef[] = [
-  { field: 'book_name', headerName: 'book', width: 160, cellStyle: { color: '#f4a52b' } },
+  { field: 'book_name', headerName: 'book', width: 160, cellStyle: { color: 'var(--atlas-amber)' } },
   { field: 'asset_class', headerName: 'asset', width: 120 },
   { field: 'currency', headerName: 'ccy', width: 70 },
   { field: 'n_positions', headerName: 'n_positions', width: 120, type: 'numericColumn',
@@ -17,7 +17,7 @@ export const VIEW_COL_DEFS: ColDef[] = [
     valueFormatter: (p) => fmtSignedMillions(p.value as number),
     cellStyle: (p) =>
       typeof p.value === 'number' && p.value < 0 ? { color: '#ff6062' } :
-      typeof p.value === 'number' ? { color: '#f4a52b' } : null },
+      typeof p.value === 'number' ? { color: 'var(--atlas-amber)' } : null },
   { field: 'gross_exposure', headerName: 'gross', width: 130, type: 'numericColumn',
     valueFormatter: (p) => fmtMillions(p.value as number) },
   { field: 'net_dv01', headerName: 'dv01', width: 110, type: 'numericColumn',

@@ -68,6 +68,11 @@ pub struct AdminState {
     /// Per-view teardown info so DELETE /admin/views can stop a view's
     /// runner (soft delete; the evaluator lingers until restart).
     pub view_teardown: Arc<dashmap::DashMap<String, crate::ViewTeardown>>,
+    /// Optional bearer token. When `Some`, every route except
+    /// `GET /healthz` requires a matching `Authorization: Bearer` header.
+    /// `None` leaves the API open (the port binds to loopback by
+    /// default). See `ServerConfig::admin_token`.
+    pub admin_token: Arc<Option<String>>,
 }
 
 /// Captured replication topology for `/admin/replication`.
@@ -87,10 +92,12 @@ pub async fn start_admin_server(
     addr: String,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut app = Router::new()
+    // Everything except the liveness probe sits behind the optional
+    // bearer-token guard. `/healthz` stays open so orchestrators can
+    // probe without a credential.
+    let protected = Router::new()
         .route("/", get(admin_ui))
         .route("/fi-demo", get(fi_demo_ui))
-        .route("/healthz", get(healthz))
         .route("/stats", get(get_stats))
         .route("/topics", get(get_topics))
         .route("/subscriptions", get(get_subscriptions))
@@ -109,6 +116,13 @@ pub async fn start_admin_server(
         .route("/admin/config", get(get_config_toml))
         .route("/admin/clients", get(get_clients))
         .route("/admin/add-column/:topic", post(add_column_endpoint))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_token,
+        ));
+
+    let mut app = protected
+        .route("/healthz", get(healthz))
         .with_state(state);
 
     // U7: serve the admin-ui static bundle under /ui. Resolved
@@ -176,6 +190,60 @@ async fn fi_demo_ui() -> impl IntoResponse {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Bearer-token guard for the admin API. No-op when `admin_token` is
+/// unset (open API, loopback-bound by default). When set, requires
+/// `Authorization: Bearer <token>` with a constant-time-compared match;
+/// otherwise responds `401 Unauthorized`.
+async fn require_admin_token(
+    State(state): State<AdminState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(expected) = state.admin_token.as_ref() else {
+        return next.run(req).await;
+    };
+
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    let ok = match presented {
+        Some(tok) => constant_time_eq(tok.as_bytes(), expected.as_bytes()),
+        None => false,
+    };
+
+    if ok {
+        next.run(req).await
+    } else {
+        metrics::counter!("cq_admin_unauthorized_total").increment(1);
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
+}
+
+/// Length-independent byte comparison to avoid leaking the token via
+/// response timing. Folds length differences into the result so the
+/// comparison time doesn't reveal a prefix match.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // Seed with a plain length-mismatch flag. The previous
+    // `(a.len() ^ b.len()) as u8` truncated to 8 bits, so a length
+    // difference that happened to be an exact multiple of 256 folded to
+    // zero and was only caught incidentally by the byte loop.
+    let mut diff: u8 = (a.len() != b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    // The loop has no early exit; black_box additionally stops the
+    // optimizer from short-circuiting the accumulation, preserving the
+    // length-independent timing this function exists to provide.
+    std::hint::black_box(diff) == 0
 }
 
 async fn get_stats(State(s): State<AdminState>) -> impl IntoResponse {
@@ -403,8 +471,12 @@ async fn rotate_journal(
         )
             .into_response();
     }
-    match topic_arc.force_rotate_txlog() {
-        Ok(()) => (
+    // force_rotate_txlog seals the segment with an fsync — blocking disk
+    // I/O. Run it off the runtime so a slow disk can't stall the admin
+    // worker (and with it /healthz).
+    let rotated = tokio::task::spawn_blocking(move || topic_arc.force_rotate_txlog()).await;
+    match rotated {
+        Ok(Ok(())) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "topic": topic,
@@ -412,9 +484,14 @@ async fn rotate_journal(
             })),
         )
             .into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("rotate failed: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rotate task failed: {e}"),
         )
             .into_response(),
     }
@@ -447,13 +524,21 @@ async fn shrink_store(
 /// `POST /admin/shrink-store-all` — shrink every topic. One-shot
 /// convenience for "I want my memory back now" after a load test.
 async fn shrink_store_all(State(s): State<AdminState>) -> impl IntoResponse {
-    let results: Vec<serde_json::Value> = s
+    // Snapshot (name, topic) first so we don't hold a DashMap shard read
+    // lock while each shrink_store() acquires the topic write lock — that
+    // would stall publishers and the evaluator on every topic in the
+    // shard for the duration of the shrink.
+    let snapshot: Vec<_> = s
         .topics
         .iter()
-        .map(|e| {
-            let (old, new) = e.value().shrink_store();
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    let results: Vec<serde_json::Value> = snapshot
+        .into_iter()
+        .map(|(name, topic)| {
+            let (old, new) = topic.shrink_store();
             serde_json::json!({
-                "topic": e.key(),
+                "topic": name,
                 "oldCapacity": old,
                 "newCapacity": new,
                 "reclaimedRows": old.saturating_sub(new),
@@ -559,14 +644,25 @@ async fn create_view(
             let canonical = cq_core::topic::canonicalize_topic(&entry.name);
             s.view_names.insert(canonical.clone());
             s.view_teardown.insert(canonical, teardown);
-            if let Err(e) = crate::config::persist_runtime_view(&s.runtime_views_path, &entry) {
+            // persist_runtime_view does a read-modify-write + rename of the
+            // runtime-views TOML — blocking disk I/O; run it off the
+            // runtime worker.
+            let path = s.runtime_views_path.clone();
+            let entry_for_persist = entry.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                crate::config::persist_runtime_view(&path, &entry_for_persist)
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            let persist_err = match persisted {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("view created but persistence failed: {e}")),
+                Err(e) => Some(format!("view created but persistence task failed: {e}")),
+            };
+            if let Some(msg) = persist_err {
                 // Live but not persisted — surface so the operator knows
                 // it won't survive restart.
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("view created but persistence failed: {e}"),
-                )
-                    .into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
             }
             (
                 StatusCode::CREATED,
@@ -621,12 +717,22 @@ async fn delete_view(
     }
     s.topics.remove(&canonical);
     s.view_names.remove(&canonical);
-    if let Err(e) = crate::config::remove_runtime_view(&s.runtime_views_path, &canonical) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("view stopped but de-persist failed: {e}"),
-        )
-            .into_response();
+    // remove_runtime_view rewrites the runtime-views TOML — blocking disk
+    // I/O; run it off the runtime worker.
+    let path = s.runtime_views_path.clone();
+    let canonical_for_remove = canonical.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        crate::config::remove_runtime_view(&path, &canonical_for_remove)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    let remove_err = match removed {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(format!("view stopped but de-persist failed: {e}")),
+        Err(e) => Some(format!("view stopped but de-persist task failed: {e}")),
+    };
+    if let Some(msg) = remove_err {
+        return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
     }
     (StatusCode::OK, Json(serde_json::json!({ "deleted": canonical }))).into_response()
 }
@@ -813,6 +919,7 @@ mod tests {
             runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
             view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
             view_teardown: Arc::new(dashmap::DashMap::new()),
+            admin_token: Arc::new(None),
         };
         Router::new()
             .route("/healthz", get(healthz))
@@ -821,6 +928,90 @@ mod tests {
             .route("/admin/catalog", get(get_catalog))
             .route("/metrics", get(get_metrics))
             .with_state(state)
+    }
+
+    /// Build a router whose `/stats` is behind the bearer guard while
+    /// `/healthz` stays open, mirroring `start_admin_server`'s layering.
+    fn token_router(token: Option<&str>) -> Router {
+        let topics: Arc<DashMap<String, SharedTopic>> = Arc::new(DashMap::new());
+        let prom = PrometheusBuilder::new().build_recorder().handle();
+        let state = AdminState {
+            topics,
+            registry: new_registry(),
+            queues: cq_transport::queue::new_queue_registry(),
+            prom,
+            shards: Arc::new(Vec::new()),
+            self_url: Arc::new("ws://127.0.0.1:9000/cqp".to_string()),
+            views: Arc::new(Vec::new()),
+            replication: Arc::new(ReplicationView {
+                role: "standalone".into(),
+                peer: None,
+                peers: Vec::new(),
+                listen: None,
+            }),
+            raw_config_toml: Arc::new(String::new()),
+            view_names: Arc::new(dashmap::DashSet::new()),
+            runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
+            view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            view_teardown: Arc::new(dashmap::DashMap::new()),
+            admin_token: Arc::new(token.map(str::to_string)),
+        };
+        let protected = Router::new()
+            .route("/stats", get(get_stats))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_token,
+            ));
+        protected
+            .route("/healthz", get(healthz))
+            .with_state(state)
+    }
+
+    async fn status_of(router: Router, req: Request<Body>) -> StatusCode {
+        router.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn admin_token_unset_allows_all() {
+        let r = token_router(None);
+        let req = Request::builder().uri("/stats").body(Body::empty()).unwrap();
+        assert_eq!(status_of(r, req).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_token_set_rejects_missing_and_wrong() {
+        let r = token_router(Some("s3cret"));
+        // Missing header.
+        let req = Request::builder().uri("/stats").body(Body::empty()).unwrap();
+        assert_eq!(status_of(r, req).await, StatusCode::UNAUTHORIZED);
+
+        // Wrong token.
+        let r = token_router(Some("s3cret"));
+        let req = Request::builder()
+            .uri("/stats")
+            .header(header::AUTHORIZATION, "Bearer nope")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(r, req).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_token_set_accepts_correct_and_healthz_open() {
+        let r = token_router(Some("s3cret"));
+        let req = Request::builder()
+            .uri("/stats")
+            .header(header::AUTHORIZATION, "Bearer s3cret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(r, req).await, StatusCode::OK);
+
+        // Liveness probe is exempt even with a token configured.
+        let r = token_router(Some("s3cret"));
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(r, req).await, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -906,6 +1097,7 @@ mod tests {
             runtime_views_path: Arc::new(std::path::PathBuf::from("/dev/null")),
             view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
             view_teardown: Arc::new(dashmap::DashMap::new()),
+            admin_token: Arc::new(None),
         };
         Router::new()
             .route("/admin/shard-for/:topic", get(shard_for))

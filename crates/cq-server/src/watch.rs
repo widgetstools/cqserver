@@ -141,6 +141,34 @@ async fn run(
                 }
             }
 
+            // A degraded route has irrecoverably lost a Remove/OOF delta,
+            // so its client is serving a phantom row. Rate thresholds
+            // don't apply — a single lost removal is permanent corruption.
+            // Log loudly always; evict to force re-establishment when the
+            // operator has opted into server-initiated disconnects.
+            // (Eviction frees server-side state and, for clients that
+            // monitor subscription liveness, prompts a fresh SOW. A true
+            // client-side resync signal would need a protocol addition.)
+            if st.degraded {
+                metrics::counter!(
+                    "cq_subscription_degraded_total",
+                    "topic" => st.topic.clone()
+                )
+                .increment(1);
+                tracing::error!(
+                    sub = %st.sub_id,
+                    topic = %st.topic,
+                    session = %st.session_id,
+                    auto_disconnect = cfg.auto_disconnect,
+                    "Subscription degraded (lost Remove/OOF); client view is stale \
+                     and must resync"
+                );
+                if cfg.auto_disconnect {
+                    disconnect(&registry, &topics, &st.sub_id, &st.topic);
+                    continue;
+                }
+            }
+
             if warned && cfg.auto_disconnect {
                 disconnect(&registry, &topics, &st.sub_id, &st.topic);
             }

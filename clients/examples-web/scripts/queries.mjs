@@ -38,7 +38,7 @@ export const QUERIES = [
   {
     "id": "fl-2",
     "feature": "filter",
-    "sql": "SELECT trade_id, trade_ts, symbol, side, notional_usd\nFROM trades\nWHERE execution_venue IN ('NYSE','NASDAQ','BATS')\n  AND trade_ts BETWEEN '2026-05-01' AND '2026-05-22'\n  AND ABS(slippage_arrival_bps) > 5;",
+    "sql": "SELECT trade_id, trade_ts, symbol, side, notional_usd\nFROM trades\nWHERE execution_venue IN ('NYSE','NASDAQ','BATS')\n  AND trade_ts BETWEEN '2026-05-01' AND '2026-12-31'\n  AND ABS(slippage_arrival_bps) > 5;",
     "title": "IN + BETWEEN range filter"
   },
   {

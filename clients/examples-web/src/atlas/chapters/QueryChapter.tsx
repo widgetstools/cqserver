@@ -1,17 +1,16 @@
 /**
- * Query — Chapter 08, Ad-Hoc SQL. The catalog rail on the left, an
- * editable SQL editor top right, a result grid bottom right. The
- * runner forks by mode (see scopes/query.ts comment): live for
- * single-topic queries, static for multi-topic JOIN queries.
+ * Query — Chapter 08, Ad-Hoc SQL. Catalog rail on the left; SQL editor
+ * and result grid on the right. Runner forks live vs static by JOIN
+ * detection (see scopes/query.ts).
  */
 import { useMemo, useState } from 'react';
-import { ChapterHead, HeroMetric } from '../components/ChapterHead';
-import { KpiStrip, type Kpi } from '../components/KpiStrip';
 import { QueryLibrary } from '../components/QueryLibrary';
 import { SqlEditor } from '../components/SqlEditor';
 import { QueryResult } from '../components/QueryResult';
+import { QueryPivotResult } from '../components/QueryPivotResult';
 import {
   QUERIES,
+  FEATURE_LABEL,
   detectRunMode,
   detectFromTopic,
   stripAliases,
@@ -19,12 +18,22 @@ import {
   fmtMs,
   type QueryEntry,
 } from '../scopes/query';
+import { parsePivotSql, inferPivotDisplay } from '../scopes/pivotGrid';
 import { useLiveQuery, type LiveQuerySpec } from '@/lib/use-live-query';
 import { runOneShotSql, type Row } from '@/lib/use-subscription';
 
 const adhocRowId = (r: Row): string =>
   String(
-    r.position_id ??
+    // JOIN fan-out (positions ⨝ trades) repeats one position_id across
+    // many trade_ids, and a bare /trades row likewise shares its
+    // position_id with sibling trades. Keying on position_id alone makes
+    // AG Grid's getRowId collapse those to one row per position (the grid
+    // drops duplicate ids), so the result grid looked empty/short. When
+    // both ids are present, key on the composite so every row is unique.
+    (r.position_id != null && r.trade_id != null
+      ? `${r.position_id}|${r.trade_id}`
+      : undefined) ??
+      r.position_id ??
       r.trade_id ??
       r.cusip ??
       r.book_name ??
@@ -51,20 +60,44 @@ interface LiveRun {
 }
 type Run = StaticRun | LiveRun;
 
+function QueryStat({ label, value, emphasis }: { label: string; value: string; emphasis?: boolean }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+      <span style={{ fontSize: 9, letterSpacing: '.18em', color: 'var(--atlas-fg-faint)' }}>{label}</span>
+      <span
+        style={{
+          fontSize: 12,
+          fontWeight: 600,
+          fontFeatureSettings: '"tnum"',
+          color: emphasis ? 'var(--atlas-amber)' : 'var(--atlas-fg)',
+        }}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
 export function QueryChapter() {
   const [selected, setSelected] = useState<QueryEntry>(QUERIES[0]!);
   const [editorValue, setEditorValue] = useState<string>(QUERIES[0]!.sql);
   const [run, setRun] = useState<Run | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sqlOpen, setSqlOpen] = useState(true);
+
+  const pivotSpec = useMemo(() => parsePivotSql(editorValue), [editorValue]);
+  const pivotDisplay = useMemo(
+    () => selected.pivotDisplay ?? (pivotSpec ? inferPivotDisplay(pivotSpec) : null),
+    [selected.pivotDisplay, pivotSpec],
+  );
+  const showPivotGrid = pivotSpec != null && pivotDisplay != null;
 
   const liveSpec = run?.mode === 'live' ? run.spec : null;
   const live = useLiveQuery(liveSpec);
 
   const runQuery = async () => {
     setError(null);
-    // Strip `alias.` prefixes so cqserver's parser doesn't trip on
-    // `p.symbol`-style references (it has no alias-resolution table).
     const wireSql = stripAliases(editorValue);
     const mode = detectRunMode(wireSql);
     const topic = detectFromTopic(wireSql);
@@ -92,6 +125,7 @@ export function QueryChapter() {
     setEditorValue(q.sql);
     setError(null);
     setRun(null);
+    setSqlOpen(true);
   };
 
   const liveError = live?.error ?? null;
@@ -112,31 +146,48 @@ export function QueryChapter() {
         ? `${rowCount.toLocaleString()} rows · ${elapsed} · static (JOIN)`
         : 'press RUN';
 
-  const kpis = useMemo<Kpi[]>(
-    () => [
-      { label: 'CATALOG', value: fmtCount(QUERIES.length), caption: 'pre-built queries', emphasis: true },
-      { label: 'MODE', value: run?.mode?.toUpperCase() ?? '—', caption: 'live = stream · static = SOW' },
-      { label: 'ROWS', value: fmtCount(rowCount), caption: 'result' },
-      { label: 'ELAPSED', value: elapsed, caption: 'one-shot run' },
-      {
-        label: 'STATE',
-        value: surfacedError ? 'ERROR' : busy ? 'BUSY' : run ? 'OK' : 'IDLE',
-        caption: 'runner',
-        emphasis: !!surfacedError || busy,
-      },
-    ],
-    [run, rowCount, elapsed, busy, surfacedError],
+  const stateLabel = surfacedError ? 'ERROR' : busy ? 'BUSY' : run ? 'OK' : 'IDLE';
+
+  const resultTitle = useMemo(
+    () => (run?.mode === 'live' ? 'RESULT · live' : run?.mode === 'static' ? 'RESULT · static' : 'RESULT'),
+    [run?.mode],
   );
 
   return (
     <>
-      <ChapterHead
-        kicker="CHAPTER 08 — QUERY"
-        title="query."
-        sub="Pick from the catalog or write your own. Single-topic queries open a live sowAndSubscribe and tick on every match; multi-topic JOIN queries fall back to a one-shot SOW because cqserver's join evaluator is on the static path only."
-        hero={<HeroMetric label="RESULT" value={fmtCount(rowCount)} detail={status} />}
-      />
-      <KpiStrip kpis={kpis} />
+      <header
+        style={{
+          position: 'relative',
+          zIndex: 1,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 16,
+          padding: '8px 20px',
+          borderBottom: '1px solid var(--atlas-rule)',
+          flexShrink: 0,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }}>
+          <span style={{ fontSize: 9, letterSpacing: '.22em', color: 'var(--atlas-fg-dim)' }}>08 · QUERY</span>
+          <span
+            style={{
+              fontSize: 22,
+              fontWeight: 700,
+              letterSpacing: '-.02em',
+              lineHeight: 1,
+              color: 'var(--atlas-amber)',
+            }}
+          >
+            query.
+          </span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexShrink: 0 }}>
+          <QueryStat label="ROWS" value={fmtCount(rowCount)} emphasis />
+          <QueryStat label="MODE" value={run?.mode?.toUpperCase() ?? '—'} />
+          <QueryStat label="STATE" value={stateLabel} emphasis={!!surfacedError || busy} />
+        </div>
+      </header>
       <div
         style={{
           position: 'relative',
@@ -147,30 +198,161 @@ export function QueryChapter() {
           minHeight: 0,
         }}
       >
-        <QueryLibrary selectedId={selected.id} onSelect={onSelectQuery} />
+        <QueryLibrary selectedId={selected.id} onSelect={onSelectQuery} compact />
         <div
           style={{
             flex: 1,
             display: 'flex',
             flexDirection: 'column',
             minHeight: 0,
+            minWidth: 0,
           }}
         >
-          <SqlEditor
-            value={editorValue}
-            onChange={setEditorValue}
-            onRun={runQuery}
-            status={status}
-            error={surfacedError}
-            busy={busy}
-          />
-          <QueryResult
-            title={run?.mode === 'live' ? 'RESULT · live · ticking' : 'RESULT · static'}
-            status={status}
-            liveSubscription={run?.mode === 'live' ? (live ?? undefined) : undefined}
-            staticRows={run?.mode === 'static' ? run.rows : undefined}
-            getRowId={adhocRowId}
-          />
+          <div
+            style={{
+              flexShrink: 0,
+              padding: '8px 14px',
+              borderBottom: '1px solid var(--atlas-rule)',
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 10,
+              minWidth: 0,
+            }}
+          >
+            <span
+              style={{
+                fontSize: 9,
+                letterSpacing: '.14em',
+                padding: '3px 6px',
+                border: '1px solid var(--atlas-rule)',
+                color: 'var(--atlas-fg-dim)',
+                flexShrink: 0,
+                marginTop: 2,
+              }}
+            >
+              {FEATURE_LABEL[selected.feature]}
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: 'var(--atlas-fg)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {selected.title}
+              </div>
+              <div
+                style={{
+                  fontSize: 10,
+                  color: 'var(--atlas-fg-faint)',
+                  marginTop: 2,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {selected.synopsis}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSqlOpen((o) => !o)}
+              style={{
+                flexShrink: 0,
+                background: 'transparent',
+                border: '1px solid var(--atlas-rule)',
+                color: 'var(--atlas-fg-dim)',
+                fontFamily: 'var(--atlas-font)',
+                fontSize: 9,
+                letterSpacing: '.16em',
+                padding: '4px 8px',
+                cursor: 'pointer',
+              }}
+            >
+              {sqlOpen ? 'HIDE SQL' : 'SHOW SQL'}
+            </button>
+          </div>
+
+          {sqlOpen ? (
+            <SqlEditor
+              value={editorValue}
+              onChange={setEditorValue}
+              onRun={runQuery}
+              status={status}
+              error={surfacedError}
+              busy={busy}
+              compact
+            />
+          ) : (
+            <div
+              style={{
+                flexShrink: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                padding: '6px 14px',
+                borderBottom: '1px solid var(--atlas-rule)',
+                background: 'var(--atlas-surface)',
+              }}
+            >
+              <div
+                style={{
+                  flex: 1,
+                  fontSize: 10,
+                  color: error ? 'var(--atlas-neg)' : 'var(--atlas-fg-faint)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {surfacedError ?? status}
+              </div>
+              <button
+                onClick={runQuery}
+                disabled={busy}
+                style={{
+                  background: 'var(--atlas-amber)',
+                  color: 'var(--atlas-ink)',
+                  border: 'none',
+                  padding: '5px 14px',
+                  fontFamily: 'var(--atlas-font)',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: '.18em',
+                  cursor: busy ? 'wait' : 'pointer',
+                  opacity: busy ? 0.6 : 1,
+                  flexShrink: 0,
+                }}
+              >
+                {busy ? 'RUNNING…' : 'RUN'}
+              </button>
+            </div>
+          )}
+
+          {showPivotGrid && pivotDisplay ? (
+            <QueryPivotResult
+              key={run?.qid ?? 'idle'}
+              pivotSpec={pivotSpec}
+              pivotDisplay={pivotDisplay}
+              liveSubscription={run?.mode === 'live' ? (live ?? undefined) : undefined}
+              staticRows={run?.mode === 'static' ? run.rows : undefined}
+              compact
+            />
+          ) : (
+            <QueryResult
+              title={resultTitle}
+              status={status}
+              liveSubscription={run?.mode === 'live' ? (live ?? undefined) : undefined}
+              staticRows={run?.mode === 'static' ? run.rows : undefined}
+              getRowId={adhocRowId}
+              compact
+            />
+          )}
         </div>
       </div>
     </>

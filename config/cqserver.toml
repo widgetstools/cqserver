@@ -15,6 +15,20 @@ admin_addr = "0.0.0.0:8085"
 [transport]
 outbound_queue_capacity = 2048
 
+# ===== Transaction log / fast restart =====
+#
+# On a graceful shutdown the server checkpoints each persistent topic's
+# in-memory SOW to a `snapshot` file, then on the next start it loads
+# the snapshot and replays ONLY the txlog tail after it — turning a
+# multi-minute full replay into a sub-second restart. `snapshot_reclaim`
+# additionally deletes the now-redundant sealed segments after a durable
+# snapshot, keeping the on-disk footprint at ~the live SOW size instead
+# of growing unbounded (the /positions log had reached 288 GB).
+[txlog]
+directory            = "./data/txlog"   # matches the existing default
+snapshot_on_shutdown = true             # write the SOW checkpoint on clean exit
+snapshot_reclaim     = true             # delete sealed segments after the snapshot
+
 # ===== Fixed-income demo topics =====
 #
 # Every FI topic declares its schema up front via an external JSON file

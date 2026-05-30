@@ -39,6 +39,15 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tokio::sync::mpsc;
 
+/// Capacity for each sharded-evaluator lane channel. Bounded so a lane
+/// that falls behind backpressures the dispatcher (and, transitively, the
+/// publisher) instead of buffering an unbounded `Arc<MutationEvent>`
+/// backlog. The cap is generous so it never blocks under healthy load;
+/// the dispatcher's `send` blocks (not drops) when a lane is full, which
+/// preserves per-subscription delta ordering and correctness — dropping
+/// events would silently desync a subscription forever.
+const LANE_CHANNEL_CAP: usize = 65_536;
+
 fn dt_label(dt: DeltaType) -> &'static str {
     match dt {
         DeltaType::Add => "add",
@@ -70,7 +79,7 @@ pub fn deliver_delta_cached(
 ) {
     let dt_str = dt_label(delta.delta_type);
 
-    let route = match registry.get(&delta.subscription_id) {
+    let route = match registry.get(delta.subscription_id.as_ref()) {
         Some(r) => r,
         None => return,
     };
@@ -116,7 +125,7 @@ pub fn deliver_delta_cached(
         return;
     }
 
-    let frame = if let Some(b) = body {
+    let mut frame = if let Some(b) = body {
         match build_json_delta_frame(&delta.subscription_id, dt_str, delta.sequence, &b) {
             Some(f) => f,
             None => {
@@ -152,7 +161,10 @@ pub fn deliver_delta_cached(
         .as_ref()
         .is_some_and(|sp| !sp.is_empty());
     if !must_spill {
-        match route.tx.try_send(frame.clone()) {
+        // Move the frame into the channel; on `Full` the error hands it
+        // back so we can fall through to spillover without ever cloning
+        // on the common (delivered) path.
+        match route.tx.try_send(frame) {
             Ok(()) => {
                 metrics::counter!("cq_deltas_delivered_total").increment(1);
                 // Update server-side bookmark store so MOST_RECENT
@@ -173,8 +185,9 @@ pub fn deliver_delta_cached(
                     .fetch_max(delta.sequence, Ordering::Relaxed);
                 return;
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Fall through to spillover handling below.
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                // Recover ownership and fall through to spillover handling.
+                frame = returned;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 metrics::counter!(
@@ -205,6 +218,7 @@ pub fn deliver_delta_cached(
                     "reason" => "spillover_over_cap"
                 )
                 .increment(1);
+                mark_state_loss_if_removing(&route, delta);
             }
             Err(e) => {
                 route.dropped.fetch_add(1, Ordering::Relaxed);
@@ -229,6 +243,33 @@ pub fn deliver_delta_cached(
             topic = %route.topic,
             "Delta queue full; dropping (consumer can't keep up)"
         );
+        mark_state_loss_if_removing(&route, delta);
+    }
+}
+
+/// Flag a route degraded when the delta we just dropped was a Remove or
+/// OOF. Add/Update drops are self-correcting (a later delta overwrites
+/// the stale row), but a dropped Remove/OOF leaves the client with a
+/// phantom row it can never reconcile — permanent corruption. The
+/// slow-consumer watcher force-resyncs degraded routes.
+fn mark_state_loss_if_removing(route: &crate::session::DeliveryRoute, delta: &Delta) {
+    if !matches!(delta.delta_type, DeltaType::Remove | DeltaType::Oof) {
+        return;
+    }
+    if !route.is_degraded() {
+        route.mark_degraded();
+        metrics::counter!(
+            "cq_subscription_state_loss_total",
+            "topic" => route.topic.clone()
+        )
+        .increment(1);
+        tracing::error!(
+            sub = %delta.subscription_id,
+            topic = %route.topic,
+            delta_type = dt_label(delta.delta_type),
+            "Dropped a Remove/OOF delta (queue full / spillover over cap); \
+             subscription degraded — client must resync"
+        );
     }
 }
 
@@ -238,7 +279,7 @@ pub fn spawn_evaluator(
     topic: SharedTopic,
     rx: Receiver<MutationEvent>,
     registry: SessionRegistry,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     let topic_name = topic.name().to_string();
     thread::Builder::new()
         .name(format!("evaluator:{}", topic_name))
@@ -249,8 +290,19 @@ pub fn spawn_evaluator(
             // amortized across mutation events.
             let mut body_cache: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
             for event in rx.iter() {
-                let deltas =
-                    topic.evaluate_row_kind(event.row, event.sequence, event.kind);
+                // S46 / review C1: route through the predicate index so a
+                // sparse publish only re-evaluates subscriptions that
+                // reference a changed column. `changed_cols == None`
+                // (full-row publishes, deletes, recovery replay) still
+                // falls through to the all-subs path inside
+                // `evaluate_row_kind_indexed`, so this is a strict
+                // superset of the previous behavior.
+                let deltas = topic.evaluate_row_kind_indexed(
+                    event.row,
+                    event.sequence,
+                    event.kind,
+                    event.changed_cols.as_deref(),
+                );
                 body_cache.clear();
                 for delta in &deltas {
                     deliver_delta_cached(delta, &registry, &mut body_cache);
@@ -258,5 +310,251 @@ pub fn spawn_evaluator(
             }
             tracing::info!(topic = %topic_name, "Evaluator thread exiting");
         })
-        .expect("evaluator thread spawn")
+}
+
+/// Spawn evaluator thread(s) for a topic, honoring its configured lane
+/// count. `eval_lanes() <= 1` keeps the historical single-thread loop
+/// (zero overhead); `> 1` spins up the sharded form. Returns one
+/// `JoinHandle` per spawned thread (1 for single-lane, `lanes + 1` for
+/// the sharded form: N lane workers + 1 dispatcher).
+pub fn spawn_evaluators(
+    topic: SharedTopic,
+    rx: Receiver<MutationEvent>,
+    registry: SessionRegistry,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    let lanes = topic.eval_lanes();
+    if lanes <= 1 {
+        Ok(vec![spawn_evaluator(topic, rx, registry)?])
+    } else {
+        spawn_sharded_evaluator(topic, rx, registry, lanes)
+    }
+}
+
+/// Multi-lane evaluator. A single dispatcher thread drains the topic's
+/// mutation channel and broadcasts each event (wrapped in an `Arc` so the
+/// fanout is N pointer clones, not N `changed_cols` Vec clones) to every
+/// lane's channel **in topic-sequence order**. One evaluator thread per
+/// lane then evaluates only the subscriptions pinned to that lane (see
+/// `Topic::engine_for`).
+///
+/// Per-subscription delta ordering is preserved: a subscription lives on
+/// exactly one lane, events reach each lane in order (single producer →
+/// FIFO crossbeam channels), and the lane processes them serially — so a
+/// subscription's conflation state is only ever mutated by one thread, in
+/// sequence order. We need an explicit dispatcher because crossbeam's
+/// `Receiver` is work-*stealing* (MPMC): cloning it into N lanes would
+/// hand each event to only one lane, not broadcast it.
+///
+/// Returns N lane handles followed by the dispatcher handle.
+pub fn spawn_sharded_evaluator(
+    topic: SharedTopic,
+    rx: Receiver<MutationEvent>,
+    registry: SessionRegistry,
+    lanes: usize,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
+    let topic_name = topic.name().to_string();
+    let mut lane_txs = Vec::with_capacity(lanes);
+    let mut handles = Vec::with_capacity(lanes + 1);
+
+    for lane in 0..lanes {
+        let (tx, lane_rx) = crossbeam_channel::bounded::<Arc<MutationEvent>>(LANE_CHANNEL_CAP);
+        lane_txs.push(tx);
+        let topic = topic.clone();
+        let registry = registry.clone();
+        let tname = topic_name.clone();
+        let handle = thread::Builder::new()
+            .name(format!("evaluator:{}:{}", tname, lane))
+            .spawn(move || {
+                // Per-lane body-encode cache (same amortization as the
+                // single-lane loop). Each lane owns its own cache.
+                let mut body_cache: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
+                for event in lane_rx.iter() {
+                    let deltas = topic.evaluate_row_kind_indexed_lane(
+                        lane,
+                        event.row,
+                        event.sequence,
+                        event.kind,
+                        event.changed_cols.as_deref(),
+                    );
+                    body_cache.clear();
+                    for delta in &deltas {
+                        deliver_delta_cached(delta, &registry, &mut body_cache);
+                    }
+                }
+            })?;
+        handles.push(handle);
+    }
+
+    let dispatch = thread::Builder::new()
+        .name(format!("evaluator-dispatch:{}", topic_name))
+        .spawn(move || {
+            tracing::info!(topic = %topic_name, lanes, "Sharded evaluator started");
+            for event in rx.iter() {
+                let ev = Arc::new(event);
+                for tx in &lane_txs {
+                    let _ = tx.send(ev.clone());
+                }
+            }
+            // Source channel closed (topic dropped): release the lane
+            // senders so each lane's channel closes and its thread exits.
+            drop(lane_txs);
+            tracing::info!(topic = %topic_name, "Sharded evaluator dispatcher exiting");
+        })?;
+    handles.push(dispatch);
+
+    Ok(handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{new_registry, DeliveryRoute};
+    use std::sync::Arc;
+
+    fn make_delta(sub_id: &str, dt: DeltaType) -> Delta {
+        Delta {
+            subscription_id: sub_id.into(),
+            delta_type: dt,
+            row: 0,
+            sequence: 1,
+            row_data: Arc::new(serde_json::Map::new()),
+            encoded_body_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_remove_marks_route_degraded() {
+        // Capacity-1 channel with no spillover; fill it so the next
+        // delivery must hard-drop.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let route = DeliveryRoute::with_codec(tx.clone(), "/t".into(), Codec::Json);
+        // Saturate the queue.
+        tx.try_send(crate::session::OutboundFrame::Text("x".into())).unwrap();
+
+        let registry = new_registry();
+        registry.insert("s1".into(), route);
+
+        // An Add drop must NOT degrade (self-correcting).
+        deliver_delta(&make_delta("s1", DeltaType::Add), &registry);
+        assert!(!registry.get("s1").unwrap().is_degraded());
+
+        // A Remove drop is unrecoverable → degraded.
+        deliver_delta(&make_delta("s1", DeltaType::Remove), &registry);
+        assert!(registry.get("s1").unwrap().is_degraded());
+    }
+
+    #[tokio::test]
+    async fn dropped_oof_marks_route_degraded() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let route = DeliveryRoute::with_codec(tx.clone(), "/t".into(), Codec::Json);
+        tx.try_send(crate::session::OutboundFrame::Text("x".into())).unwrap();
+        let registry = new_registry();
+        registry.insert("s1".into(), route);
+
+        deliver_delta(&make_delta("s1", DeltaType::Oof), &registry);
+        assert!(registry.get("s1").unwrap().is_degraded());
+    }
+
+    /// Conflation invariant under sharding: drive a stream of mutations
+    /// on a single key through the 4-lane sharded evaluator and assert
+    /// the delivered deltas for the subscription arrive in strictly
+    /// increasing topic-sequence order. The subscription lives on exactly
+    /// one lane, so its conflation state is only ever touched by one
+    /// thread — if the dispatcher fanout or per-lane FIFO ordering were
+    /// broken, the `seq` field would regress here.
+    #[tokio::test]
+    async fn sharded_evaluator_preserves_per_sub_ordering() {
+        use cq_core::schema::{ColumnType, Schema};
+        use cq_core::store::Value;
+        use cq_core::topic::{Topic, TopicConfig};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::from_strs(
+            &["symbol", "price", "quantity"],
+            &[ColumnType::String, ColumnType::Double, ColumnType::Long],
+        ));
+        let config = TopicConfig {
+            name: "/market-data".into(),
+            key_fields: vec!["symbol".into()],
+            persist: false,
+            conflation_ms: None,
+            index_columns: vec![],
+            expire_seconds: None,
+        };
+        let topic: SharedTopic = Arc::new(Topic::new(config, schema, 1024).with_eval_lanes(4));
+        assert_eq!(topic.eval_lanes(), 4);
+
+        // Register the subscription before any live mutations. The
+        // initial snapshot is returned to the caller (empty here), not
+        // delivered through the registry, so the registry sees only the
+        // live deltas the evaluator produces.
+        topic
+            .subscribe("s1".into(), "SELECT * FROM t")
+            .expect("subscribe");
+
+        // Non-conflated JSON route so every delta is delivered as its
+        // own frame (no merging) — lets us count and order them.
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1024);
+        let route = DeliveryRoute::with_codec(out_tx, "/market-data".into(), Codec::Json);
+        let registry = new_registry();
+        registry.insert("s1".into(), route);
+
+        let rx = topic.take_mutation_rx().expect("mutation rx");
+        // Detach the evaluator threads: they hold `Arc<Topic>` clones that
+        // keep `mutation_tx` alive, so the dispatcher's `rx.iter()` never
+        // ends and joining would hang. The test verifies behavior via the
+        // delivered frames, not thread teardown.
+        let _handles =
+            spawn_sharded_evaluator(topic.clone(), rx, registry, 4).expect("spawn evaluators");
+
+        // Publish N mutations to the SAME key with strictly increasing
+        // price: first is an Add, the rest Updates. Each allocates the
+        // next topic sequence under the write lock, so the channel is
+        // already in sequence order.
+        const N: u64 = 50;
+        for i in 0..N {
+            topic.upsert(vec![
+                Value::String(Some(compact_str::CompactString::new("AAPL"))),
+                Value::Double(100.0 + i as f64),
+                Value::Long(10),
+            ]);
+        }
+
+        // Drain with a timeout rather than joining: the lane threads hold
+        // `Arc<Topic>` clones, so `mutation_tx` stays alive and the
+        // dispatcher's `rx.iter()` never ends — joining would hang.
+        let mut seqs: Vec<u64> = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), out_rx.recv()).await {
+                Ok(Some(frame)) => {
+                    let text = match frame {
+                        crate::session::OutboundFrame::Text(s) => s,
+                        _ => panic!("expected JSON text frame"),
+                    };
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(v["sid"], "s1");
+                    seqs.push(v["seq"].as_u64().expect("seq field"));
+                    if seqs.len() as u64 == N {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break, // timed out waiting for more frames
+            }
+        }
+
+        assert_eq!(
+            seqs.len() as u64,
+            N,
+            "expected {N} delivered deltas, got {}",
+            seqs.len()
+        );
+        for w in seqs.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "per-subscription sequence regressed: {:?}",
+                seqs
+            );
+        }
+    }
 }

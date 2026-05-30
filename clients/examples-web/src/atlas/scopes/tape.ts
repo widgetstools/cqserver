@@ -32,7 +32,7 @@ export const TAPE_STATUS_OPTIONS = [
 ];
 
 export const TAPE_COL_DEFS: ColDef[] = [
-  { field: 'trade_id', headerName: 'trade_id', width: 130, cellStyle: { color: '#f4a52b' } },
+  { field: 'trade_id', headerName: 'trade_id', width: 130, cellStyle: { color: 'var(--atlas-amber)' } },
   { field: 'position_id', headerName: 'position_id', width: 130 },
   { field: 'symbol', headerName: 'symbol', width: 90 },
   { field: 'side', headerName: 'side', width: 70,
@@ -45,7 +45,7 @@ export const TAPE_COL_DEFS: ColDef[] = [
   { field: 'notional_usd', headerName: 'notional_usd', width: 140, type: 'numericColumn',
     valueFormatter: (p) => fmtMillions(p.value as number) },
   { field: 'status', headerName: 'status', width: 110,
-    cellStyle: { color: '#f4a52b', letterSpacing: '.1em' } },
+    cellStyle: { color: 'var(--atlas-amber)', letterSpacing: '.1em' } },
 ];
 
 export function fmtMillions(n: number | null | undefined): string {

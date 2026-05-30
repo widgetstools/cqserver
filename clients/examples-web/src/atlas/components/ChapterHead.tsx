@@ -73,7 +73,7 @@ export function HeroMetric({ label, value, detail }: HeroMetricProps) {
           fontFeatureSettings: '"tnum"',
           lineHeight: 1,
           marginTop: 8,
-          textShadow: '0 0 28px rgba(244, 165, 43, .25)',
+          textShadow: 'var(--atlas-hero-glow)',
         }}
       >
         {value}

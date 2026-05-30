@@ -164,6 +164,25 @@ pub struct CqMessage {
     #[serde(rename = "seqs", skip_serializing_if = "Option::is_none")]
     pub sequences: Option<Vec<u64>>,
 
+    /// Queue publish priority. Higher values are delivered ahead of
+    /// lower ones; messages of equal priority keep FIFO order. Absent
+    /// (treated as 0) on non-queue publishes and pre-feature clients.
+    #[serde(rename = "prio", skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+
+    /// Queue message grouping key. All messages sharing a `group` are
+    /// pinned to the same consumer (sticky routing) so their relative
+    /// order is preserved. Absent on ungrouped publishes.
+    #[serde(rename = "grp", skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
+    /// On an `Ack` frame carrying a queue `delivery_id`, request a
+    /// lease extension of this many milliseconds (from now) instead of
+    /// committing the lease. Lets a slow consumer keep an in-flight
+    /// message from being redelivered while it finishes work.
+    #[serde(rename = "lease_ext", skip_serializing_if = "Option::is_none")]
+    pub lease_extend_ms: Option<u64>,
+
     /// Q4 — opaque trace id for cross-process request correlation.
     /// Echoed by the server on every response that carries `cid`
     /// for the same request. Recorded into the tracing span so logs
@@ -172,6 +191,35 @@ pub struct CqMessage {
     /// to keep unique enough — UUIDv4 / W3C trace-id work).
     #[serde(rename = "tid", skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+
+    /// Historical SOW ("as-of sequence"): on a one-shot `Sow`, return
+    /// the topic's state as it existed immediately after this txlog
+    /// sequence was applied, instead of the live SOW. The server
+    /// reconstructs state by replaying the txlog up to and including
+    /// this sequence (last-writer-wins per key, tombstones remove the
+    /// key), then runs the query's filter/projection against that
+    /// snapshot. Requires a persistent topic. Wins over `asof_ts`.
+    #[serde(rename = "asof_seq", skip_serializing_if = "Option::is_none")]
+    pub as_of_sequence: Option<u64>,
+
+    /// Historical SOW ("as-of timestamp", epoch millis): like
+    /// `asof_seq`, but the server first resolves the highest txlog
+    /// sequence whose write timestamp is **at or before** this
+    /// wall-clock value, then reconstructs state as-of that sequence.
+    /// Requires a persistent topic. Ignored when `asof_seq` is set.
+    #[serde(rename = "asof_ts", skip_serializing_if = "Option::is_none")]
+    pub as_of_timestamp_ms: Option<u64>,
+
+    /// S30 wire-codec negotiation. On `Logon`, clients send a
+    /// preference-ordered list of codecs they can speak on the wire
+    /// (e.g. `["msgpack", "json"]`); the server picks the first it
+    /// supports and echoes it back as a single-entry vec on the ack.
+    /// Both sides then switch to that codec for all post-ack frames.
+    /// Absent on every non-Logon frame. Pre-S30 clients that omit
+    /// this field negotiate to [`crate::serialization::DEFAULT_LEGACY_CODEC`]
+    /// (i.e. `Codec::Json`), preserving the JSON-on-TCP behavior.
+    #[serde(rename = "cdc", skip_serializing_if = "Option::is_none")]
+    pub codecs: Option<Vec<crate::serialization::Codec>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -208,7 +256,13 @@ impl CqMessage {
             compressions: None,
             batch: None,
             sequences: None,
+            priority: None,
+            group: None,
+            lease_extend_ms: None,
             trace_id: None,
+            as_of_sequence: None,
+            as_of_timestamp_ms: None,
+            codecs: None,
         }
     }
 
@@ -355,5 +409,21 @@ mod tests {
         assert_eq!(msg.command, Command::Publish);
         assert_eq!(msg.topic.unwrap(), "/orders");
         assert!(msg.data.is_some());
+    }
+}
+
+#[cfg(test)]
+mod queue_field_tests {
+    use super::*;
+    use crate::command::Command;
+    #[test]
+    fn group_and_priority_roundtrip() {
+        let mut m = CqMessage::new(Command::Publish);
+        m.group = Some("ORD-1".into());
+        m.priority = Some(5);
+        let s = serde_json::to_string(&m).unwrap();
+        let back: CqMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.group.as_deref(), Some("ORD-1"), "wire={s}");
+        assert_eq!(back.priority, Some(5));
     }
 }

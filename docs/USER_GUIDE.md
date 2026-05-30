@@ -5,7 +5,11 @@ install through publishing your first row, querying it, persisting
 it, replaying it after restart, and integrating with the client
 SDKs we ship.
 
-This is the **operator + application-developer** guide. For internal
+This is the **operator + application-developer** guide. For a focused,
+SDK-by-SDK walkthrough of **how to run every kind of query** (one-shot
+SOW, SQL/JOIN, live subscriptions, continuous aggregates, views,
+replay) from Rust, TypeScript, Python, Go, and Java, see the companion
+[`docs/CLIENT_SDK_GUIDE.md`](CLIENT_SDK_GUIDE.md). For internal
 design rationale, see [`ARCHITECTURE.md`](../ARCHITECTURE.md). For
 the admin web UI, see [`docs/admin-ui.md`](admin-ui.md). For
 multi-host deployments, see [`docs/deploy/replica-reads.md`](deploy/replica-reads.md).
@@ -465,10 +469,11 @@ The server acks a publish only after:
    peer — enabled via the S11 `last_replicated_sequence` barrier;
    off by default.
 
-For at-least-once durability across crashes, also enable
-`fsync_on_publish = true` under `[txlog.fsync]`. This trades latency
-(every publish becomes a disk-flush) for stronger guarantees.
-Default is `none` — fsync runs on a background timer.
+For at-least-once durability across **power loss**, set
+`fsync = "every_write"` (or the cheaper group-commit
+`fsync = "interval"`) under `[txlog]` — see §8.3. The default
+`fsync = "none"` already survives a process crash (the write is in
+the OS page cache) but can lose recent writes on power loss.
 
 ### 5.5 Publishing rates
 
@@ -752,22 +757,44 @@ segment_size    = 268435456   # 256 MB — defaults to 16 MB; raise for fewer fi
 
 ### 8.3 fsync policy
 
-By default, txlog writes go to the OS page cache and fsync happens
-on a background timer. For stricter durability:
+Every append is written straight through to the OS page cache (so it
+is immediately durable against a *process* crash and immediately
+visible to the replication shipper). The `fsync` policy controls when
+the log is additionally flushed to stable storage, hardening it
+against *power loss*:
 
 ```toml
-[txlog.fsync]
-mode = "always"           # fsync on every publish (slowest, safest)
+[txlog]
+fsync = "none"               # default — rely on the OS page cache; a power
+                             # loss can lose writes not yet flushed by the OS
 # or
-mode = "interval"
-interval_ms = 100         # fsync every 100ms (default; covers ~all crash modes)
+fsync = "every_write"        # fsync on every publish (slowest, safest)
 # or
-mode = "none"             # rely on OS — risk losing recent writes on power loss
+fsync = "interval"           # group commit — fsync at most once per interval
+fsync_interval_ms = 200      # bounds power-loss window to ~this much (default 200ms)
 ```
 
-The `always` mode is the choice for financial systems where a
-single lost write is unacceptable. The cost is ~5-10× higher
-publish latency on most SSDs.
+- **`every_write`** is the choice for systems where a single lost
+  write is unacceptable. The cost is ~5-10× higher publish latency on
+  most SSDs, since each publish waits on a disk flush.
+- **`interval`** (group commit) is the fast-and-durable middle ground:
+  many publishes within the window share one `fsync`, so steady-state
+  throughput stays high while the worst-case loss window is bounded to
+  `fsync_interval_ms`. The active segment is always fsynced on
+  rotation and on clean shutdown regardless of mode.
+
+Independently of fsync policy, you can reserve each segment's disk
+blocks up front so steady-state appends don't stall on filesystem
+extent allocation:
+
+```toml
+[txlog]
+preallocate = true           # fallocate/F_PREALLOCATE the segment on open
+```
+
+This is a best-effort throughput optimization for hot persistent
+topics on ext4/xfs/APFS; filesystems without preallocation support
+silently fall back to on-demand allocation. Off by default.
 
 ### 8.4 Archiving sealed segments
 
@@ -816,6 +843,45 @@ running server, snapshot at the filesystem level (LVM, ZFS, EBS
 snapshot) — cqserver's segments are append-only so an
 in-flight snapshot is consistent at the last-sealed segment
 boundary.
+
+### 8.7 Fast restart: SOW snapshots
+
+Replaying the entire txlog on every restart is fine for a small log
+but becomes the startup bottleneck once a topic has accumulated many
+segments (a full replay is O(total writes ever made)). To keep restart
+O(recent tail) instead, cqserver checkpoints the in-memory SOW to a
+**snapshot** file on clean shutdown:
+
+```toml
+[txlog]
+snapshot_on_shutdown = true   # default — checkpoint the SOW on graceful exit
+snapshot_reclaim     = false  # default — keep sealed segments after snapshot
+```
+
+On shutdown, after each persistent topic's log is fsynced durable, the
+server writes a `snapshot` file (sequence watermark + active segment id
++ per-origin highwater + live-row payloads) atomically alongside the
+topic's segments. On the next start, cqserver:
+
+1. Loads the snapshot and rebuilds the SOW directly from it.
+2. Replays **only** the txlog entries after the snapshot's segment
+   (the tail), skipping everything the snapshot already covers.
+
+This is the canonical SOW-database fast-restart design. It's safe by
+construction: the snapshot is written *after* the log is durable, so a
+crash between the two simply leaves a slightly stale snapshot and the
+tail replay fills the gap. A missing or corrupt snapshot transparently
+falls back to a full txlog replay — never to data loss.
+
+- **`snapshot_on_shutdown`** (default `true`) — write the checkpoint on
+  graceful exit. Set `false` to always full-replay (e.g. when debugging
+  recovery).
+- **`snapshot_reclaim`** (default `false`) — after a durable snapshot,
+  delete the now-redundant **sealed** segments (those older than the
+  active one) to bound disk growth. Left off by default because a
+  far-behind replication standby needs those segments to catch up
+  without a base-SOW resync — only enable it on standalone or
+  fully-caught-up deployments.
 
 ---
 
@@ -1462,7 +1528,7 @@ delta has `deltaType`, `data`, `sequence`, `subId` fields.
 ### 17.1 Installation
 
 ```sh
-cd client-sdks/python
+cd client-sdks/python-legacy
 pip install -e .
 ```
 
@@ -1675,9 +1741,12 @@ keeps speaking the older dialect to older clients indefinitely.
 
 ## Related documents
 
+- [`docs/CLIENT_SDK_GUIDE.md`](CLIENT_SDK_GUIDE.md) — SDK-by-SDK guide to running every query kind (the companion to this guide)
 - [`ARCHITECTURE.md`](../ARCHITECTURE.md) — system design rationale
 - [`docs/admin-ui.md`](admin-ui.md) — operator console reference
 - [`docs/deploy/replica-reads.md`](deploy/replica-reads.md) — multi-host deployment guide
 - [`PRODUCTION_READINESS.md`](../PRODUCTION_READINESS.md) — gap analysis + roadmap
+- [`docs/AMPS_PARITY.md`](AMPS_PARITY.md) — feature parity analysis vs AMPS
+- [`docs/JAVA_SERVER_PORT_SKETCH.md`](JAVA_SERVER_PORT_SKETCH.md) — why the engine stays in Rust; what a GC-free JVM port would require
 - Worklogs at the repo root: `HIGH_SCALE_WORKLOG.md`, `REPLICA_READS_WORKLOG.md`, `QUERY_GUARDRAILS_WORKLOG.md`, `ADMIN_UI_WORKLOG.md`, `CLOUD_REPLICATION_TEST_WORKLOG.md`
-- SDK READMEs: [`client-sdks/python/README.md`](../client-sdks/python/README.md), [`client-sdks/ts/README.md`](../client-sdks/ts/README.md)
+- SDK READMEs: [`client-sdks/python-legacy/README.md`](../client-sdks/python-legacy/README.md), [`client-sdks/ts/README.md`](../client-sdks/ts/README.md)

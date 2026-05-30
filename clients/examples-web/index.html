@@ -4,7 +4,19 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0a0c10" />
+    <meta name="theme-color" content="#0e0e10" />
+    <script>
+      (function () {
+        var t = localStorage.getItem('atlas-theme');
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        }
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme = t;
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', t === 'light' ? '#f7f5f0' : '#0e0e10');
+      })();
+    </script>
     <!-- Match the StarUI design system's font stack 1:1: Inter (display
          + body, 400–800) and JetBrains Mono (mono, 400–600). The
          @fontsource-variable package registered the family as

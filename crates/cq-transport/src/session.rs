@@ -225,6 +225,14 @@ pub struct DeliveryRoute {
     /// full" behaviour. Ordering is preserved by routing through
     /// spillover whenever any backlog is present.
     pub spillover: Option<Arc<crate::spillover::Spillover>>,
+    /// Set when a *state-removing* delta (Remove / OOF) had to be
+    /// dropped — i.e. the client's view now contains a phantom row it
+    /// can never reconcile on its own. Add/Update drops are eventually
+    /// self-correcting (a later update overwrites the stale row), but a
+    /// lost Remove/OOF is permanent state corruption. The slow-consumer
+    /// watcher treats a degraded route as a force-resync candidate
+    /// (evict → client reconnects and re-SOWs) regardless of drop rate.
+    pub degraded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DeliveryRoute {
@@ -248,6 +256,7 @@ impl DeliveryRoute {
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resume_notify: Arc::new(tokio::sync::Notify::new()),
             spillover: None,
+            degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -341,6 +350,7 @@ impl DeliveryRoute {
         let dropped = Arc::new(AtomicU64::new(0));
         let interval_ms = Arc::new(AtomicU64::new(interval.as_millis().max(1) as u64));
         let last_seq = Arc::new(AtomicU64::new(0));
+        let degraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         spawn_flush_loop(
             sub_id,
@@ -351,6 +361,7 @@ impl DeliveryRoute {
             interval_ms.clone(),
             codec,
             last_seq.clone(),
+            degraded.clone(),
             None, // client_name + bookmark_store are bound later via
             None, // `with_*` builders; the flush loop captures them
                   // through Arc cloning at spawn time. Conflated subs
@@ -376,7 +387,20 @@ impl DeliveryRoute {
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resume_notify: Arc::new(tokio::sync::Notify::new()),
             spillover: None,
+            degraded,
         }
+    }
+
+    /// True once a Remove/OOF delta has been irrecoverably dropped for
+    /// this route. See the `degraded` field for the full rationale.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flag this route as having lost state-removing delta(s). Idempotent.
+    pub fn mark_degraded(&self) {
+        self.degraded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -413,11 +437,23 @@ pub fn spawn_spillover_drain(
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 continue;
             }
-            let frame = match spillover.read_next_frame() {
-                Ok(Some(f)) => f,
-                Ok(None) => continue,
-                Err(e) => {
+            // The spillover read is synchronous file I/O (open/seek/read).
+            // Run it on the blocking pool so it never stalls a runtime
+            // worker thread under a large on-disk backlog.
+            let sp = spillover.clone();
+            let read = tokio::task::spawn_blocking(move || sp.read_next_frame()).await;
+            let frame = match read {
+                Ok(Ok(Some(f))) => f,
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => {
                     tracing::warn!(sub = %sub_id, error = %e, "Spillover read failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(join_err) => {
+                    // Blocking task panicked — log and back off rather than
+                    // spinning. The next iteration retries.
+                    tracing::warn!(sub = %sub_id, error = %join_err, "Spillover read task failed");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -459,6 +495,7 @@ fn spawn_flush_loop(
     interval_ms: Arc<AtomicU64>,
     codec: Codec,
     last_seq: Arc<AtomicU64>,
+    degraded: Arc<std::sync::atomic::AtomicBool>,
     client_name: Option<String>,
     bookmark_store: Option<crate::router::BookmarkStore>,
 ) {
@@ -569,6 +606,26 @@ fn spawn_flush_loop(
                             "topic" => topic.clone()
                         )
                         .increment(1);
+                        // A lost Remove/OOF is permanent state corruption
+                        // (the client keeps a phantom row), unlike an
+                        // Add/Update which a later delta overwrites. Flag
+                        // the route degraded so the watcher force-resyncs.
+                        if matches!(delta.delta_type, DeltaType::Remove | DeltaType::Oof) {
+                            if !degraded.swap(true, Ordering::Relaxed) {
+                                metrics::counter!(
+                                    "cq_subscription_state_loss_total",
+                                    "topic" => topic.clone()
+                                )
+                                .increment(1);
+                                tracing::error!(
+                                    sub = %sub_id,
+                                    topic = %topic,
+                                    delta_type = dt_str,
+                                    "Dropped a Remove/OOF delta (conflated, queue full); \
+                                     subscription degraded — client must resync"
+                                );
+                            }
+                        }
                         // Cap log spam: only log every 256th drop per sub.
                         let n = dropped.load(Ordering::Relaxed);
                         if n.is_power_of_two() {
@@ -621,6 +678,9 @@ pub struct SubscriptionStats {
     /// Current flush interval (ms) when the route uses conflation;
     /// 0 when conflation is disabled.
     pub conflation_interval_ms: u64,
+    /// `true` once a Remove/OOF delta was irrecoverably dropped for this
+    /// route — the client's view is now stale and must be resynced.
+    pub degraded: bool,
 }
 
 impl SubscriptionStats {
@@ -713,6 +773,7 @@ pub fn collect_subscription_stats(registry: &SessionRegistry) -> Vec<Subscriptio
                 age_ms: r.age_ms(),
                 conflated: r.conflator.is_some(),
                 conflation_interval_ms: r.conflation_interval_ms(),
+                degraded: r.is_degraded(),
             }
         })
         .collect()

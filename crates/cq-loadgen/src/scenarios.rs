@@ -33,6 +33,14 @@ pub struct ScenarioConfig {
     pub warmup: Duration,
     /// Admin HTTP base URL (used by stress-2k for /stats polling).
     pub admin_url: String,
+    /// Target serialized JSON body size in bytes for each publish. When > 0,
+    /// `publish_throughput` pads the body with a filler string so the encoded
+    /// frame is approximately this size. 0 = no padding (tiny `{k,v}` body).
+    pub payload_bytes: usize,
+    /// `sow-wide`: number of rows to seed before the SOW snapshot. 0 ⇒ 30_000.
+    pub wide_rows: usize,
+    /// `sow-wide`: number of columns per row (including the `k` key). 0 ⇒ 400.
+    pub wide_cols: usize,
 }
 
 impl Default for ScenarioConfig {
@@ -45,8 +53,27 @@ impl Default for ScenarioConfig {
             subscribers: 0,
             warmup: Duration::from_secs(1),
             admin_url: "http://127.0.0.1:8085".into(),
+            payload_bytes: 0,
+            wide_rows: 0,
+            wide_cols: 0,
         }
     }
+}
+
+/// Build a publish body whose serialized JSON length is approximately
+/// `target_bytes`. The base body is `{"k":"<key>","v":<key>}`; when a larger
+/// target is requested we add a `"p"` filler field padded with ASCII 'x' so
+/// the total encoded length lands on `target_bytes` (never smaller than base).
+fn padded_body(key: u64, target_bytes: usize) -> serde_json::Value {
+    let base = json!({ "k": key.to_string(), "v": key });
+    if target_bytes == 0 {
+        return base;
+    }
+    let base_len = serde_json::to_vec(&base).map(|v| v.len()).unwrap_or(0);
+    // Adding `,"p":""` costs 8 bytes of structural overhead before the filler.
+    let overhead = 8;
+    let fill = target_bytes.saturating_sub(base_len + overhead);
+    json!({ "k": key.to_string(), "v": key, "p": "x".repeat(fill) })
 }
 
 #[derive(Debug)]
@@ -109,7 +136,7 @@ pub async fn publish_throughput(cfg: &ScenarioConfig) -> Result<Report> {
     while Instant::now() < deadline {
         limiter.tick().await;
         let key = issued; // distinct key per publish
-        let body = json!({ "k": key.to_string(), "v": key });
+        let body = padded_body(key, cfg.payload_bytes);
         let t0 = Instant::now();
         match client.publish(&cfg.topic, body).await {
             Ok(_seq) => {
@@ -255,6 +282,573 @@ pub async fn fanout(cfg: &ScenarioConfig) -> Result<Report> {
         delivery_p99: hist.p99(),
         duration: started.elapsed().saturating_sub(cfg.warmup),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// sow-wide: seed a large, wide SOW (e.g. 30k rows × 400 cols), measure the
+// snapshot delivery, then drive live updates and measure pub→delivery latency.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build one wide row: key `k` plus `cols - 1` numeric columns `c1..c{cols-1}`.
+/// Values are a cheap deterministic hash of (row, col) so every cell is
+/// distinct (defeats any accidental dedup) without per-cell allocation beyond
+/// the integer itself.
+fn wide_row(r: u64, cols: usize) -> serde_json::Value {
+    let mut obj = serde_json::Map::with_capacity(cols);
+    obj.insert("k".into(), json!(r));
+    // `_t` is seeded (value 0) so it's part of the topic schema from the
+    // start — the live phase updates it with a publish timestamp, and only
+    // columns that already exist propagate on a delta_publish.
+    obj.insert("_t".into(), json!(0u64));
+    for c in 2..cols {
+        let v = r.wrapping_mul(2_654_435_761).wrapping_add(c as u64) % 1_000_000;
+        obj.insert(format!("c{c}"), json!(v));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Heavy-SOW scenario: `--subscribers N` clients (default 1) each request a
+/// Σ-row snapshot of `wide_rows × wide_cols` concurrently and then receive
+/// real-time updates.
+///
+/// Phases:
+///   1. **Seed** `wide_rows` rows (each `wide_cols` columns) via
+///      `publish_batch`. Reports seed throughput.
+///   2. **Snapshot** — N subscribers `sow_and_subscribe` in parallel and each
+///      drains the full snapshot. Reports how many caught up, aggregate rows /
+///      MB, and per-sub completion min/max (≈ N × snapshot egress).
+///   3. **Live** — once every sub has caught up, one publisher issues sparse
+///      `delta_publish` updates at `--rate`/s for `--duration-secs`, stamping
+///      each with a monotonic `_t`; all subscriptions fan the deltas out and
+///      record publish→delivery latency. Reports delivery p50/p95/p99,
+///      fanout deliveries, and best-effort peak server RSS.
+pub async fn sow_wide(cfg: &ScenarioConfig) -> Result<()> {
+    let rows = if cfg.wide_rows == 0 { 30_000 } else { cfg.wide_rows };
+    let cols = if cfg.wide_cols == 0 { 400 } else { cfg.wide_cols };
+    let live_rate = if cfg.publish_rate <= 0.0 { 5_000.0 } else { cfg.publish_rate };
+
+    println!("──────────────────────────────────────────────────");
+    println!("Scenario: sow-wide  ({rows} rows × {cols} cols)");
+
+    // ---- phase 1: seed ------------------------------------------------
+    let seeder = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| format!("seeder connect {}", cfg.server_url))?;
+    // Size a batch so each `publish_batch` frame stays well under the 16 MiB
+    // wire limit — wide rows (e.g. 2000 cols ≈ 34 KB/row) would blow a fixed
+    // 500-row batch, so derive the batch from the measured row width with an
+    // ~8 MiB target and a sane floor/ceiling.
+    let per_row_bytes = serde_json::to_vec(&wide_row(0, cols)).map(|v| v.len()).unwrap_or(0);
+    const FRAME_TARGET: usize = 8 * 1024 * 1024;
+    let batch_size = (FRAME_TARGET / per_row_bytes.max(1)).clamp(1, 500);
+    let seed_start = Instant::now();
+    let mut batch: Vec<serde_json::Value> = Vec::with_capacity(batch_size);
+    for r in 0..rows as u64 {
+        batch.push(wide_row(r, cols));
+        if batch.len() == batch_size {
+            seeder
+                .publish_batch(&cfg.topic, std::mem::take(&mut batch))
+                .await
+                .with_context(|| "seed publish_batch failed")?;
+            batch = Vec::with_capacity(batch_size);
+        }
+    }
+    if !batch.is_empty() {
+        seeder.publish_batch(&cfg.topic, batch).await?;
+    }
+    let seed_elapsed = seed_start.elapsed();
+    let total_mb = (per_row_bytes * rows) as f64 / (1024.0 * 1024.0);
+    println!(
+        "Seed:      {rows} rows in {:.2}s  ({:.0} rows/s, ~{:.1} MB, ~{} B/row)",
+        seed_elapsed.as_secs_f64(),
+        rows as f64 / seed_elapsed.as_secs_f64(),
+        total_mb,
+        per_row_bytes,
+    );
+
+    // ---- phases 2+3: N concurrent subscribers -------------------------
+    // Each subscriber connects, requests the full wide snapshot, drains it,
+    // records its completion time, then reads live deltas (timing
+    // publish→delivery latency from the `_t` micro-stamp). One shared
+    // publisher drives sparse updates after every sub has caught up, so the
+    // measured latency reflects steady-state fanout, not snapshot backlog.
+    let n_subs = cfg.subscribers.max(1);
+    println!("Subscribers: {n_subs} concurrent (each pulls the full snapshot)");
+
+    // Shared monotonic clock so a publisher `_t` yields true latency at any sub.
+    let base = Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+    let delivery_hist = Arc::new(Mutex::new(LatencyHistogram::new()));
+    let delivered = Arc::new(AtomicU64::new(0));
+    let raw_deltas = Arc::new(AtomicU64::new(0));
+    let snaps_complete = Arc::new(AtomicU64::new(0));
+    let snap_rows_total = Arc::new(AtomicU64::new(0));
+    let snap_times: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::with_capacity(n_subs)));
+    let live_window = cfg.duration;
+
+    // Best-effort peak-RSS sampler via admin /stats every 250ms.
+    let peak_rss = Arc::new(Mutex::new(0.0f64));
+    let rss_stop = stop.clone();
+    let rss_peak = peak_rss.clone();
+    let admin_url = cfg.admin_url.clone();
+    let rss_task = tokio::spawn(async move {
+        let addr = admin_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string();
+        let admin = match cq_client::admin::AdminClient::new(&addr) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        while !rss_stop.load(Ordering::Relaxed) {
+            if let Ok((rss_mb, _subs)) = read_rss_subs(&admin).await {
+                let mut p = rss_peak.lock().await;
+                if rss_mb > *p {
+                    *p = rss_mb;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+
+    // Spawn the subscriber cohort.
+    let snap_phase_start = Instant::now();
+    let mut sub_handles = Vec::with_capacity(n_subs);
+    for _ in 0..n_subs {
+        let url = cfg.server_url.clone();
+        let topic = cfg.topic.clone();
+        let hist = delivery_hist.clone();
+        let dcount = delivered.clone();
+        let rcount = raw_deltas.clone();
+        let scomplete = snaps_complete.clone();
+        let srows = snap_rows_total.clone();
+        let stimes = snap_times.clone();
+        let sstop = stop.clone();
+        let want_rows = rows as u64;
+        sub_handles.push(tokio::spawn(async move {
+            let client = match Client::connect(&url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("subscriber connect failed: {e}");
+                    return;
+                }
+            };
+            let mut sub = match client.sow_and_subscribe(&topic, None, None).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("sow_and_subscribe failed: {e}");
+                    return;
+                }
+            };
+            // Phase 2: drain the snapshot.
+            let mut my_rows: u64 = 0;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(60), sub.next_delta()).await {
+                    Ok(Some(d)) if d.delta_type == cq_client::DeltaKind::SowSnapshot => {
+                        my_rows += 1;
+                        if my_rows >= want_rows {
+                            break;
+                        }
+                    }
+                    // A live delta arrived (snapshot effectively done) — count it
+                    // toward latency and fall through into the live loop.
+                    Ok(Some(d)) => {
+                        rcount.fetch_add(1, Ordering::Relaxed);
+                        if let Some(t) = d.data.get("_t").and_then(|v| v.as_u64()) {
+                            let now_us = base.elapsed().as_micros() as u64;
+                            if now_us >= t {
+                                hist.lock().await.record(Duration::from_micros(now_us - t));
+                                dcount.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        break;
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            srows.fetch_add(my_rows, Ordering::Relaxed);
+            stimes.lock().await.push(snap_phase_start.elapsed());
+            scomplete.fetch_add(1, Ordering::Relaxed);
+
+            // Phase 3: live loop until the stop flag is set.
+            loop {
+                if sstop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), sub.next_delta()).await {
+                    Ok(Some(d)) => {
+                        rcount.fetch_add(1, Ordering::Relaxed);
+                        if let Some(t) = d.data.get("_t").and_then(|v| v.as_u64()) {
+                            let now_us = base.elapsed().as_micros() as u64;
+                            if now_us >= t {
+                                hist.lock().await.record(Duration::from_micros(now_us - t));
+                                dcount.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {} // timeout — re-check stop flag
+                }
+            }
+        }));
+    }
+
+    // Barrier: wait until every subscriber has finished its snapshot (bounded),
+    // so the live publisher doesn't pollute latency with snapshot backlog.
+    let barrier_deadline = Instant::now() + Duration::from_secs(180);
+    while snaps_complete.load(Ordering::Relaxed) < n_subs as u64 {
+        if Instant::now() >= barrier_deadline {
+            println!(
+                "  ⚠ only {}/{n_subs} subscribers finished snapshot before barrier timeout",
+                snaps_complete.load(Ordering::Relaxed)
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let caught_up = snaps_complete.load(Ordering::Relaxed);
+    {
+        let times = snap_times.lock().await;
+        let (mn, mx) = times
+            .iter()
+            .fold((Duration::MAX, Duration::ZERO), |(mn, mx), &t| {
+                (mn.min(t), mx.max(t))
+            });
+        let agg_rows = snap_rows_total.load(Ordering::Relaxed);
+        let agg_mb = (per_row_bytes as u64 * agg_rows) as f64 / (1024.0 * 1024.0);
+        let span = if times.is_empty() { 0.0 } else { mx.as_secs_f64() };
+        println!(
+            "Snapshot:  {caught_up}/{n_subs} subs caught up, {agg_rows} total rows (~{:.1} MB) in {:.2}s",
+            agg_mb, span,
+        );
+        if !times.is_empty() {
+            println!(
+                "           per-sub completion: min {:.2}s / max {:.2}s, aggregate {:.0} MB/s",
+                mn.as_secs_f64(),
+                mx.as_secs_f64(),
+                if span > 0.0 { agg_mb / span } else { 0.0 },
+            );
+        }
+    }
+
+    // ---- live phase: single publisher, fanout to all subscribers ------
+    let pub_client = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| "live publisher connect")?;
+    let mut limiter = RateLimiter::new(live_rate);
+    let mut issued: u64 = 0;
+    let mut seed_rng: u64 = 0x9E3779B97F4A7C15;
+    let deadline = Instant::now() + live_window;
+    while Instant::now() < deadline {
+        limiter.tick().await;
+        // xorshift for a cheap pseudo-random existing key.
+        seed_rng ^= seed_rng << 13;
+        seed_rng ^= seed_rng >> 7;
+        seed_rng ^= seed_rng << 17;
+        let key = seed_rng % rows as u64;
+        let now_us = base.elapsed().as_micros() as u64;
+        let body = json!({ "k": key, "c2": issued, "_t": now_us });
+        if let Err(e) = pub_client.delta_publish(&cfg.topic, body).await {
+            eprintln!("live delta_publish error at issued={issued}: {e}");
+        }
+        issued += 1;
+    }
+
+    // Let tail deltas land, then stop subscribers + RSS sampler.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.store(true, Ordering::Relaxed);
+    for h in sub_handles {
+        let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(1), rss_task).await;
+
+    let hist = delivery_hist.lock().await;
+    let got = delivered.load(Ordering::Relaxed);
+    let expected = issued * n_subs as u64;
+    println!(
+        "Live:      {issued} updates issued @ {:.0}/s target over {:.0}s ({n_subs}× fanout ⇒ {expected} expected deliveries)",
+        limiter.actual_rate(),
+        live_window.as_secs_f64(),
+    );
+    println!(
+        "Delivery:  raw deltas = {}, with _t = {got}, pub→delivery p50 = {}µs, p95 = {}µs, p99 = {}µs",
+        raw_deltas.load(Ordering::Relaxed),
+        hist.p50().as_micros(),
+        hist.p95().as_micros(),
+        hist.p99().as_micros(),
+    );
+    {
+        let peak = *peak_rss.lock().await;
+        if peak > 0.0 {
+            println!("Server:    peak RSS {:.0} MB during run", peak);
+        }
+    }
+    println!("──────────────────────────────────────────────────");
+    Ok(())
+}
+
+/// Egress-fanout scenario: ramp `--subscribers N` *lightweight* firehose
+/// subscribers (drain-and-discard — they never retain a row), then run one
+/// publisher at `--rate` msg/s with `--payload-bytes` bodies. Every publish
+/// fans out to all N subs, so the ideal egress is `rate × N × body_bytes`.
+///
+/// Unlike `sow-wide` (which holds a full deserialized snapshot per sub and so
+/// is bounded by *client* heap), this scenario measures the server's
+/// **wire-egress ceiling** at high connection counts: how many deltas/sec and
+/// MB/sec it actually pushes, what fraction of the ideal fanout is delivered
+/// (a number well below 100 % means the server is shedding — slow-consumer
+/// drops or queue-cap), and the peak server RSS while holding N connections.
+///
+/// Reuses `cfg.subscribers` (N, default 1), `cfg.publish_rate` (msg/s,
+/// default 100), `cfg.payload_bytes` (body size, 0 ⇒ tiny `{k,v}`),
+/// `cfg.duration` (measurement window), `cfg.admin_url` (RSS sampling).
+pub async fn egress_fanout(cfg: &ScenarioConfig) -> Result<()> {
+    use cq_client::admin::AdminClient;
+    // Connect-storm pacing — 100 connects per 100 ms = ~1000/s. Localhost
+    // tolerates this; bump WAVE_MS if the server's accept loop saturates.
+    const WAVE_SIZE: usize = 100;
+    const WAVE_MS: u64 = 100;
+
+    let n_subs = cfg.subscribers.max(1);
+    // `--rate 0` ⇒ unthrottled: publishers push as fast as the server
+    // accepts (self-throttle on the bounded mutation channel), which is how
+    // we find the egress ceiling.
+    let rate = cfg.publish_rate.max(0.0);
+    let payload = cfg.payload_bytes;
+    let body_bytes = serde_json::to_vec(&padded_body(0, payload))
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    println!("──────────────────────────────────────────────────");
+    let rate_label = if rate <= 0.0 {
+        "unthrottled".to_string()
+    } else {
+        format!("{rate:.0}/s")
+    };
+    println!(
+        "Scenario: egress-fanout  ({n_subs} firehose subs, pub {rate_label} × ~{body_bytes}B body)"
+    );
+
+    let admin_hostport = cfg
+        .admin_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string();
+    let admin = AdminClient::new(&admin_hostport).ok();
+    let baseline_rss = if let Some(a) = &admin {
+        read_rss_subs(a).await.map(|(r, _)| r).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    // Seed one row so the firehose has a schema to deliver against.
+    let seeder = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| "egress seeder connect")?;
+    seeder
+        .publish(&cfg.topic, padded_body(0, payload))
+        .await
+        .with_context(|| "egress seed publish")?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let deliveries = Arc::new(AtomicU64::new(0));
+    let opened = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+
+    // Ramp subscribers in waves.
+    let ramp_start = Instant::now();
+    let mut handles = Vec::with_capacity(n_subs);
+    for i in 0..n_subs {
+        let url = cfg.server_url.clone();
+        let topic = cfg.topic.clone();
+        let d = deliveries.clone();
+        let o = opened.clone();
+        let f = failed.clone();
+        let s = stop.clone();
+        handles.push(tokio::spawn(async move {
+            let client = match tokio::time::timeout(Duration::from_secs(20), Client::connect(&url))
+                .await
+            {
+                Ok(Ok(c)) => c,
+                _ => {
+                    f.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let mut sub = match tokio::time::timeout(
+                Duration::from_secs(20),
+                client.subscribe(&topic, None),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                _ => {
+                    f.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            o.fetch_add(1, Ordering::Relaxed);
+            // Drain-and-discard: count the delta, drop the row immediately.
+            while !s.load(Ordering::Relaxed) {
+                match tokio::time::timeout(Duration::from_millis(200), sub.next_delta()).await {
+                    Ok(Some(_)) => {
+                        d.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+        }));
+        if (i + 1) % WAVE_SIZE == 0 {
+            tokio::time::sleep(Duration::from_millis(WAVE_MS)).await;
+        }
+    }
+
+    // Wait until every sub has connected+subscribed (or a 180 s ceiling).
+    let ramp_deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let up = opened.load(Ordering::Relaxed);
+        let fl = failed.load(Ordering::Relaxed);
+        if up + fl >= n_subs as u64 {
+            break;
+        }
+        if Instant::now() >= ramp_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let ramp_s = ramp_start.elapsed().as_secs_f64();
+    let subs_up = opened.load(Ordering::Relaxed);
+    println!(
+        "Ramp:      {subs_up}/{n_subs} subs subscribed in {ramp_s:.1}s  (failed {})",
+        failed.load(Ordering::Relaxed)
+    );
+
+    // Peak-RSS sampler (best-effort).
+    let peak_rss = Arc::new(Mutex::new(baseline_rss));
+    let rss_stop = stop.clone();
+    let rss_peak = peak_rss.clone();
+    let rss_admin_hostport = admin_hostport.clone();
+    let rss_task = tokio::spawn(async move {
+        let a = match AdminClient::new(&rss_admin_hostport) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        while !rss_stop.load(Ordering::Relaxed) {
+            if let Ok((rss, _)) = read_rss_subs(&a).await {
+                let mut p = rss_peak.lock().await;
+                if rss > *p {
+                    *p = rss;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+
+    // Publisher pool. A *single* synchronous publisher awaiting each ack
+    // tops out at the publish→ack RTT (≈ tens/sec once fanout is heavy), so
+    // it would measure ack latency, not the server's egress ceiling. Instead
+    // run `PUB_CONNS` independent publisher connections in parallel: together
+    // they keep the server's ingest+fanout pipeline saturated and self-
+    // throttle on the bounded mutation channel, so the *server* becomes the
+    // limiting factor. `--rate` caps the combined publish rate (0 ⇒ as fast
+    // as the server accepts); the cap is split evenly across connections.
+    const PUB_CONNS: usize = 16;
+    let per_conn_rate = if rate <= 0.0 { 0.0 } else { rate / PUB_CONNS as f64 };
+    let issued = Arc::new(AtomicU64::new(0));
+
+    // Reset the delivery counter just before the window so ramp-time deltas
+    // (the seed fanout) don't count.
+    deliveries.store(0, Ordering::Relaxed);
+    let meas_start = Instant::now();
+    let deadline = meas_start + cfg.duration;
+
+    let mut pub_handles = Vec::with_capacity(PUB_CONNS);
+    for p in 0..PUB_CONNS {
+        let url = cfg.server_url.clone();
+        let topic = cfg.topic.clone();
+        let issued = issued.clone();
+        pub_handles.push(tokio::spawn(async move {
+            let pubc = match Client::connect(&url).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("egress publisher {p} connect failed: {e}");
+                    return;
+                }
+            };
+            let mut limiter = RateLimiter::new(per_conn_rate);
+            // Stripe keys by connection so no two publishers collide on a key
+            // in the same instant (keeps every publish a distinct row event).
+            let mut k: u64 = p as u64 + 1;
+            let mut errs = 0u64;
+            while Instant::now() < deadline {
+                limiter.tick().await;
+                if let Err(e) = pubc.publish(&topic, padded_body(k, payload)).await {
+                    if errs < 2 {
+                        eprintln!("egress publish error (conn {p}): {e}");
+                    }
+                    errs += 1;
+                }
+                k = k.wrapping_add(PUB_CONNS as u64);
+                issued.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    let _ = futures::future::join_all(pub_handles).await;
+
+    // Let in-flight deltas land before stopping the drainers — scale the
+    // grace period with connection count (more conns ⇒ longer flush tail).
+    let drain_ms = 750 + (subs_up / 4).min(3000);
+    tokio::time::sleep(Duration::from_millis(drain_ms)).await;
+    let meas_s = meas_start.elapsed().as_secs_f64();
+    let issued = issued.load(Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::join_all(handles),
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), rss_task).await;
+
+    let got = deliveries.load(Ordering::Relaxed);
+    let ideal = issued.saturating_mul(subs_up);
+    let pct = if ideal > 0 {
+        100.0 * got as f64 / ideal as f64
+    } else {
+        0.0
+    };
+    let egress_mb = (got.saturating_mul(body_bytes as u64)) as f64 / (1024.0 * 1024.0);
+    println!(
+        "Publish:   {issued} msgs @ {:.0}/s actual over {meas_s:.1}s ({PUB_CONNS} pub conns)",
+        issued as f64 / meas_s.max(0.001),
+    );
+    println!(
+        "Delivered: {got} deltas = {pct:.1}% of {ideal} ideal fanout ({subs_up} subs × {issued} msgs)"
+    );
+    println!(
+        "Egress:    {:.0} deltas/s,  ~{:.0} MB/s  (~{body_bytes} B/delta)",
+        got as f64 / meas_s,
+        egress_mb / meas_s,
+    );
+    {
+        let peak = *peak_rss.lock().await;
+        println!(
+            "Server:    RSS baseline {:.0} MB → peak {:.0} MB  (Δ {:+.0} MB for {subs_up} conns)",
+            baseline_rss,
+            peak,
+            peak - baseline_rss,
+        );
+    }
+    if pct < 95.0 {
+        println!(
+            "  ⚠ delivered < 95% of ideal — server shedding load (slow-consumer / queue-cap) \
+             or client can't drain {subs_up} conns fast enough"
+        );
+    }
+    println!("──────────────────────────────────────────────────");
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────

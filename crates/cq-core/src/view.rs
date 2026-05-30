@@ -54,11 +54,13 @@ const QUIET_WINDOW: Duration = Duration::from_millis(75);
 const MAX_REFRESH_DELAY: Duration = Duration::from_secs(1);
 
 use crate::query::{
-    combined_join_schema, parse_query, peek_join, AggFn, ParsedQuery, QueryError,
+    aggregate_one_group, build_group_membership, combined_join_schema,
+    group_key_canonical_from_store, parse_query, peek_join, AggFn, ParsedQuery, QueryError,
 };
 use crate::schema::{ColumnType, Schema};
 use crate::subscription::group_key_canonical;
-use crate::topic::{MutationEvent, SharedTopic, Topic, TopicConfig, TopicError};
+use crate::topic::{MutationEvent, MutationKind, SharedTopic, Topic, TopicConfig, TopicError};
+use roaring::RoaringBitmap;
 
 /// One materialized view. Wraps the source topic, the derived
 /// view topic, and the canonical "last emitted" map keyed by group.
@@ -87,6 +89,27 @@ pub struct View {
 struct ViewState {
     /// Canonical group key → last-emitted row map.
     last_emitted: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// S22-incremental — per-group set of source row indices currently
+    /// matching the view's predicate. Lets one mutation recompute only
+    /// the group(s) it touches. Seeded from a full scan on the first
+    /// incremental pass (and re-seeded after any reconciliation).
+    group_rows: HashMap<String, RoaringBitmap>,
+    /// S22-incremental — reverse map: source row index → its current
+    /// group key. Used to move a mutated row between groups.
+    row_group: HashMap<u32, String>,
+    /// S22-incremental — false until membership maps have been seeded.
+    /// Reset to false whenever a dropped tap event forces a full
+    /// reconciliation, so the next incremental pass re-seeds first.
+    incremental_ready: bool,
+    /// S22-incremental — highest source sequence already reflected in
+    /// `last_emitted` / membership. Tap events with `sequence <= seed_seq`
+    /// were captured by the seed snapshot and must be skipped to avoid
+    /// double-counting (the tap is registered before the seed read, so a
+    /// publish can land in both).
+    seed_seq: u64,
+    /// Last `Topic::view_tap_drops` value the runner observed. An
+    /// increase means events were missed → reconcile instead of trust.
+    last_seen_drops: u64,
 }
 
 /// Errors that can surface during view construction or refresh.
@@ -273,6 +296,13 @@ impl View {
             refresh_count: AtomicU64::new(0),
         });
         view.refresh()?;
+        // Eagerly seed incremental membership from the same source state
+        // the initial refresh observed, so the first mutation has a
+        // correct "old group" to move rows out of (a lazy seed taken
+        // after the event already applied would miss vanished groups).
+        if view.supports_incremental() {
+            view.seed_membership();
+        }
         Ok(view)
     }
 
@@ -335,10 +365,152 @@ impl View {
         Ok(())
     }
 
-    /// Number of completed refreshes since construction (includes the
-    /// initial population in `View::new`).
+    /// Number of completed *full* refreshes since construction (includes
+    /// the initial population in `View::new` and any drop-triggered
+    /// reconciliation). Incremental per-event updates do not bump this —
+    /// they're the cheap steady-state path.
     pub fn refresh_count(&self) -> u64 {
         self.refresh_count.load(Ordering::Relaxed)
+    }
+
+    /// S22 — whether this view can be maintained incrementally (recompute
+    /// only the group a mutation touches) rather than by full re-scan.
+    /// Mirrors the subscription engine's `aggregate_needs_full_recompute`
+    /// classification: JOIN / PIVOT / LIMIT / OFFSET / window / implicit
+    /// single-group shapes always full-recompute.
+    pub fn supports_incremental(&self) -> bool {
+        self.right_topic.is_none()
+            && self.query.join.is_none()
+            && self.query.pivot.is_none()
+            && self.query.unpivot.is_none()
+            && self.query.limit.is_none()
+            && self.query.offset.is_none()
+            && self.query.windows.is_empty()
+            && !self.query.group_by.is_empty()
+    }
+
+    /// S22 — (re)seed incremental membership from the current source
+    /// snapshot and record the applied sequence watermark. Called once
+    /// in `View::new` and again by the runner after a full-refresh
+    /// reconciliation (tap drops may have desynced the maps). Assumes
+    /// `last_emitted` already matches this snapshot (the preceding
+    /// `refresh()` ensures that).
+    fn seed_membership(&self) {
+        let mut state = self.state.lock();
+        self.source_topic.with_live_store(|store, live, applied_seq| {
+            let (gr, rg) = build_group_membership(&self.query, store, Some(live));
+            state.group_rows = gr;
+            state.row_group = rg;
+            state.seed_seq = applied_seq;
+            state.incremental_ready = true;
+        });
+    }
+
+    /// S22 — apply a single source mutation to the view incrementally.
+    /// Updates per-group membership for the mutated row, recomputes only
+    /// the affected group(s), and applies one upsert/delete per changed
+    /// group to the view topic. Membership is seeded lazily on the first
+    /// call (and after any reconciliation). Only valid when
+    /// `supports_incremental()` — the runner gates on that.
+    fn apply_event_incremental(&self, ev: &MutationEvent) -> Result<(), ViewError> {
+        let group_cols = self.query.group_by.clone();
+        let mut state = self.state.lock();
+
+        let (to_upsert, to_delete): (
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            Vec<String>,
+        ) = self.source_topic.with_live_store(|store, live, _applied_seq| {
+            // Skip events already folded into the seed snapshot (the tap
+            // is registered before the seed read, so a publish can appear
+            // both in the seed and in the tap queue).
+            if ev.sequence <= state.seed_seq {
+                return (Vec::new(), Vec::new());
+            }
+            let row = ev.row;
+            // A delete (or a stale upsert whose row was since tombstoned —
+            // the tap lags the writer) is no longer a live member. Gating
+            // on `live` keeps membership consistent with the full-scan
+            // path (`build_group_membership` filters by live rows too) and
+            // avoids fabricating a phantom group from a nulled row under a
+            // `True` predicate.
+            let matches = ev.kind != MutationKind::Delete
+                && live.contains(row)
+                && self.query.predicate.matches(store, row);
+            let new_key = if matches {
+                Some(group_key_canonical_from_store(store, row, &group_cols))
+            } else {
+                None
+            };
+            let old_key = state.row_group.get(&row).cloned();
+            if old_key.is_none() && new_key.is_none() {
+                return (Vec::new(), Vec::new());
+            }
+
+            // Phase 1 — update membership; collect dirty group keys.
+            let mut dirty: Vec<String> = Vec::with_capacity(2);
+            match (&old_key, &new_key) {
+                (Some(ok), Some(nk)) if ok == nk => dirty.push(nk.clone()),
+                _ => {
+                    if let Some(ok) = &old_key {
+                        if let Some(bm) = state.group_rows.get_mut(ok) {
+                            bm.remove(row);
+                            if bm.is_empty() {
+                                state.group_rows.remove(ok);
+                            }
+                        }
+                        dirty.push(ok.clone());
+                    }
+                    if let Some(nk) = &new_key {
+                        state.group_rows.entry(nk.clone()).or_default().insert(row);
+                        dirty.push(nk.clone());
+                    }
+                }
+            }
+            match &new_key {
+                Some(nk) => {
+                    state.row_group.insert(row, nk.clone());
+                }
+                None => {
+                    state.row_group.remove(&row);
+                }
+            }
+
+            // Phase 2 — recompute each dirty group, diff against last_emitted.
+            let mut to_upsert = Vec::new();
+            let mut to_delete = Vec::new();
+            for key in &dirty {
+                let recomputed = match state.group_rows.get(key) {
+                    Some(bm) if !bm.is_empty() => aggregate_one_group(&self.query, store, bm),
+                    _ => None,
+                };
+                match recomputed {
+                    Some(new_row) => match state.last_emitted.get(key) {
+                        Some(prev) if prev == &new_row => {}
+                        _ => {
+                            state.last_emitted.insert(key.clone(), new_row.clone());
+                            to_upsert.push(new_row);
+                        }
+                    },
+                    None => {
+                        if let Some(prev) = state.last_emitted.remove(key) {
+                            if let Some(k) = self.compose_view_key(&prev) {
+                                to_delete.push(k);
+                            }
+                        }
+                    }
+                }
+            }
+            (to_upsert, to_delete)
+        });
+
+        drop(state);
+        for row in to_upsert {
+            self.view_topic.upsert_map(&row)?;
+        }
+        for key in to_delete {
+            self.view_topic.delete(&key)?;
+        }
+        Ok(())
     }
 
     /// Compose the view's primary-key string from a row map, using the
@@ -375,44 +547,89 @@ impl View {
 /// effective refresh — since `refresh()` reads the *current* source
 /// state, redundant per-event passes would just write the same
 /// answer to the view multiple times.
-pub fn spawn_view_runner(view: Arc<View>, tap_rx: Receiver<MutationEvent>) -> JoinHandle<()> {
+/// Bursts larger than this take the full-recompute path even when the
+/// view is incremental-capable: at that point one O(rows) scan is
+/// cheaper than N per-group recomputes, and it also re-seeds membership.
+const INCREMENTAL_BATCH_CAP: usize = 256;
+
+pub fn spawn_view_runner(
+    view: Arc<View>,
+    tap_rx: Receiver<MutationEvent>,
+) -> std::io::Result<JoinHandle<()>> {
     let view_name = view.view_topic.name().to_string();
     std::thread::Builder::new()
         .name(format!("view:{}", view_name))
         .spawn(move || {
-            tracing::info!(view = %view_name, "View runner started");
-            // Debounce: block for the first event, then absorb the
-            // burst, refreshing once after QUIET_WINDOW of silence or
-            // MAX_REFRESH_DELAY since the first event — whichever comes
-            // first. `refresh()` re-reads current source state, so one
-            // pass after a burst is equivalent to one per event, but
-            // without re-scanning a growing source under the writer's
-            // lock (which is what collapses bulk-seed throughput).
+            let incremental = view.supports_incremental();
+            tracing::info!(view = %view_name, incremental, "View runner started");
+            // Debounce: block for the first event, then absorb the burst
+            // (up to QUIET_WINDOW of silence or MAX_REFRESH_DELAY since
+            // the first event). Then either replay the burst
+            // incrementally (cheap steady state) or, for large bursts /
+            // non-incremental shapes / dropped tap events, do one full
+            // re-scan that also re-seeds incremental membership.
             'outer: loop {
-                // Block until the first event of a new burst (or exit
-                // when the source's tap senders are all dropped).
-                if tap_rx.recv().is_err() {
-                    break;
-                }
+                let first = match tap_rx.recv() {
+                    Ok(ev) => ev,
+                    Err(_) => break, // all tap senders dropped → exit
+                };
+                let mut batch: Vec<MutationEvent> = vec![first];
                 let deadline = Instant::now() + MAX_REFRESH_DELAY;
-                loop {
+                let disconnected = loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        break; // hit the staleness cap under unbroken load
+                        break false; // hit the staleness cap under unbroken load
                     }
                     match tap_rx.recv_timeout(QUIET_WINDOW.min(remaining)) {
-                        Ok(_) => continue,                       // burst ongoing; keep absorbing
-                        Err(RecvTimeoutError::Timeout) => break, // quiet (or capped) → refresh
-                        Err(RecvTimeoutError::Disconnected) => break 'outer,
+                        Ok(ev) => batch.push(ev),
+                        Err(RecvTimeoutError::Timeout) => break false,
+                        Err(RecvTimeoutError::Disconnected) => break true,
                     }
-                }
-                if let Err(e) = view.refresh() {
-                    tracing::warn!(view = %view_name, error = %e, "View refresh failed");
+                };
+
+                run_view_batch(&view, incremental, &batch, &view_name);
+
+                if disconnected {
+                    break 'outer;
                 }
             }
             tracing::info!(view = %view_name, "View runner exiting");
         })
-        .expect("view runner spawn")
+}
+
+/// Process one absorbed burst: incremental replay when safe, otherwise a
+/// full re-scan that also invalidates (re-seeds) incremental membership.
+fn run_view_batch(view: &Arc<View>, incremental: bool, batch: &[MutationEvent], view_name: &str) {
+    // Detect dropped tap events since the last burst: if any were
+    // dropped, our incremental membership may have missed a mutation, so
+    // we must reconcile with a full scan rather than trust it.
+    let drops_now = view.source_topic.view_tap_drops();
+    let dropped = {
+        let mut state = view.state.lock();
+        let d = drops_now != state.last_seen_drops;
+        state.last_seen_drops = drops_now;
+        d
+    };
+
+    let use_incremental =
+        incremental && !dropped && batch.len() <= INCREMENTAL_BATCH_CAP;
+
+    if use_incremental {
+        for ev in batch {
+            if let Err(e) = view.apply_event_incremental(ev) {
+                tracing::warn!(view = %view_name, error = %e, "View incremental update failed");
+            }
+        }
+    } else {
+        if let Err(e) = view.refresh() {
+            tracing::warn!(view = %view_name, error = %e, "View refresh failed");
+        }
+        // The full scan rebuilt `last_emitted`; re-seed membership from
+        // the same snapshot so the incremental path can resume.
+        if incremental {
+            view.seed_membership();
+        }
+    }
 }
 
 /// S20 — for JOIN views, the runner needs to wake on EITHER source
@@ -426,7 +643,7 @@ pub fn spawn_view_runner_joined(
     view: Arc<View>,
     left_tap: Receiver<MutationEvent>,
     right_tap: Receiver<MutationEvent>,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     let (merged_tx, merged_rx) = crossbeam_channel::bounded::<MutationEvent>(1024);
     // Forward thread: select on either tap; exit when both are closed.
     let view_name = view.view_topic.name().to_string();
@@ -443,7 +660,6 @@ pub fn spawn_view_runner_joined(
                     Err(_) => return,
                 },
             }
-        })
-        .expect("view fan-in spawn");
+        })?;
     spawn_view_runner(view, merged_rx)
 }

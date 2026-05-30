@@ -29,6 +29,19 @@ export type ClientMsg =
       sql?: string;
     }
   | { kind: 'unsubscribe'; subId: string }
+  | {
+      /**
+       * One-shot SQL fetch (JOINs / derived tables). Unlike `subscribe`,
+       * this routes through the server's one-shot SOW path and streams no
+       * live deltas. The hub replies with `snapshot` chunks tagged with
+       * `reqId` (used as `subId`) and a terminating `more:false`, or an
+       * `error` tagged with `reqId`.
+       */
+      kind: 'sow';
+      reqId: string;
+      topic: string;
+      sql: string;
+    }
   | { kind: 'ping' };
 
 /** Worker → Main. */

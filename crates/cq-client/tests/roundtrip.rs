@@ -10,7 +10,6 @@ use cq_transport::heartbeat::HeartbeatConfig;
 use cq_transport::queue::{new_queue_registry, Queue};
 use cq_transport::router::RouterContext;
 use cq_transport::session::new_registry;
-use cq_transport::tcp;
 use dashmap::DashMap;
 use serde_json::json;
 use std::sync::Arc;
@@ -58,6 +57,7 @@ async fn spawn_test_server() -> (String, Arc<DashMap<String, SharedTopic>>) {
         spillover: None,
         read_only: false,
         query_limits: cq_core::query::QueryLimits::default(),
+        sync_replication: cq_transport::router::SyncReplication::default(),
     };
     tokio::spawn(async move {
         loop {

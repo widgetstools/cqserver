@@ -1,32 +1,79 @@
 /**
  * Atlas design tokens — Modernist Mono · Amber.
  *
- * Scoped under `.atlas-root` so this file can be imported app-wide
- * without bleeding into the existing examples (which still use
- * tokens.css + globals.css). Every Atlas component lives inside an
- * `.atlas-root` container.
+ * Dark and light use a fiery orange-red accent (#ff5722 / #ea580c).
  */
 @import "@fontsource-variable/jetbrains-mono/wght.css";
 
-.atlas-root {
-  /* ── palette ───────────────────────────────────────────────── */
+/* ── Dark (default) ─────────────────────────────────────────────── */
+html[data-theme="dark"],
+html:not([data-theme]) {
   --atlas-ink: #0e0e10;
   --atlas-ink-2: #14141a;
   --atlas-surface: rgba(255, 255, 255, .02);
+  --atlas-cell-empty: rgba(255, 255, 255, .02);
   --atlas-rule: rgba(255, 255, 255, .08);
   --atlas-rule-soft: rgba(255, 255, 255, .035);
+  --atlas-grid-line: rgba(255, 255, 255, .035);
   --atlas-fg: #e6e6e6;
   --atlas-fg-dim: rgba(230, 230, 230, .55);
   --atlas-fg-faint: rgba(230, 230, 230, .35);
-  --atlas-amber: #f4a52b;
-  --atlas-amber-soft: rgba(244, 165, 43, .08);
-  --atlas-amber-glow: 0 0 12px rgba(244, 165, 43, .45);
+  --atlas-amber: #ff5722;
+  --atlas-amber-soft: rgba(255, 87, 34, .08);
+  --atlas-amber-glow: 0 0 14px rgba(255, 87, 34, .55);
   --atlas-neg: #ff6062;
+  --atlas-page-bg: #0e0e10;
+  --atlas-page-fg: #e6e6e6;
+  --atlas-scrollbar-track: rgba(255, 255, 255, .04);
+  --atlas-scrollbar-thumb: rgba(255, 255, 255, .18);
+  --atlas-scrollbar-thumb-hover: rgba(255, 87, 34, .52);
+  --atlas-hover-surface: rgba(255, 255, 255, .06);
+  --atlas-key-badge-bg: rgba(255, 255, 255, .08);
+  --atlas-on-heat: #ffffff;
+  --atlas-pos-bar: rgba(255, 87, 34, .68);
+  --atlas-neg-bar: rgba(255, 96, 98, .65);
+  --atlas-neg-bar-strong: rgba(255, 96, 98, .7);
+  --atlas-hero-glow: 0 0 28px rgba(255, 87, 34, .35);
+  --atlas-chip-active-border: rgba(255, 87, 34, .68);
+  --atlas-heat-flash: rgba(255, 87, 34, .88);
+  --atlas-popover-shadow: 0 16px 40px -10px rgba(0, 0, 0, .6);
+}
 
-  /* ── type ──────────────────────────────────────────────────── */
+/* ── Light — warm paper studio, richer amber & rose saturation ───── */
+html[data-theme="light"] {
+  --atlas-ink: #f7f5f0;
+  --atlas-ink-2: #ebe6dc;
+  --atlas-surface: rgba(234, 88, 12, .12);
+  --atlas-cell-empty: rgba(42, 38, 32, .055);
+  --atlas-rule: rgba(42, 38, 32, .14);
+  --atlas-rule-soft: rgba(42, 38, 32, .075);
+  --atlas-grid-line: rgba(42, 38, 32, .055);
+  --atlas-fg: #2a2722;
+  --atlas-fg-dim: rgba(42, 39, 34, .82);
+  --atlas-fg-faint: rgba(42, 39, 34, .64);
+  --atlas-amber: #ea580c;
+  --atlas-amber-soft: rgba(234, 88, 12, .22);
+  --atlas-amber-glow: 0 0 18px rgba(234, 88, 12, .58);
+  --atlas-neg: #ff4757;
+  --atlas-page-bg: #f7f5f0;
+  --atlas-page-fg: #2a2722;
+  --atlas-scrollbar-track: rgba(42, 38, 32, .07);
+  --atlas-scrollbar-thumb: rgba(234, 88, 12, .38);
+  --atlas-scrollbar-thumb-hover: rgba(234, 88, 12, .65);
+  --atlas-hover-surface: rgba(234, 88, 12, .16);
+  --atlas-key-badge-bg: rgba(42, 38, 32, .08);
+  --atlas-on-heat: #ffffff;
+  --atlas-pos-bar: rgba(234, 88, 12, .78);
+  --atlas-neg-bar: rgba(255, 59, 72, .62);
+  --atlas-neg-bar-strong: rgba(255, 59, 72, .72);
+  --atlas-hero-glow: 0 0 36px rgba(234, 88, 12, .44);
+  --atlas-chip-active-border: rgba(234, 88, 12, .78);
+  --atlas-heat-flash: rgba(234, 88, 12, .92);
+  --atlas-popover-shadow: 0 12px 32px -8px rgba(42, 38, 32, .18);
+}
+
+.atlas-root {
   --atlas-font: 'JetBrains Mono Variable', ui-monospace, 'SF Mono', monospace;
-
-  /* ── spacing scale (4px base) ──────────────────────────────── */
   --atlas-sp-1: 4px;
   --atlas-sp-2: 8px;
   --atlas-sp-3: 12px;
@@ -39,28 +86,117 @@
   font-family: var(--atlas-font);
   font-feature-settings: 'tnum';
   -webkit-font-smoothing: antialiased;
+
+  scrollbar-color: var(--atlas-scrollbar-thumb) var(--atlas-scrollbar-track);
+  scrollbar-width: thin;
 }
 
-/* Background grid — structural rhythm, masked to the focal area. */
+.atlas-root ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.atlas-root ::-webkit-scrollbar-track {
+  background: var(--atlas-scrollbar-track);
+}
+
+.atlas-root ::-webkit-scrollbar-thumb {
+  background: var(--atlas-scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.atlas-root ::-webkit-scrollbar-thumb:hover {
+  background: var(--atlas-scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+.atlas-root .ag-body-viewport,
+.atlas-root .ag-body-horizontal-scroll-viewport,
+.atlas-root .ag-center-cols-viewport {
+  scrollbar-color: var(--atlas-scrollbar-thumb) var(--atlas-scrollbar-track);
+  scrollbar-width: thin;
+}
+
+.atlas-root .ag-body-viewport::-webkit-scrollbar,
+.atlas-root .ag-body-horizontal-scroll-viewport::-webkit-scrollbar,
+.atlas-root .ag-center-cols-viewport::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.atlas-root .ag-body-viewport::-webkit-scrollbar-track,
+.atlas-root .ag-body-horizontal-scroll-viewport::-webkit-scrollbar-track,
+.atlas-root .ag-center-cols-viewport::-webkit-scrollbar-track {
+  background: var(--atlas-scrollbar-track);
+}
+
+.atlas-root .ag-body-viewport::-webkit-scrollbar-thumb,
+.atlas-root .ag-body-horizontal-scroll-viewport::-webkit-scrollbar-thumb,
+.atlas-root .ag-center-cols-viewport::-webkit-scrollbar-thumb {
+  background: var(--atlas-scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.atlas-root .ag-body-viewport::-webkit-scrollbar-thumb:hover,
+.atlas-root .ag-body-horizontal-scroll-viewport::-webkit-scrollbar-thumb:hover,
+.atlas-root .ag-center-cols-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--atlas-scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+/* AG Grid — hide column header icons until hover (or active filter/sort/menu). */
+.atlas-root .ag-header-cell .ag-header-cell-filter-button,
+.atlas-root .ag-header-cell .ag-header-cell-menu-button,
+.atlas-root .ag-header-cell .ag-sort-indicator-container,
+.atlas-root .ag-header-group-cell .ag-header-cell-menu-button,
+.atlas-root .ag-header-group-cell .ag-header-expand-icon {
+  display: none;
+}
+
+.atlas-root .ag-header-cell:hover .ag-header-cell-filter-button,
+.atlas-root .ag-header-cell:hover .ag-header-cell-menu-button,
+.atlas-root .ag-header-cell:hover .ag-sort-indicator-container,
+.atlas-root .ag-header-group-cell:hover .ag-header-cell-menu-button,
+.atlas-root .ag-header-group-cell:hover .ag-header-expand-icon,
+.atlas-root .ag-header-cell.ag-header-cell-filtered .ag-header-cell-filter-button,
+.atlas-root .ag-header-cell.ag-column-menu-visible .ag-header-cell-filter-button,
+.atlas-root .ag-header-cell.ag-column-menu-visible .ag-header-cell-menu-button,
+.atlas-root .ag-header-cell.ag-header-active .ag-header-cell-filter-button,
+.atlas-root .ag-header-cell.ag-header-active .ag-header-cell-menu-button,
+.atlas-root .ag-header-cell.ag-header-cell-sorted-asc .ag-sort-indicator-container,
+.atlas-root .ag-header-cell.ag-header-cell-sorted-desc .ag-sort-indicator-container {
+  display: flex;
+}
+
 .atlas-root.atlas-app {
   position: relative;
   min-height: 100vh;
 }
+
 .atlas-root.atlas-app::before {
   content: "";
   position: absolute;
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(to right, var(--atlas-rule-soft) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--atlas-rule-soft) 1px, transparent 1px);
+    linear-gradient(to right, var(--atlas-grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--atlas-grid-line) 1px, transparent 1px);
   background-size: 32px 32px;
   -webkit-mask-image: radial-gradient(1400px 800px at 25% 0%, #000 50%, transparent 100%);
           mask-image: radial-gradient(1400px 800px at 25% 0%, #000 50%, transparent 100%);
 }
 
-/* The single signature motion — live tick pulse on the amber dot. */
+html[data-theme="light"] .atlas-root.atlas-app::before {
+  -webkit-mask-image: radial-gradient(1500px 900px at 22% 0%, #000 42%, transparent 100%);
+          mask-image: radial-gradient(1500px 900px at 22% 0%, #000 42%, transparent 100%);
+}
+
 @keyframes atlas-pulse { 0%,100% {opacity:1} 50% {opacity:.4} }
+
 .atlas-root .atlas-live-dot {
   display: inline-block;
   width: 6px;

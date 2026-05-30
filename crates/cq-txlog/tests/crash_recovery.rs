@@ -9,6 +9,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::Duration;
 
 use cq_txlog::reader::TxLogReader;
 use cq_txlog::writer::TxLogWriter;
@@ -71,6 +72,47 @@ fn torn_write_at_tail_truncates_and_recovers_prior_entries() {
     }
 }
 
+/// Reopening a multi-segment log seeds `max_sequence` from the newest
+/// non-empty segment's highest sequence — without re-reading the whole log.
+/// This is the fast-restart invariant: the writer's resume scan must be
+/// O(one segment), and it must still return the true global max even when
+/// the data spans many rotated segments.
+#[test]
+fn reopen_seeds_max_sequence_from_tail_segment() {
+    let dir = tempdir().unwrap();
+    let segment_size = 256u64; // force frequent rotation
+    let n = 60usize;
+
+    {
+        let mut w =
+            TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, segment_size)
+                .expect("open");
+        for i in 0..n {
+            w.append(
+                (i as u64) + 1,
+                "/t",
+                &format!("k{i:03}"),
+                b"payload bytes large enough to rotate often",
+            )
+            .expect("append");
+        }
+        w.sync().expect("sync");
+    }
+
+    // Confirm we rotated, so the tail-scan path (not a single segment) runs.
+    let segs = cq_txlog::segment::list_segments(dir.path()).expect("list");
+    assert!(segs.len() >= 2, "expected rotation, got {}", segs.len());
+
+    // Reopen: the resume scan must recover the true max sequence (== n).
+    let w2 = TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, segment_size)
+        .expect("reopen");
+    assert_eq!(
+        w2.max_sequence(),
+        n as u64,
+        "reopen must seed max_sequence from the newest non-empty segment"
+    );
+}
+
 /// C10.3 — CRC corruption mid-log. A byte is flipped inside a
 /// completed entry's BODY (not in a header). The reader must
 /// surface a CRC error rather than silently producing garbage data
@@ -130,6 +172,123 @@ fn crc_corruption_mid_log_surfaces_error() {
         hit_error,
         "mid-log CRC corruption silently swallowed (read {entries_read} entries without error)"
     );
+}
+
+/// C10.5 — `FsyncPolicy::Interval` (group commit) preserves the same
+/// crash-recovery shape as the other policies. Interval mode writes each
+/// frame straight through to the OS page cache (only the fsync is
+/// batched), so a torn write at the tail must still truncate cleanly at
+/// the last complete frame and recover every prior entry.
+#[test]
+fn interval_group_commit_recovers_after_torn_tail() {
+    let dir = tempdir().unwrap();
+    let n = 50;
+
+    let mut w =
+        TxLogWriter::open(dir.path(), FsyncPolicy::Interval(Duration::from_millis(5)))
+            .expect("open");
+    write_n_entries(&mut w, n);
+    let segment_path = w.path().to_path_buf();
+    drop(w);
+
+    // Simulate a torn trailing frame from a crash mid-interval.
+    {
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("open append");
+        f.write_all(&[0xde, 0xad, 0xbe, 0xef, 0x00]).expect("trash");
+    }
+
+    let entries = TxLogReader::open(dir.path())
+        .expect("reopen")
+        .read_all()
+        .expect("read_all should tolerate torn tail");
+    assert_eq!(entries.len(), n, "interval-mode recovery lost entries");
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(e.sequence, (i as u64) + 1);
+        assert_eq!(e.key, format!("k{i:04}"));
+    }
+}
+
+/// C10.6 — block preallocation is transparent to replay. With
+/// preallocation enabled and a small segment size forcing rotation,
+/// every entry must read back in order. This specifically exercises the
+/// sealed-segment path: if a rotated segment carried preallocated
+/// trailing padding, the strict (non-active) reader would reject it with
+/// a checksum/zero-frame error — so a clean read of all entries proves
+/// the reserved tail is released on rotation and that the logical file
+/// length always tracks real content.
+#[test]
+fn preallocated_segments_replay_cleanly_across_rotation() {
+    let dir = tempdir().unwrap();
+    let segment_size = 256u64; // small => frequent rotation
+    let n = 40usize;
+
+    let mut w =
+        TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, segment_size)
+            .expect("open")
+            .with_preallocate(true);
+    for i in 0..n {
+        w.append(
+            (i as u64) + 1,
+            "/t",
+            &format!("k{i:03}"),
+            b"sufficient payload bytes to force rotation",
+        )
+        .expect("append");
+    }
+    w.sync().expect("sync");
+
+    // Confirm we actually rotated (otherwise the sealed-segment path
+    // isn't exercised).
+    let segs = cq_txlog::segment::list_segments(dir.path()).expect("list");
+    assert!(segs.len() >= 2, "expected rotation, got {} segment(s)", segs.len());
+
+    let entries = TxLogReader::open(dir.path())
+        .expect("reopen")
+        .read_all()
+        .expect("preallocated log must replay without error");
+    assert_eq!(entries.len(), n);
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(e.sequence, (i as u64) + 1);
+        assert_eq!(e.key, format!("k{i:03}"));
+    }
+}
+
+/// C10.7 — a torn tail in a *preallocated* active segment recovers like
+/// any other. Because preallocation reserves blocks without growing the
+/// logical file size, the active segment never exposes the reserved
+/// (zero) tail to a reader; a crash mid-write therefore truncates at the
+/// last good frame exactly as in the non-preallocated case.
+#[test]
+fn preallocated_active_segment_torn_tail_recovers() {
+    let dir = tempdir().unwrap();
+    let n = 30;
+
+    let mut w = TxLogWriter::open(dir.path(), FsyncPolicy::None)
+        .expect("open")
+        .with_preallocate(true);
+    write_n_entries(&mut w, n);
+    let segment_path = w.path().to_path_buf();
+    drop(w);
+
+    {
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("open append");
+        f.write_all(&[0xff, 0xff, 0xff]).expect("trash");
+    }
+
+    let entries = TxLogReader::open(dir.path())
+        .expect("reopen")
+        .read_all()
+        .expect("read_all should tolerate torn tail");
+    assert_eq!(entries.len(), n);
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(e.sequence, (i as u64) + 1);
+    }
 }
 
 /// C10.4 — replay equivalence across mixed compressed + uncompressed

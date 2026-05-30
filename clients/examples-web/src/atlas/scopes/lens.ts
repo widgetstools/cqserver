@@ -1,7 +1,7 @@
 import type { ColDef } from 'ag-grid-community';
 
 export const LENS_COL_DEFS: ColDef[] = [
-  { field: 'asset_class', headerName: 'asset_class', width: 130, cellStyle: { color: '#f4a52b' } },
+  { field: 'asset_class', headerName: 'asset_class', width: 130, cellStyle: { color: 'var(--atlas-amber)' } },
   { field: 'currency', headerName: 'ccy', width: 80 },
   { field: 'n_positions', headerName: 'n_positions', width: 120, type: 'numericColumn',
     valueFormatter: (p) => (p.value as number)?.toLocaleString('en-US') ?? '—' },
@@ -11,7 +11,7 @@ export const LENS_COL_DEFS: ColDef[] = [
     valueFormatter: (p) => fmtSignedMillions(p.value as number),
     cellStyle: (p) =>
       typeof p.value === 'number' && p.value < 0 ? { color: '#ff6062' } :
-      typeof p.value === 'number' ? { color: '#f4a52b' } : null },
+      typeof p.value === 'number' ? { color: 'var(--atlas-amber)' } : null },
   { field: 'exposure_gross', headerName: 'gross', width: 130, type: 'numericColumn',
     valueFormatter: (p) => fmtMillions(p.value as number) },
   { field: 'var_1d_95', headerName: 'var_1d', width: 110, type: 'numericColumn',

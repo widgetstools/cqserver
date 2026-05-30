@@ -562,10 +562,151 @@ impl NumExpr {
     }
 }
 
+/// SQL three-valued logic result. `Unknown` arises whenever a
+/// comparison touches a NULL operand. A WHERE clause keeps a row only
+/// when the predicate evaluates to `True` — both `False` and `Unknown`
+/// exclude it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tri {
+    True,
+    False,
+    Unknown,
+}
+
+#[inline]
+fn tri(b: bool) -> Tri {
+    if b {
+        Tri::True
+    } else {
+        Tri::False
+    }
+}
+
+/// Whether column `col` holds SQL NULL at `row`, per the column's type
+/// sentinel. Mirrors the `IsNull` leaf logic.
+#[inline]
+fn column_is_null(store: &ColumnStore, col: usize, row: u32) -> bool {
+    match store.schema().column_type(col) {
+        ColumnType::Double => store.get_double(col, row).is_nan(),
+        ColumnType::Long => store.get_long(col, row) == NULL_LONG,
+        ColumnType::Int => store.get_int(col, row) == NULL_INT,
+        ColumnType::String => store.get_string(col, row).is_none(),
+        ColumnType::Bool => store.get_bool(col, row).is_none(),
+        ColumnType::Timestamp => store.get_timestamp(col, row) == crate::store::NULL_TIMESTAMP,
+        ColumnType::Bytes => store.get(col, row).is_null(),
+    }
+}
+
 impl CompiledPredicate {
-    /// Evaluate this predicate against a specific row in the store.
+    /// Evaluate against a row for WHERE semantics: `true` only when the
+    /// predicate is definitely TRUE. UNKNOWN (NULL operand) excludes
+    /// the row, matching SQL three-valued logic.
     #[inline]
     pub fn matches(&self, store: &ColumnStore, row: u32) -> bool {
+        self.matches_3vl(store, row) == Tri::True
+    }
+
+    /// Three-valued evaluation. Combinators follow SQL Kleene logic;
+    /// comparison leaves return `Unknown` when their operand is NULL.
+    /// `IS [NOT] NULL` and `IS [NOT] TRUE/FALSE` are total predicates —
+    /// they map NULL to a definite TRUE/FALSE.
+    pub fn matches_3vl(&self, store: &ColumnStore, row: u32) -> Tri {
+        match self {
+            CompiledPredicate::And(left, right) => {
+                match (
+                    left.matches_3vl(store, row),
+                    right.matches_3vl(store, row),
+                ) {
+                    (Tri::False, _) | (_, Tri::False) => Tri::False,
+                    (Tri::True, Tri::True) => Tri::True,
+                    _ => Tri::Unknown,
+                }
+            }
+            CompiledPredicate::Or(left, right) => {
+                match (
+                    left.matches_3vl(store, row),
+                    right.matches_3vl(store, row),
+                ) {
+                    (Tri::True, _) | (_, Tri::True) => Tri::True,
+                    (Tri::False, Tri::False) => Tri::False,
+                    _ => Tri::Unknown,
+                }
+            }
+            CompiledPredicate::Not(inner) => match inner.matches_3vl(store, row) {
+                Tri::True => Tri::False,
+                Tri::False => Tri::True,
+                Tri::Unknown => Tri::Unknown,
+            },
+            CompiledPredicate::True => Tri::True,
+            CompiledPredicate::IsNull { .. }
+            | CompiledPredicate::IsNotNull { .. }
+            | CompiledPredicate::IsBool { .. } => tri(self.matches_leaf_bool(store, row)),
+            leaf => {
+                if leaf.operand_is_null(store, row) {
+                    Tri::Unknown
+                } else {
+                    tri(leaf.matches_leaf_bool(store, row))
+                }
+            }
+        }
+    }
+
+    /// True when this comparison leaf's operand (column or expression)
+    /// is NULL at `row`. Combinators and null-test leaves return false
+    /// (they're dispatched before this is reached).
+    fn operand_is_null(&self, store: &ColumnStore, row: u32) -> bool {
+        use CompiledPredicate::*;
+        match self {
+            EqDouble { col, .. }
+            | NeqDouble { col, .. }
+            | LtDouble { col, .. }
+            | LeDouble { col, .. }
+            | GtDouble { col, .. }
+            | GeDouble { col, .. }
+            | BetweenDouble { col, .. }
+            | EqLong { col, .. }
+            | NeqLong { col, .. }
+            | LtLong { col, .. }
+            | LeLong { col, .. }
+            | GtLong { col, .. }
+            | GeLong { col, .. }
+            | BetweenLong { col, .. }
+            | EqString { col, .. }
+            | NeqString { col, .. }
+            | InString { col, .. }
+            | InLong { col, .. }
+            | InDouble { col, .. }
+            | InBool { col, .. }
+            | EqBool { col, .. }
+            | NeqBool { col, .. }
+            | EqTimestamp { col, .. }
+            | NeqTimestamp { col, .. }
+            | LtTimestamp { col, .. }
+            | LeTimestamp { col, .. }
+            | GtTimestamp { col, .. }
+            | GeTimestamp { col, .. }
+            | BetweenTimestamp { col, .. }
+            | InTimestamp { col, .. }
+            | Like { col, .. }
+            | Regex { col, .. }
+            | EqStringFn { col, .. }
+            | NeqStringFn { col, .. }
+            | LikeStringFn { col, .. }
+            | LengthCmp { col, .. } => column_is_null(store, *col, row),
+            EqStringExpr { expr, .. } | NeqStringExpr { expr, .. } | LikeStringExpr { expr, .. } => {
+                expr.eval(store, row).is_none()
+            }
+            CompareNum { expr, .. } | BetweenNum { expr, .. } => expr.eval(store, row).is_nan(),
+            IsNull { .. } | IsNotNull { .. } | IsBool { .. } | And(..) | Or(..) | Not(..)
+            | True => false,
+        }
+    }
+
+    /// Leaf boolean evaluation without NULL/3VL semantics. Only invoked
+    /// for a leaf whose operand is already known non-NULL (or for the
+    /// total null-test predicates). Combinators are unreachable here.
+    #[inline]
+    fn matches_leaf_bool(&self, store: &ColumnStore, row: u32) -> bool {
         match self {
             // ---- Double comparisons ----
             // IEEE 754 equality with a NaN guard. The previous EPSILON
@@ -639,9 +780,12 @@ impl CompiledPredicate {
                 store.get_string(*col, row).map_or(true, |s| s != value.as_str())
             }
             CompiledPredicate::InString { col, values } => {
-                store.get_string(*col, row).map_or(false, |s| {
-                    values.contains(&CompactString::new(s))
-                })
+                // `CompactString: Borrow<str>` lets us probe the set
+                // with the borrowed `&str` directly — no per-row
+                // allocation on the scan hot path.
+                store
+                    .get_string(*col, row)
+                    .map_or(false, |s| values.contains(s))
             }
             CompiledPredicate::InLong { col, values } => {
                 let v = store.get_long(*col, row);
@@ -860,8 +1004,11 @@ fn string_fn_eq(func: StringFn, s: &str, literal: &str) -> bool {
 /// `%`, `\_` matches a literal `_`, and `\\` matches a single backslash.
 /// A trailing unmatched `\` is dropped.
 pub fn like_to_regex(pattern: &str) -> String {
-    let mut regex = String::with_capacity(pattern.len() + 4);
-    regex.push('^');
+    let mut regex = String::with_capacity(pattern.len() + 8);
+    // `(?s)` makes `.` (from `_`) and `.*` (from `%`) match newlines,
+    // so LIKE behaves correctly on multiline string values. Anchored
+    // with `^`/`$` for a whole-string match.
+    regex.push_str("(?s)^");
     let mut chars = pattern.chars();
     while let Some(ch) = chars.next() {
         match ch {
@@ -1182,7 +1329,16 @@ pub fn compile_expr(
             };
             let col = resolve_column(col_expr, schema)?;
             let pat_str = extract_string_value(pat_expr)?;
-            let pattern = regex::Regex::new(&pat_str)
+            // Bound the compiled program / DFA size for caller-supplied
+            // patterns. The `regex` crate matches in linear time (no
+            // catastrophic backtracking), but a pathological pattern can
+            // still blow up compiled-program memory; cap it explicitly.
+            // 1 MiB program + 1 MiB DFA is generous for legitimate
+            // filters and rejects abusive ones at compile time.
+            let pattern = regex::RegexBuilder::new(&pat_str)
+                .size_limit(1 << 20)
+                .dfa_size_limit(1 << 20)
+                .build()
                 .map_err(|e| PredicateError::InvalidPattern(e.to_string()))?;
             Ok(CompiledPredicate::Regex { col, pattern })
         }
@@ -2096,6 +2252,86 @@ mod tests {
         let sql = format!("SELECT * FROM t WHERE {sql_where}");
         let parsed = crate::query::parse_query(&sql, schema).expect("parse");
         parsed.predicate
+    }
+
+    /// Row 0 has NULL `desk` and NULL `price`; row 1 is fully populated.
+    fn make_store_with_nulls() -> (Arc<Schema>, ColumnStore) {
+        let schema = Arc::new(Schema::from_strs(
+            &["symbol", "price", "quantity", "desk"],
+            &[
+                ColumnType::String,
+                ColumnType::Double,
+                ColumnType::Long,
+                ColumnType::String,
+            ],
+        ));
+        let mut store = ColumnStore::new(schema.clone(), 10);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("AAPL"))),
+            Value::Double(f64::NAN), // NULL price
+            Value::Long(100),
+            Value::String(None), // NULL desk
+        ]);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("MSFT"))),
+            Value::Double(300.0),
+            Value::Long(50),
+            Value::String(Some(CompactString::new("RATES"))),
+        ]);
+        (schema, store)
+    }
+
+    #[test]
+    fn null_three_valued_logic_excludes_null_rows() {
+        let (schema, store) = make_store_with_nulls();
+        // row 0: desk = NULL, price = NULL. row 1: desk = 'RATES', price = 300.
+
+        // Equality on NULL is UNKNOWN -> excluded.
+        let eq = compile("desk = 'RATES'", &schema);
+        assert!(!eq.matches(&store, 0), "NULL desk must not match `= 'RATES'`");
+        assert!(eq.matches(&store, 1));
+
+        // <> on NULL is UNKNOWN, NOT TRUE -> must exclude the NULL row
+        // (regression: previously leaked NULLs as `true`).
+        let neq = compile("desk <> 'RATES'", &schema);
+        assert!(!neq.matches(&store, 0), "NULL desk must not match `<> 'RATES'`");
+        assert!(!neq.matches(&store, 1));
+
+        // NOT IN on NULL is UNKNOWN -> excluded (regression).
+        let not_in = compile("desk NOT IN ('RATES','FX')", &schema);
+        assert!(!not_in.matches(&store, 0), "NULL desk must not match NOT IN");
+        assert!(!not_in.matches(&store, 1));
+
+        // NOT (col = lit) on NULL is NOT UNKNOWN = UNKNOWN -> excluded
+        // (regression: Not used to flip the leaf's false to true).
+        let not_eq = compile("NOT (desk = 'RATES')", &schema);
+        assert!(!not_eq.matches(&store, 0), "NOT over a NULL comparison must not match");
+        assert!(!not_eq.matches(&store, 1));
+
+        // Numeric <> on NULL (NaN) is UNKNOWN -> excluded (regression).
+        let price_neq = compile("price <> 100.0", &schema);
+        assert!(!price_neq.matches(&store, 0), "NULL price must not match `<> 100`");
+        assert!(price_neq.matches(&store, 1));
+
+        // IS NULL / IS NOT NULL stay total.
+        let is_null = compile("desk IS NULL", &schema);
+        assert!(is_null.matches(&store, 0));
+        assert!(!is_null.matches(&store, 1));
+    }
+
+    #[test]
+    fn null_kleene_and_or() {
+        let (schema, store) = make_store_with_nulls();
+        // row 0: desk NULL, quantity = 100.
+        // (desk = 'RATES') AND (quantity = 999): Unknown AND False = False.
+        let and_false = compile("desk = 'RATES' AND quantity = 999", &schema);
+        assert_eq!(and_false.matches_3vl(&store, 0), Tri::False);
+        // (desk = 'RATES') OR (quantity = 100): Unknown OR True = True.
+        let or_true = compile("desk = 'RATES' OR quantity = 100", &schema);
+        assert_eq!(or_true.matches_3vl(&store, 0), Tri::True);
+        // (desk = 'RATES') AND (quantity = 100): Unknown AND True = Unknown.
+        let and_unknown = compile("desk = 'RATES' AND quantity = 100", &schema);
+        assert_eq!(and_unknown.matches_3vl(&store, 0), Tri::Unknown);
     }
 
     #[test]

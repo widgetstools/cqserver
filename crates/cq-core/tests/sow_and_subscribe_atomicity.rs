@@ -81,7 +81,7 @@ fn pre_snapshot_publishes_are_not_redelivered_as_live_deltas() {
     while let Ok(ev) = rx.try_recv() {
         let deltas = topic.evaluate_row_kind(ev.row, ev.sequence, ev.kind);
         for d in deltas {
-            if d.subscription_id == "sub-1" {
+            if d.subscription_id.as_ref() == "sub-1" {
                 deltas_for_sub.push((d.delta_type, d.sequence));
             }
         }
@@ -135,7 +135,7 @@ fn post_snapshot_publishes_are_delivered_as_live_deltas() {
     while let Ok(ev) = rx.try_recv() {
         let deltas = topic.evaluate_row_kind(ev.row, ev.sequence, ev.kind);
         for d in deltas {
-            if d.subscription_id == "sub-1" && d.delta_type == DeltaType::Add {
+            if d.subscription_id.as_ref() == "sub-1" && d.delta_type == DeltaType::Add {
                 adds.push(d.sequence);
             }
         }

@@ -109,7 +109,7 @@ fn build_joined_view(
         Some(right_topic),
     )
     .expect("new joined view");
-    let _ = spawn_view_runner_joined(view, left_tap, right_tap);
+    let _ = spawn_view_runner_joined(view, left_tap, right_tap).expect("spawn view runner");
     view_topic_arc
 }
 

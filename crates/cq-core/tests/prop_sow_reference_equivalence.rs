@@ -219,7 +219,7 @@ proptest! {
         while let Ok(ev) = rx.try_recv() {
             let deltas = topic.evaluate_row_kind(ev.row, ev.sequence, ev.kind);
             for d in deltas {
-                if d.subscription_id == "sub-bm" && d.sequence <= captured {
+                if d.subscription_id.as_ref() == "sub-bm" && d.sequence <= captured {
                     pre_deltas += 1;
                 }
             }
@@ -240,7 +240,7 @@ proptest! {
             while let Ok(ev) = rx.try_recv() {
                 let deltas = topic.evaluate_row_kind(ev.row, ev.sequence, ev.kind);
                 for d in deltas {
-                    if d.subscription_id == "sub-bm" {
+                    if d.subscription_id.as_ref() == "sub-bm" {
                         post_deltas.push((d.delta_type, d.sequence));
                     }
                 }

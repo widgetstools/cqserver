@@ -105,7 +105,7 @@ fn closed_subscription_receives_no_further_deltas() {
     let mut deltas_for_closed = 0usize;
     while let Ok(ev) = rx.try_recv() {
         for d in topic.evaluate_row_kind(ev.row, ev.sequence, ev.kind) {
-            if d.subscription_id == "close-test" {
+            if d.subscription_id.as_ref() == "close-test" {
                 deltas_for_closed += 1;
             }
         }

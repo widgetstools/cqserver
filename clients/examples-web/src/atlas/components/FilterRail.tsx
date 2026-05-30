@@ -55,7 +55,7 @@ export function FilterRail({ chips, state, options, onChange, subscriptionSummar
                 alignItems: 'center',
                 gap: 8,
                 padding: '5px 10px 5px 8px',
-                border: `1px solid ${isActive ? 'rgba(244,165,43,.65)' : 'var(--atlas-rule)'}`,
+                border: `1px solid ${isActive ? 'var(--atlas-chip-active-border)' : 'var(--atlas-rule)'}`,
                 background: isActive ? 'var(--atlas-amber-soft)' : 'transparent',
                 borderRadius: 999,
                 fontSize: 10.5,

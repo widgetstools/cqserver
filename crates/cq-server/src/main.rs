@@ -36,7 +36,7 @@ use cq_core::query::peek_join;
 use cq_core::view::{spawn_view_runner, spawn_view_runner_joined, View};
 use cq_replication::{receiver as repl_recv, shipper as repl_ship};
 use cq_transport::auth::{AuthStore, User};
-use cq_transport::delivery::spawn_evaluator;
+use cq_transport::delivery::spawn_evaluators;
 use cq_transport::heartbeat::HeartbeatConfig;
 use cq_transport::queue::{new_queue_registry, Queue};
 use cq_transport::session::new_registry;
@@ -145,6 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(dlq) = &q.dlq {
             queue = queue.with_dlq(dlq.clone());
         }
+        if let Some(cap) = q.max_buffer {
+            queue = queue.with_max_buffer(cap);
+        }
         let queue_arc = Arc::new(queue);
         if q.lease_ms.is_some() {
             cq_transport::queue::spawn_lease_sweeper(
@@ -166,7 +169,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fsync = match server_config.txlog.fsync {
         TxLogFsyncConfig::None => FsyncPolicy::None,
         TxLogFsyncConfig::EveryWrite => FsyncPolicy::EveryWrite,
+        TxLogFsyncConfig::Interval => FsyncPolicy::Interval(
+            std::time::Duration::from_millis(server_config.txlog.fsync_interval_ms),
+        ),
     };
+    let txlog_preallocate = server_config.txlog.preallocate;
 
     // Resolve the optional archive directory once per server.
     let archive_dir_root: Option<PathBuf> = server_config
@@ -176,6 +183,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from);
     let segment_size_override = server_config.txlog.segment_size;
     let archive_compress = server_config.txlog.archive_compress;
+
+    let default_eval_lanes = server_config.resolved_default_eval_lanes();
+    info!(default_eval_lanes, "Evaluator lane default resolved");
+
+    // S20 — resolve this node's AMPS-style instance id once. Stamped on
+    // every local txlog write so peers can dedup convergently. An HA node
+    // (primary/standby) with no configured name gets no convergence
+    // protection — warn loudly.
+    let instance_name = server_config.replication.resolve_instance_name();
+    if instance_name.is_empty() {
+        if server_config.replication.role != ReplicationRole::Standalone {
+            warn!(
+                "replication.instance_name is unset for a non-standalone node — \
+                 origin tagging and split-brain convergence dedup are DISABLED"
+            );
+        }
+    } else {
+        info!(instance = %instance_name, "Replication instance identity resolved");
+    }
 
     let mut evaluator_handles = Vec::new();
     for topic_cfg in &server_config.topics {
@@ -201,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             topic_archive_dir.clone(),
             segment_size_override,
             archive_compress,
+            txlog_preallocate,
+            default_eval_lanes,
+            &instance_name,
         )?;
 
         // Recover from log BEFORE spawning the evaluator. Any mutation
@@ -211,11 +240,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("freshly-created topic must have an rx");
         if topic_cfg.persist {
             let log_path = log_path_for(&txlog_dir, &topic_cfg.name);
+            // SOW snapshot fast-restart: if a checkpoint exists, rebuild the
+            // bulk of the store from it in one pass and then replay only the
+            // txlog tail (segments after the snapshot). Falls back to a full
+            // replay when no/invalid snapshot is present.
+            let mut resume_segment = 0u64;
+            match cq_txlog::snapshot::Snapshot::load(&log_path) {
+                Ok(Some(snap)) => {
+                    let rows = snap.rows.len();
+                    let seq = snap.sequence;
+                    resume_segment = snap.segment_id;
+                    shared.apply_snapshot(&snap);
+                    info!(
+                        topic = %topic_cfg.name,
+                        rows,
+                        sequence = seq,
+                        resume_segment,
+                        "Loaded SOW snapshot"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    topic = %topic_cfg.name,
+                    error = %e,
+                    "Snapshot load failed; falling back to full txlog replay"
+                ),
+            }
             if log_path.exists() {
                 let count = recover_topic_with_archive(
                     &shared,
                     &log_path,
                     topic_archive_dir.as_deref(),
+                    resume_segment,
                 )?;
                 if count > 0 {
                     info!(
@@ -229,8 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let handle = spawn_evaluator(shared.clone(), rx, registry.clone());
-        evaluator_handles.push(handle);
+        evaluator_handles.extend(spawn_evaluators(shared.clone(), rx, registry.clone())?);
 
         // TTL sweeper task — only spawned when `expire_seconds` is
         // configured. Ticks every second by default.
@@ -351,6 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ReplicationRole::Standalone => "standalone".into(),
                 ReplicationRole::Primary => "primary".into(),
                 ReplicationRole::Standby => "standby".into(),
+                ReplicationRole::ActiveActive => "active_active".into(),
             },
             peer: server_config.replication.peer.clone(),
             peers: server_config.replication.peers.clone(),
@@ -361,6 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_views_path: Arc::new(runtime_views_path.clone()),
         view_create_lock: Arc::new(tokio::sync::Mutex::new(())),
         view_teardown: view_teardown.clone(),
+        admin_token: Arc::new(server_config.admin_token.clone()),
     };
     let admin_addr = server_config.admin_addr.clone();
 
@@ -424,6 +481,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Replication role = standby — transports running in read-only mode (publishes will be rejected)");
     }
     let query_limits = server_config.query_limits.to_core();
+    // S11 — a `replicated` ack can only be satisfied when this node
+    // actually ships to a standby (primary role with ≥1 peer). On any
+    // other topology the publish path rejects `ack_type = "replicated"`
+    // rather than hanging until timeout.
+    let sync_replication = cq_transport::router::SyncReplication {
+        active: matches!(
+            server_config.replication.role,
+            ReplicationRole::Primary | ReplicationRole::ActiveActive
+        ) && !server_config.replication.resolve_peers().is_empty(),
+        ack_timeout: std::time::Duration::from_millis(
+            server_config.replication.sync_ack_timeout_ms,
+        ),
+    };
+
     let ws_config = WsConfig {
         listen_addr: server_config.websocket_addr.clone(),
         path: server_config.websocket_path.clone(),
@@ -433,6 +504,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spillover: spillover_ctx.clone(),
         read_only,
         query_limits,
+        max_message_bytes: server_config
+            .ws_max_message_bytes
+            .unwrap_or(cq_protocol::codec::MAX_FRAME_SIZE),
+        sync_replication,
     };
     let tcp_config = TcpConfig {
         listen_addr: server_config.tcp_addr.clone(),
@@ -443,6 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         spillover: spillover_ctx,
         read_only,
         query_limits,
+        sync_replication,
     };
 
     let heartbeat_cfg = HeartbeatConfig {
@@ -479,15 +555,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut auth_store = AuthStore::new(server_config.auth.required, auth_users);
     if let Some(jwt_cfg) = &server_config.auth.jwt {
-        let validator = cq_transport::auth::JwtValidator::new_hs256(
-            jwt_cfg.secret.as_bytes(),
-            jwt_cfg.issuer.as_deref(),
-            jwt_cfg.audience.as_deref(),
-            &jwt_cfg.username_claim,
-            &jwt_cfg.entitlements_claim,
-        );
+        use config::JwtAlgorithm;
+        let validator = match jwt_cfg.algorithm {
+            JwtAlgorithm::Hs256 => {
+                let secret = jwt_cfg.secret.as_deref().ok_or_else(|| {
+                    "auth.jwt.secret is required when algorithm = \"HS256\"".to_string()
+                })?;
+                cq_transport::auth::JwtValidator::new_hs256(
+                    secret.as_bytes(),
+                    jwt_cfg.issuer.as_deref(),
+                    jwt_cfg.audience.as_deref(),
+                    &jwt_cfg.username_claim,
+                    &jwt_cfg.entitlements_claim,
+                )
+            }
+            JwtAlgorithm::Rs256 => {
+                let pem = match (&jwt_cfg.public_key, &jwt_cfg.public_key_path) {
+                    (Some(_), Some(_)) => {
+                        return Err("auth.jwt: set only one of public_key / public_key_path".into());
+                    }
+                    (Some(inline), None) => inline.clone().into_bytes(),
+                    (None, Some(path)) => std::fs::read(path).map_err(|e| {
+                        format!("auth.jwt.public_key_path '{path}' could not be read: {e}")
+                    })?,
+                    (None, None) => {
+                        return Err("auth.jwt: public_key or public_key_path is required when algorithm = \"RS256\"".into());
+                    }
+                };
+                cq_transport::auth::JwtValidator::new_rs256(
+                    &pem,
+                    jwt_cfg.issuer.as_deref(),
+                    jwt_cfg.audience.as_deref(),
+                    &jwt_cfg.username_claim,
+                    &jwt_cfg.entitlements_claim,
+                )
+                .map_err(|e| format!("auth.jwt: invalid RS256 public key: {e}"))?
+            }
+        };
         auth_store = auth_store.with_jwt(validator);
         info!(
+            algorithm = ?jwt_cfg.algorithm,
             issuer = ?jwt_cfg.issuer,
             audience = ?jwt_cfg.audience,
             username_claim = %jwt_cfg.username_claim,
@@ -584,6 +691,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shutdown_topics = topics.clone();
+    let snapshot_on_shutdown = server_config.txlog.snapshot_on_shutdown;
+    let snapshot_reclaim = server_config.txlog.snapshot_reclaim;
     tokio::select! {
         result = websocket::start_ws_server(
             ws_config, ws_topics, ws_registry, queues.clone(), heartbeat_cfg, auth.clone(),
@@ -608,6 +717,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_config.replication.filter.clone(),
             server_config.replication.transform.clone(),
             repl_topic_refs,
+            server_config.replication.auth_token.clone(),
+            instance_name.clone(),
         ) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "Replication failed");
@@ -618,7 +729,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    shutdown(&shutdown_topics).await;
+    shutdown(&shutdown_topics, snapshot_on_shutdown, snapshot_reclaim).await;
     Ok(())
 }
 
@@ -653,10 +764,22 @@ async fn wait_for_shutdown_signal() -> &'static str {
 /// moment of exit — regardless of the configured fsync policy on
 /// the hot write path. Bounded by a wall-clock budget so a stuck
 /// disk can't hang the process forever.
-async fn shutdown(topics: &Arc<DashMap<String, SharedTopic>>) {
+async fn shutdown(
+    topics: &Arc<DashMap<String, SharedTopic>>,
+    snapshot_on_shutdown: bool,
+    snapshot_reclaim: bool,
+) {
     metrics::counter!("cq_shutdown_initiated_total").increment(1);
     let started = std::time::Instant::now();
-    let budget = std::time::Duration::from_secs(10);
+    // Generous wall-clock cap: an fsync alone is milliseconds, but when
+    // snapshot_on_shutdown is set we also serialize each persistent
+    // topic's live SOW to a checkpoint file, which for a multi-GB topic
+    // (e.g. a wide /positions universe) is seconds of work. The budget
+    // exists only to stop a *stuck disk* from hanging the process
+    // forever — it must be comfortably above the legitimate snapshot
+    // time, or we'd time out and exit before the checkpoint lands,
+    // forcing the next start back into a full txlog replay.
+    let budget = std::time::Duration::from_secs(120);
 
     // Per-topic fsync is synchronous (file::sync_all) but typically
     // milliseconds. Run them on the runtime's blocking pool with an
@@ -679,6 +802,44 @@ async fn shutdown(topics: &Arc<DashMap<String, SharedTopic>>) {
                 Err(e) => {
                     failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(topic = %name, error = %e, "txlog flush failed");
+                    // Skip the snapshot if we couldn't even make the log
+                    // durable — the snapshot would claim a sequence the log
+                    // can't back up.
+                    return;
+                }
+            }
+            // Checkpoint the SOW after the log is durable, so the next start
+            // loads the snapshot and replays only the (now-empty) tail
+            // instead of the whole log. Best-effort: a snapshot failure
+            // degrades to a slower full replay, never to data loss.
+            if !snapshot_on_shutdown {
+                return;
+            }
+            let wrote = match topic.write_snapshot() {
+                Ok(true) => {
+                    tracing::info!(topic = %name, "SOW snapshot written");
+                    true
+                }
+                Ok(false) => false,
+                Err(e) => {
+                    tracing::warn!(topic = %name, error = %e, "snapshot write failed");
+                    false
+                }
+            };
+            // Reclaim sealed segments only after a durable snapshot — the
+            // snapshot now backs every row, so the older segments are
+            // redundant for local restart. Opt-in (snapshot_reclaim) since a
+            // far-behind replication standby would need those segments to
+            // catch up without a base-SOW resync.
+            if wrote && snapshot_reclaim {
+                match topic.reclaim_sealed_segments() {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(topic = %name, reclaimed = n, "reclaimed sealed txlog segments")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(topic = %name, error = %e, "segment reclaim failed")
+                    }
                 }
             }
         }));
@@ -714,6 +875,8 @@ async fn run_replication(
     filter: Option<cq_replication::filter::FilterSpec>,
     transform: Option<cq_replication::filter::TransformSpec>,
     topic_refs: std::collections::HashMap<String, SharedTopic>,
+    auth_token: Option<String>,
+    instance_name: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match role {
         ReplicationRole::Standalone => {
@@ -727,48 +890,103 @@ async fn run_replication(
                     "replication.peer or replication.peers required for primary role".into(),
                 );
             }
-            // Multi-peer fanout (C0 enabler): spawn one shipper task
-            // per peer. Each task reads from the same per-topic txlog
-            // directories independently (read-only operation, safe to
-            // share across processes/tasks). Each peer maintains its
-            // own ack stream → topic.mark_replicated() bumps the
-            // barrier on the SLOWEST peer's ack, which is the safe
-            // choice for an at-least-once guarantee.
-            let mut handles = Vec::with_capacity(peers.len());
-            for peer in peers {
-                let cfg = repl_ship::ShipperConfig {
-                    peer: peer.clone(),
-                    topics: ship_topics.clone(),
-                    filter: filter.clone(),
-                    transform: transform.clone(),
-                    topic_refs: topic_refs.clone(),
-                    ..Default::default()
-                };
-                handles.push(tokio::spawn(async move {
-                    if let Err(e) = repl_ship::run(cfg).await {
-                        tracing::warn!(peer = %peer, error = %e, "Shipper task exited");
-                    }
-                }));
-            }
-            // The shipper's run() loops internally on reconnect; the
-            // only way these tasks exit is on a fatal error (which
-            // they log above). Wait on all of them indefinitely —
-            // if every shipper somehow exits, return so the caller
-            // can decide what to do.
-            for h in handles {
-                let _ = h.await;
-            }
+            run_shippers(
+                peers,
+                ship_topics,
+                filter,
+                transform,
+                topic_refs,
+                auth_token,
+                instance_name,
+            )
+            .await;
             Ok(())
         }
         ReplicationRole::Standby => {
             let listen = listen.ok_or("replication.listen required for standby role")?;
             let cfg = repl_recv::ReceiverConfig {
                 listen_addr: listen,
+                token: auth_token,
+                instance_name,
+                concurrent: false,
             };
             repl_recv::run(cfg, standby_topics)
                 .await
                 .map_err(|e| format!("receiver: {}", e).into())
         }
+        ReplicationRole::ActiveActive => {
+            // S21 full mesh: every node both ships its local writes to all
+            // peers AND receives their writes concurrently. Run the shipper
+            // fanout and a concurrent receiver together; either completing
+            // (only on fatal error) ends the replication future.
+            if peers.is_empty() {
+                return Err(
+                    "replication.peers required for active_active role".into(),
+                );
+            }
+            let listen = listen
+                .ok_or("replication.listen required for active_active role")?;
+            let recv_cfg = repl_recv::ReceiverConfig {
+                listen_addr: listen,
+                token: auth_token.clone(),
+                instance_name: instance_name.clone(),
+                concurrent: true,
+            };
+            let ship = run_shippers(
+                peers,
+                ship_topics,
+                filter,
+                transform,
+                topic_refs,
+                auth_token,
+                instance_name,
+            );
+            let recv = repl_recv::run(recv_cfg, standby_topics);
+            tokio::select! {
+                _ = ship => {
+                    tracing::warn!("active-active shippers all exited");
+                    Ok(())
+                }
+                r = recv => r.map_err(|e| format!("receiver: {}", e).into()),
+            }
+        }
+    }
+}
+
+/// Spawn one shipper task per peer and wait on all of them. Each task
+/// tails the shared per-topic txlog directories (read-only) and ships
+/// its local writes; the shipper's `run()` loops internally on
+/// reconnect, so a task only exits on a fatal error (logged). Shared by
+/// the `primary` and `active_active` roles.
+async fn run_shippers(
+    peers: Vec<String>,
+    ship_topics: Vec<(String, PathBuf)>,
+    filter: Option<cq_replication::filter::FilterSpec>,
+    transform: Option<cq_replication::filter::TransformSpec>,
+    topic_refs: std::collections::HashMap<String, SharedTopic>,
+    auth_token: Option<String>,
+    instance_name: String,
+) {
+    let mut handles = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let cfg = repl_ship::ShipperConfig {
+            peer: peer.clone(),
+            topics: ship_topics.clone(),
+            filter: filter.clone(),
+            transform: transform.clone(),
+            topic_refs: topic_refs.clone(),
+            token: auth_token.clone(),
+            instance_name: instance_name.clone(),
+            ..Default::default()
+        };
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = repl_ship::run(cfg).await {
+                tracing::warn!(peer = %peer, error = %e, "Shipper task exited");
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
     }
 }
 
@@ -797,9 +1015,14 @@ fn init_topic(
     archive_dir: Option<PathBuf>,
     segment_size_override: Option<u64>,
     archive_compress: bool,
+    preallocate: bool,
+    default_eval_lanes: usize,
+    instance_name: &str,
 ) -> Result<SharedTopic, Box<dyn std::error::Error>> {
     let schema = build_topic_schema(cfg, config_dir)?;
     let columns = schema.column_count();
+    // Per-topic override wins over the server-wide resolved default.
+    let lanes = cfg.evaluator_lanes.unwrap_or(default_eval_lanes).max(1);
     let mut topic = Topic::new(
         TopicConfig {
             name: cfg.name.clone(),
@@ -811,7 +1034,9 @@ fn init_topic(
         },
         Arc::new(schema),
         cfg.initial_capacity,
-    );
+    )
+    .with_eval_lanes(lanes)
+    .with_origin_id(instance_name);
 
     if cfg.persist {
         let path = log_path_for(txlog_dir, &cfg.name);
@@ -837,6 +1062,7 @@ fn init_topic(
                 archive_dir.as_deref(),
             )?
         };
+        let writer = writer.with_preallocate(preallocate);
         topic.attach_txlog(Arc::new(Mutex::new(writer)));
         info!(topic = %cfg.name, path = %path.display(), "TxLog attached");
     }
@@ -992,12 +1218,14 @@ pub(crate) fn init_view(
     let _runner = match right_tap_rx {
         Some(rt) => spawn_view_runner_joined(view, left_tap, rt),
         None => spawn_view_runner(view, left_tap),
-    };
+    }
+    .map_err(|e| InitViewError::Build(format!("view runner thread spawn failed: {e}")))?;
     let evaluator_handle = cq_transport::delivery::spawn_evaluator(
         view_topic_arc.clone(),
         view_topic_rx,
         registry,
-    );
+    )
+    .map_err(|e| InitViewError::Build(format!("view evaluator thread spawn failed: {e}")))?;
 
     topics.insert(canonical_view, view_topic_arc);
     let teardown = ViewTeardown {
@@ -1137,19 +1365,29 @@ fn parse_type_str(s: &str) -> Result<ColumnType, Box<dyn std::error::Error>> {
 /// Compatibility wrapper used by existing call sites that don't yet
 /// pass an archive directory.
 #[allow(dead_code)]
+#[allow(dead_code)]
 fn recover_topic(
     topic: &SharedTopic,
     log_path: &PathBuf,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    recover_topic_with_archive(topic, log_path, None)
+    recover_topic_with_archive(topic, log_path, None, 0)
 }
 
+/// Replay the txlog (tail) into `topic`. `resume_segment` fast-forwards the
+/// reader past every segment with a lower id — set to the snapshot's
+/// `segment_id` after `apply_snapshot` so fully-covered segments are skipped
+/// entirely. Any entries in the resume segment that predate the snapshot are
+/// harmlessly deduped by the snapshot baseline. `0` replays from the start.
 fn recover_topic_with_archive(
     topic: &SharedTopic,
     log_path: &PathBuf,
     archive_dir: Option<&std::path::Path>,
+    resume_segment: u64,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut reader = TxLogReader::open_with_archive(log_path, archive_dir)?;
+    if resume_segment > 0 {
+        reader.skip_to_segment(resume_segment);
+    }
     let mut count = 0;
     loop {
         let entry = match reader.read_next() {
@@ -1168,11 +1406,11 @@ fn recover_topic_with_archive(
         };
 
         if entry.is_tombstone() {
-            topic.replay_delete(entry.sequence, &entry.key);
+            topic.replay_delete_origin(&entry.origin, entry.sequence, &entry.key);
         } else {
             match serde_json::from_slice::<serde_json::Value>(&entry.payload) {
                 Ok(serde_json::Value::Object(map)) => {
-                    topic.replay_upsert_map(entry.sequence, &map);
+                    topic.replay_upsert_map_origin(&entry.origin, entry.sequence, &map);
                 }
                 Ok(_) => {
                     warn!("Skipping non-object payload during recovery");

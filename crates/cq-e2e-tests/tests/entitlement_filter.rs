@@ -231,6 +231,77 @@ async fn row_filter_matching_no_rows_is_empty() {
             "row filter matched no real desks, but got {rows:?}");
 }
 
+/// Per-action entitlements: a user granted only `publish:` can publish
+/// but is denied subscribe/sow, and a user granted only `subscribe:` +
+/// `sow:` can read but is denied publish. Proves each action is gated
+/// independently — not the blanket `*:*` the other tests use.
+#[tokio::test]
+async fn per_action_entitlements_are_independent() {
+    use cq_client::ClientError;
+    let topic = TopicSpec::new("/perm", "k")
+        .with_inline_columns([("k", "string"), ("v", "double")]);
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: Vec::new(),
+            auth: Some(AuthOpts {
+                users: vec![
+                    UserSpec {
+                        username: "pubonly".into(),
+                        password_hash: bcrypt_hash("pw"),
+                        entitlements: vec!["publish:/perm".into()],
+                        row_filter: None,
+                    },
+                    UserSpec {
+                        username: "readonly".into(),
+                        password_hash: bcrypt_hash("pw"),
+                        entitlements: vec![
+                            "subscribe:/perm".into(),
+                            "sow:/perm".into(),
+                        ],
+                        row_filter: None,
+                    },
+                ],
+                jwt: None,
+            }),
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+
+    // pubonly: publish succeeds, sow is forbidden.
+    let pubonly = Client::connect(&server.tcp_url()).await.unwrap();
+    pubonly.logon("pubonly", "pw").await.unwrap();
+    pubonly
+        .publish("/perm", json!({ "k": "a", "v": 1.0 }))
+        .await
+        .expect("pubonly may publish");
+    let denied = pubonly.sow("/perm", None).await;
+    assert!(
+        matches!(denied, Err(ClientError::Server(_))),
+        "pubonly must be denied sow, got {denied:?}"
+    );
+
+    // readonly: sow succeeds, publish is forbidden.
+    let readonly = Client::connect(&server.tcp_url()).await.unwrap();
+    readonly.logon("readonly", "pw").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let rows = readonly.sow("/perm", None).await.expect("readonly may sow");
+    assert_eq!(rows.len(), 1, "readonly should see the published row");
+    let denied = readonly.publish("/perm", json!({ "k": "b", "v": 2.0 })).await;
+    assert!(
+        matches!(denied, Err(ClientError::Server(_))),
+        "readonly must be denied publish, got {denied:?}"
+    );
+}
+
 /// Wrong password → logon errors; no published data leaks.
 #[tokio::test]
 async fn bad_password_rejects_logon() {

@@ -219,6 +219,109 @@ async fn queue_redelivers_after_consumer_disconnects() {
     assert_eq!(d.data.get("task").and_then(|v| v.as_str()), Some("lost"));
 }
 
+/// Lease extension: a consumer that extends its lease before the
+/// window elapses keeps the message from being redelivered.
+#[tokio::test]
+async fn queue_lease_extension_defers_redelivery() {
+    let server = start_server_with(
+        Vec::<TopicSpec>::new(),
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: vec![QueueSpec::new("/ext_q").with_lease(200)],
+            auth: None,
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+    let publisher = Client::connect(&server.tcp_url()).await.expect("pub");
+    let consumer_a = Client::connect(&server.tcp_url()).await.expect("a");
+    let consumer_b = Client::connect(&server.tcp_url()).await.expect("b");
+    let mut sub_a = consumer_a.sow_and_subscribe("/ext_q", None, None).await.unwrap();
+    let mut sub_b = consumer_b.sow_and_subscribe("/ext_q", None, None).await.unwrap();
+
+    publisher.publish("/ext_q", json!({ "task": "slow" })).await.unwrap();
+    let d = tokio::time::timeout(Duration::from_millis(500), sub_a.next_delta())
+        .await
+        .expect("a timeout")
+        .expect("a closed");
+    let did = d.delivery_id.expect("did missing");
+
+    // Extend the lease well past the original 200ms window.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    consumer_a
+        .queue_extend_lease("/ext_q", did, 1500)
+        .await
+        .expect("extend");
+
+    // Past the ORIGINAL window — B must not see a redelivery.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), sub_b.next_delta())
+            .await
+            .is_err(),
+        "extended lease was redelivered before the new window"
+    );
+    // Now ack to clean up.
+    consumer_a.queue_ack("/ext_q", did).await.expect("ack");
+}
+
+/// Grouped delivery: messages sharing a group key all land on one
+/// consumer (sticky), preserving their relative order.
+#[tokio::test]
+async fn queue_grouped_messages_stick_to_one_consumer() {
+    let server = start_server_with(
+        Vec::<TopicSpec>::new(),
+        ServerOpts {
+            outbound_queue_capacity: 1024,
+            slow_consumer: None,
+            tls: None,
+            queues: vec![QueueSpec::new("/grp_q").with_lease(2000)],
+            auth: None,
+            txlog_archive: None,
+            views: Vec::new(),
+            spillover: None,
+            logging_sinks: Vec::new(),
+            replication: None,
+        },
+    )
+    .await;
+    let publisher = Client::connect(&server.tcp_url()).await.expect("pub");
+    let a = Client::connect(&server.tcp_url()).await.unwrap();
+    let b = Client::connect(&server.tcp_url()).await.unwrap();
+    let mut sub_a = a.sow_and_subscribe("/grp_q", None, None).await.unwrap();
+    let mut sub_b = b.sow_and_subscribe("/grp_q", None, None).await.unwrap();
+
+    for i in 0..4 {
+        publisher
+            .publish_with_opts("/grp_q", json!({ "i": i }), 0, Some("ORD-1"))
+            .await
+            .unwrap();
+    }
+
+    // Collect whatever each consumer received within a short window.
+    async fn drain(sub: &mut cq_client::Subscription) -> Vec<i64> {
+        let mut out = Vec::new();
+        while let Ok(Some(d)) =
+            tokio::time::timeout(Duration::from_millis(250), sub.next_delta()).await
+        {
+            out.push(d.data.get("i").and_then(|v| v.as_i64()).unwrap());
+        }
+        out
+    }
+    let got_a = drain(&mut sub_a).await;
+    let got_b = drain(&mut sub_b).await;
+
+    let (winner, loser) = if got_a.len() == 4 { (got_a, got_b) } else { (got_b, got_a) };
+    assert_eq!(winner, vec![0, 1, 2, 3], "grouped messages must arrive in order at one consumer");
+    assert!(loser.is_empty(), "the other consumer must receive none of the group");
+}
+
 /// Multiple publishes interleaved with acks — every message either
 /// gets acked once or redelivers; none are lost.
 #[tokio::test]

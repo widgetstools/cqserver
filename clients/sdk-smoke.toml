@@ -1,0 +1,11 @@
+# Minimal config for SDK smoke tests. One schema-on-publish topic.
+tcp_addr = "127.0.0.1:9099"
+websocket_addr = "127.0.0.1:9098"
+websocket_path = "/cq/json"
+admin_addr = "127.0.0.1:8099"
+
+[[topics]]
+name = "/sdk-test"
+key = ["k"]
+persist = false
+initial_capacity = 100

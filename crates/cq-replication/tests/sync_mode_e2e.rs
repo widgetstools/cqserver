@@ -83,6 +83,9 @@ async fn shipper_ack_reader_bumps_primary_last_replicated_sequence() {
         let _ = receiver::run(
             receiver::ReceiverConfig {
                 listen_addr: addr.to_string(),
+                token: None,
+                instance_name: String::new(),
+                concurrent: false,
             },
             recv_topics,
         )
@@ -102,6 +105,8 @@ async fn shipper_ack_reader_bumps_primary_last_replicated_sequence() {
             filter: None,
             transform: None,
             topic_refs,
+            token: None,
+            instance_name: String::new(),
         })
         .await;
     });

@@ -1,0 +1,14 @@
+{
+  "name": "cqserver-client",
+  "version": "0.1.0",
+  "description": "Node.js client SDK for CQServer (pub/sub database over TCP).",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "example": "node examples/quickstart.js"
+  },
+  "license": "MIT"
+}

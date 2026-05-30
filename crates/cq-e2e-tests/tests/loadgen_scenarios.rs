@@ -25,6 +25,9 @@ async fn scenario_h_publish_batch_vs_sequential_smoke() {
         duration: std::time::Duration::ZERO,
         subscribers: 0,
         admin_url: format!("http://127.0.0.1:{}", server.admin_port),
+        payload_bytes: 0,
+        wide_rows: 0,
+        wide_cols: 0,
     };
     let report = cq_loadgen::scenarios::publish_batch_vs_sequential(&cfg)
         .await
@@ -50,6 +53,9 @@ async fn scenario_i_schema_evolution_under_load_smoke() {
         duration: std::time::Duration::from_secs(12), // 2 add-column events
         subscribers: 0,
         admin_url: format!("http://127.0.0.1:{}", server.admin_port),
+        payload_bytes: 0,
+        wide_rows: 0,
+        wide_cols: 0,
     };
     let report = cq_loadgen::scenarios::schema_evolution_under_load(&cfg)
         .await

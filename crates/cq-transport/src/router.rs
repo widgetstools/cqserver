@@ -9,7 +9,7 @@ use crate::queue::QueueRegistry;
 use crate::session::{DeliveryRoute, Session, SessionRegistry};
 use cq_core::query::peek_join;
 use cq_core::topic::SharedTopic;
-use cq_protocol::command::Command;
+use cq_protocol::command::{AckType, Command};
 use cq_protocol::message::CqMessage;
 
 /// R10 — derived-table materialisation. Detects
@@ -874,6 +874,34 @@ pub struct RouterContext {
     /// reject_degenerate_groupby = true,
     /// reject_passthrough_views = true).
     pub query_limits: cq_core::query::QueryLimits,
+    /// S11 synchronous-replication policy for `AckType::Replicated`
+    /// publishes. See [`SyncReplication`]. Defaults to inactive, in
+    /// which case a `Replicated`-ack request is rejected with a clear
+    /// error rather than silently acked before replication.
+    pub sync_replication: SyncReplication,
+}
+
+/// S11 — controls how a publish that requests `AckType::Replicated` is
+/// acknowledged. When `active`, the publish path waits (off the dispatch
+/// thread, on a spawned task) until the per-topic
+/// `last_replicated_sequence` reaches the publish's sequence, then sends
+/// the ack — or fails the publish if `ack_timeout` elapses first. When
+/// inactive (standalone node, no standby), a `Replicated`-ack request is
+/// rejected immediately so the client is never told a write is
+/// replicated when no replica exists.
+#[derive(Clone, Copy)]
+pub struct SyncReplication {
+    pub active: bool,
+    pub ack_timeout: std::time::Duration,
+}
+
+impl Default for SyncReplication {
+    fn default() -> Self {
+        SyncReplication {
+            active: false,
+            ack_timeout: std::time::Duration::from_secs(5),
+        }
+    }
 }
 
 /// Server-wide spillover configuration, captured in [`RouterContext`]
@@ -899,6 +927,14 @@ pub fn new_bookmark_store() -> BookmarkStore {
     Arc::new(DashMap::new())
 }
 
+/// Ceiling on distinct `(client_name, topic)` bookmark entries. Without
+/// it, a deployment that mints a fresh `client_name` per reconnect (e.g.
+/// per-pod random ids) would grow this map without bound for the process
+/// lifetime. Past the cap we stop tracking *new* clients — they resume
+/// with a full snapshot instead of MOST_RECENT, which is correct, just
+/// less efficient. Existing entries keep updating regardless.
+const BOOKMARK_STORE_MAX: usize = 100_000;
+
 /// Record that a client just received delta with `seq` on `topic`.
 /// Monotonic update — won't lower an already-higher mark.
 pub fn record_bookmark(store: &BookmarkStore, client_name: &str, topic: &str, seq: u64) {
@@ -907,9 +943,34 @@ pub fn record_bookmark(store: &BookmarkStore, client_name: &str, topic: &str, se
         return;
     }
     let key = (client_name.to_string(), topic.to_string());
+    // Fast path (the common case on the delivery hot path): an entry
+    // already exists — bump it monotonically without touching map size.
+    if let Some(entry) = store.get(&key) {
+        bump_bookmark(&entry, seq);
+        return;
+    }
+    // New key: enforce the ceiling before inserting. Soft cap — a benign
+    // race may overshoot slightly, which is fine.
+    if store.len() >= BOOKMARK_STORE_MAX {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                cap = BOOKMARK_STORE_MAX,
+                "Bookmark store at capacity; new clients resume via full snapshot \
+                 (check for unstable client_name values)"
+            );
+        }
+        return;
+    }
     let entry = store
         .entry(key)
         .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+    bump_bookmark(&entry, seq);
+}
+
+/// Monotonic CAS bump of a bookmark atomic — never lowers the mark.
+fn bump_bookmark(entry: &std::sync::atomic::AtomicU64, seq: u64) {
+    use std::sync::atomic::Ordering;
     let mut cur = entry.load(Ordering::Relaxed);
     while cur < seq {
         match entry.compare_exchange_weak(cur, seq, Ordering::Relaxed, Ordering::Relaxed) {
@@ -962,6 +1023,75 @@ fn resolve_timestamp_to_seq(
         }
     }
     Ok(last_before)
+}
+
+/// Historical-SOW timestamp seek (inclusive): scan a topic's txlog for
+/// the highest sequence whose write timestamp is **at or before**
+/// `as_of_ms`. Unlike [`resolve_timestamp_to_seq`] (which is strict-
+/// less-than for replay), this includes a write landing exactly at the
+/// cutoff. `Ok(None)` means no entry qualifies — the as-of snapshot is
+/// empty. Assumes the reader yields entries in ascending sequence /
+/// timestamp order (txlog is append-only in sequence order).
+fn resolve_asof_timestamp_seq(
+    log_path: &std::path::Path,
+    as_of_ms: u64,
+) -> Result<Option<u64>, String> {
+    let mut reader = cq_txlog::reader::TxLogReader::open(log_path)
+        .map_err(|e| format!("open txlog: {e}"))?;
+    let mut last: Option<u64> = None;
+    loop {
+        match reader.read_next() {
+            Ok(Some(entry)) => {
+                if entry.timestamp_ms <= as_of_ms {
+                    last = Some(entry.sequence);
+                } else {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("read txlog: {e}")),
+        }
+    }
+    Ok(last)
+}
+
+/// Reconstruct a topic's SOW state as it existed immediately after
+/// `target_seq` was applied, by replaying the txlog. Per key the last
+/// write wins; a tombstone (empty payload) removes the key. Surviving
+/// rows are returned in first-seen key order so output is stable.
+fn reconstruct_asof_rows(
+    log_path: &std::path::Path,
+    target_seq: u64,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+    let mut reader = cq_txlog::reader::TxLogReader::open(log_path)
+        .map_err(|e| format!("open txlog: {e}"))?;
+    let mut order: Vec<String> = Vec::new();
+    let mut rows: std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::HashMap::new();
+    loop {
+        match reader.read_next() {
+            Ok(Some(entry)) => {
+                if entry.sequence > target_seq {
+                    break;
+                }
+                if entry.is_tombstone() {
+                    if rows.remove(&entry.key).is_some() {
+                        order.retain(|k| k != &entry.key);
+                    }
+                } else if let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_slice::<serde_json::Value>(&entry.payload)
+                {
+                    if !rows.contains_key(&entry.key) {
+                        order.push(entry.key.clone());
+                    }
+                    rows.insert(entry.key.clone(), map);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("read txlog: {e}")),
+        }
+    }
+    Ok(order.into_iter().filter_map(|k| rows.remove(&k)).collect())
 }
 
 pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) {
@@ -1021,7 +1151,17 @@ pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) 
             // to ack server-originated messages today).
             if let (Some(topic), Some(did)) = (&msg.topic, msg.delivery_id) {
                 if let Some(q) = ctx.queues.get(topic) {
-                    q.ack(did);
+                    // A `lease_extend_ms` turns the Ack into a lease
+                    // renewal (keep the message in-flight); otherwise it
+                    // commits the lease.
+                    match msg.lease_extend_ms {
+                        Some(extra) => {
+                            q.extend_lease(did, extra);
+                        }
+                        None => {
+                            q.ack(did);
+                        }
+                    }
                 }
             }
         }
@@ -1153,6 +1293,38 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
     };
     session.set_compression(compression);
 
+    // S30 — wire-codec negotiation, same handshake shape. An empty
+    // client list (or pre-S30 client) implies Codec::Json, preserving
+    // the JSON-on-TCP behavior for older clients. The negotiated codec
+    // is applied to the session ONLY AFTER the ack is sent, so the ack
+    // itself goes out in the pre-switch codec (JSON, the codec the
+    // Logon frame was decoded with). Both sides switch in lockstep for
+    // post-ack frames.
+    let client_codecs = msg.codecs.clone().unwrap_or_default();
+    let codec = match cq_protocol::serialization::negotiate_codec(
+        &client_codecs,
+        cq_protocol::serialization::SUPPORTED_CODECS,
+    ) {
+        cq_protocol::serialization::CodecNegotiationOutcome::Negotiated(c) => c,
+        cq_protocol::serialization::CodecNegotiationOutcome::NoOverlap => {
+            tracing::warn!(
+                session = %session.id,
+                client = ?client_codecs,
+                "Logon rejected: no overlapping wire codec"
+            );
+            metrics::counter!(
+                "cq_logon_total",
+                "result" => "codec_mismatch"
+            )
+            .increment(1);
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "No mutually supported codec",
+            ));
+            return;
+        }
+    };
+
     // When auth isn't required and no creds are supplied, the logon
     // is effectively a version-negotiation handshake — accept and
     // echo the negotiated version. (Existing entitlement-checked
@@ -1189,7 +1361,9 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
                     let mut ack = CqMessage::ack_ok(msg.command_id);
                     ack.protocol_versions = Some(vec![negotiated]);
                     ack.compressions = Some(vec![compression]);
+                    ack.codecs = Some(vec![codec]);
                     let _ = session.send_message(&ack);
+                    session.set_codec(codec);
                     return;
                 }
                 None => {
@@ -1219,7 +1393,7 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
         _ => None,
     };
 
-    if credentials.is_none() {
+    let Some((user, pass)) = credentials else {
         if auth.required {
             let _ = session.send_message(&CqMessage::error(
                 msg.command_id,
@@ -1233,19 +1407,21 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
         let mut ack = CqMessage::ack_ok_for_request(&msg);
         ack.protocol_versions = Some(vec![negotiated]);
         ack.compressions = Some(vec![compression]);
+        ack.codecs = Some(vec![codec]);
         tracing::info!(
             session = %session.id,
             client_name = ?session.client_name,
             protocol_version = negotiated,
             compression = ?compression,
+            codec = ?codec,
             trace_id = ?msg.trace_id,
             "Logon ok (no credentials, auth not required)"
         );
         metrics::counter!("cq_logon_total", "result" => "ok").increment(1);
         let _ = session.send_message(&ack);
+        session.set_codec(codec);
         return;
-    }
-    let (user, pass) = credentials.unwrap();
+    };
 
     match auth.verify(user, pass) {
         Some(matched) => {
@@ -1273,8 +1449,10 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
             let mut ack = CqMessage::ack_ok(msg.command_id);
             ack.protocol_versions = Some(vec![negotiated]);
             ack.compressions = Some(vec![compression]);
+            ack.codecs = Some(vec![codec]);
             ack.trace_id = msg.trace_id; // Q4 — echo trace-id back to caller
             let _ = session.send_message(&ack);
+            session.set_codec(codec);
         }
         None => {
             tracing::warn!(
@@ -1299,6 +1477,83 @@ fn handle_publish(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
 
 fn handle_delta_publish(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
     handle_publish_inner(session, msg, ctx, true);
+}
+
+/// S11 — emit a publish ack, honoring `AckType::Replicated`.
+///
+/// For every ack level except `Replicated` the prebuilt `success_ack`
+/// (which already carries the assigned `sequence`/`sequences`) is sent
+/// inline, exactly as before. For `Replicated`:
+///   - If this node has no replication target, the request is rejected
+///     with an explicit error — we never claim a write is replicated
+///     when no standby exists.
+///   - If the standby has already confirmed `await_seq`, the ack is sent
+///     inline (fast path).
+///   - Otherwise a task is spawned that waits on the topic's replication
+///     notify until `last_replicated_sequence >= await_seq`, then sends
+///     `success_ack`; or fails the publish if `ack_timeout` elapses. The
+///     wait runs off the dispatch thread so the read loop is never
+///     blocked.
+fn finish_publish_ack(
+    session: &Session,
+    msg: &CqMessage,
+    ctx: &RouterContext,
+    topic: &SharedTopic,
+    await_seq: u64,
+    success_ack: CqMessage,
+) {
+    if !matches!(msg.ack_type, Some(AckType::Replicated)) {
+        let _ = session.send_message(&success_ack);
+        return;
+    }
+    if !ctx.sync_replication.active {
+        metrics::counter!("cq_repl_sync_ack_rejected_total").increment(1);
+        let _ = session.send_message(&CqMessage::error(
+            msg.command_id.clone(),
+            "replicated ack requested but this node has no replication target",
+        ));
+        return;
+    }
+    if topic.last_replicated_sequence() >= await_seq {
+        let _ = session.send_message(&success_ack);
+        return;
+    }
+    let tx = session.tx.clone();
+    let codec = session.codec();
+    let notify = topic.replication_notify_handle();
+    let topic = topic.clone();
+    let timeout = ctx.sync_replication.ack_timeout;
+    let command_id = msg.command_id.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if topic.last_replicated_sequence() >= await_seq {
+                if let Some(frame) = crate::session::encode_frame(codec, &success_ack) {
+                    let _ = tx.send(frame).await;
+                }
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                metrics::counter!("cq_repl_sync_ack_timeout_total").increment(1);
+                let err = CqMessage::error(
+                    command_id.clone(),
+                    "replication ack timed out before standby confirmed",
+                );
+                if let Some(frame) = crate::session::encode_frame(codec, &err) {
+                    let _ = tx.send(frame).await;
+                }
+                return;
+            }
+            // Subscribe to the notify BEFORE re-checking the sequence so
+            // an Ack landing between the check and the wait can't be lost.
+            let n = notify.notified();
+            if topic.last_replicated_sequence() >= await_seq {
+                continue;
+            }
+            let _ = tokio::time::timeout(remaining, n).await;
+        }
+    });
 }
 
 /// Q2 — atomic batched publish. Commits all N rows in input order
@@ -1356,10 +1611,13 @@ fn handle_publish_batch(session: &mut Session, msg: CqMessage, ctx: &RouterConte
         }
     };
     let started = Instant::now();
-    let mut seqs: Vec<u64> = Vec::with_capacity(batch.len());
+    // Validate every entry is an object before committing anything, so a
+    // malformed row can't leave a half-committed frame.
+    let mut objs: Vec<&serde_json::Map<String, serde_json::Value>> =
+        Vec::with_capacity(batch.len());
     for (i, payload) in batch.iter().enumerate() {
-        let obj = match payload {
-            serde_json::Value::Object(m) => m,
+        match payload {
+            serde_json::Value::Object(m) => objs.push(m),
             _ => {
                 let _ = session.send_message(&CqMessage::error(
                     msg.command_id.clone(),
@@ -1367,18 +1625,20 @@ fn handle_publish_batch(session: &mut Session, msg: CqMessage, ctx: &RouterConte
                 ));
                 return;
             }
-        };
-        match topic.upsert_map(obj) {
-            Ok(seq) => seqs.push(seq),
-            Err(e) => {
-                let _ = session.send_message(&CqMessage::error(
-                    msg.command_id.clone(),
-                    &format!("publish_batch[{i}] failed: {e}"),
-                ));
-                return;
-            }
         }
     }
+    // Commit the whole frame under one topic write lock (see
+    // `Topic::upsert_map_batch`) instead of one lock per row.
+    let seqs = match topic.upsert_map_batch(&objs) {
+        Ok(seqs) => seqs,
+        Err(e) => {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id.clone(),
+                &format!("publish_batch failed: {e}"),
+            ));
+            return;
+        }
+    };
     let n = batch.len() as u64;
     let elapsed_us = started.elapsed().as_micros() as f64;
     metrics::counter!("cq_publish_batch_total", "topic" => topic_name.clone()).increment(1);
@@ -1390,9 +1650,10 @@ fn handle_publish_batch(session: &mut Session, msg: CqMessage, ctx: &RouterConte
     // `handle_publish_inner`. One eviction sweep per batch (not per
     // row) keeps amortised cost equal to a single publish.
     invalidate_snapshot_cache_for_topic(&topic_name);
+    let await_seq = seqs.iter().copied().max().unwrap_or(0);
     let mut ack = CqMessage::ack_ok_for_request(&msg);
     ack.sequences = Some(seqs);
-    let _ = session.send_message(&ack);
+    finish_publish_ack(session, &msg, ctx, &topic, await_seq, ack);
 }
 
 fn handle_publish_inner(
@@ -1448,8 +1709,19 @@ fn handle_publish_inner(
             ));
             return;
         }
+        if matches!(msg.ack_type, Some(AckType::Replicated)) {
+            let _ = session.send_message(&CqMessage::error(
+                msg.command_id,
+                "replicated ack not supported on queue topics",
+            ));
+            return;
+        }
         let started = Instant::now();
-        let seq = queue.publish(data_value, &ctx.sessions);
+        let opts = crate::queue::PublishOpts {
+            priority: msg.priority.unwrap_or(0),
+            group: msg.group.as_deref(),
+        };
+        let seq = queue.publish_with_opts(data_value, opts, &ctx.sessions);
         let elapsed_us = started.elapsed().as_micros() as f64;
         metrics::histogram!("cq_publish_latency_us", "topic" => topic_name.clone())
             .record(elapsed_us);
@@ -1490,7 +1762,8 @@ fn handle_publish_inner(
                 invalidate_snapshot_cache_for_topic(&topic_name);
                 let mut ack = CqMessage::ack_ok_for_request(&msg);
                 ack.sequence = Some(seq);
-                let _ = session.send_message(&ack);
+                let topic = topic.value().clone();
+                finish_publish_ack(session, &msg, ctx, &topic, seq, ack);
             }
             Err(e) => {
                 let _ = session.send_message(&CqMessage::error(
@@ -1621,6 +1894,117 @@ fn handle_sow(
         }
     };
 
+    // Historical "as-of" SOW: when the request carries an as-of
+    // sequence or timestamp, ignore the live store and reconstruct the
+    // topic's point-in-time state from the txlog, then run the query's
+    // filter/projection against that snapshot. Single-topic only — JOIN
+    // / derived-table forms fall through their error from the ephemeral
+    // query if used here.
+    if msg.as_of_sequence.is_some() || msg.as_of_timestamp_ms.is_some() {
+        let log_path = match topic.txlog_path() {
+            Some(p) => p,
+            None => {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    "historical SOW requires a persistent topic",
+                ));
+                return;
+            }
+        };
+        let sql_for_asof = build_sql(&msg);
+        let asof_sub_id = msg.command_id.clone().unwrap_or_default();
+        let as_of_seq = msg.as_of_sequence;
+        let as_of_ts = msg.as_of_timestamp_ms;
+        let tx = session.tx.clone();
+        let codec = *session.codec.lock();
+        let hard_max_rows = query_limits.hard_max_sow_result_rows;
+        tokio::spawn(async move {
+            use crate::session::encode_frame;
+            let send_err = |reason: String| {
+                if let Some(f) = encode_frame(codec, &CqMessage::error(None, &reason)) {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(f).await;
+                    });
+                }
+            };
+            // Resolve the target sequence to reconstruct as-of.
+            let target = if let Some(s) = as_of_seq {
+                s
+            } else {
+                match resolve_asof_timestamp_seq(&log_path, as_of_ts.unwrap_or(0)) {
+                    Ok(Some(s)) => s,
+                    // No entry at/before the cutoff → empty snapshot.
+                    Ok(None) => 0,
+                    Err(e) => {
+                        send_err(format!("historical SOW: {e}"));
+                        return;
+                    }
+                }
+            };
+            let rows = match reconstruct_asof_rows(&log_path, target) {
+                Ok(r) => r,
+                Err(e) => {
+                    send_err(format!("historical SOW: {e}"));
+                    return;
+                }
+            };
+
+            // Run the query against the reconstructed rows. Empty
+            // snapshot → emit an empty group (skip ephemeral build,
+            // which can't infer a schema from zero rows).
+            let result_rows: Vec<serde_json::Map<String, serde_json::Value>> = if rows.is_empty() {
+                Vec::new()
+            } else {
+                match make_ephemeral_topic_from_rows(&rows) {
+                    Ok(ephemeral) => match ephemeral.query(&sql_for_asof) {
+                        Ok(mut res) => {
+                            // Strip the synthetic key column the
+                            // ephemeral topic added during seeding.
+                            for row in &mut res.rows {
+                                row.remove("__derived_id__");
+                            }
+                            res.rows
+                        }
+                        Err(e) => {
+                            send_err(format!("historical SOW query: {e}"));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        send_err(format!("historical SOW materialise: {e}"));
+                        return;
+                    }
+                }
+            };
+            let mut result_rows = result_rows;
+            let cap = hard_max_rows as usize;
+            if result_rows.len() > cap {
+                result_rows.truncate(cap);
+            }
+
+            if let Some(f) =
+                encode_frame(codec, &CqMessage::group_begin(&asof_sub_id, result_rows.len()))
+            {
+                if tx.send(f).await.is_err() {
+                    return;
+                }
+            }
+            if !result_rows.is_empty() {
+                let batch = CqMessage::sow_batch(&asof_sub_id, result_rows);
+                if let Some(f) = encode_frame(codec, &batch) {
+                    if tx.send(f).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            if let Some(f) = encode_frame(codec, &CqMessage::group_end(&asof_sub_id)) {
+                let _ = tx.send(f).await;
+            }
+        });
+        return;
+    }
+
     let tx = session.tx.clone();
     let codec_slot = session.codec.clone();
     let session_id = session.id.clone();
@@ -1722,6 +2106,12 @@ fn handle_sow_and_subscribe(
     if !check_entitlement(session, &msg.command_id, &ctx.auth, Op::Subscribe, &topic_name) {
         return;
     }
+
+    // Client-requested conflation interval (`conflation=<ms>` in the
+    // subscribe options), capped server-side. Resolved here so it is
+    // available to both the bookmark-replay branch and the snapshot
+    // branch before any of `msg`'s fields are moved.
+    let req_conflation = requested_conflation_ms(&msg);
 
     // Queue subscribe path: no snapshot, no bookmark, no predicates.
     // The subscriber joins the queue's round-robin consumer set.
@@ -1940,6 +2330,7 @@ fn handle_sow_and_subscribe(
             topics,
             registry,
             cname,
+            req_conflation,
             ctx.bookmark_store.clone(),
             ctx.spillover.as_ref(),
         );
@@ -1949,7 +2340,8 @@ fn handle_sow_and_subscribe(
     let sub_id = session.next_sub_id();
 
     if let Some(topic) = topics.get(&topic_name) {
-        let conflation_ms = topic.conflation_ms();
+        // Client request wins (incl. `0` = opt-out); else topic baseline.
+        let conflation_ms = req_conflation.or_else(|| topic.conflation_ms());
         // For `send_keys`, only the *snapshot* projection should be
         // keys-only — the live delta path still needs the original
         // projection (all columns by default) so sparse diff_update
@@ -2097,6 +2489,10 @@ fn handle_bookmark_subscribe(
     topics: &Arc<DashMap<String, SharedTopic>>,
     registry: &SessionRegistry,
     client_name: Option<String>,
+    // Capped client-requested conflation interval (see
+    // `requested_conflation_ms`). `None` falls back to the topic
+    // baseline; `Some(0)` is an explicit client opt-out.
+    requested_conflation_ms: Option<u64>,
     bookmark_store: BookmarkStore,
     spillover_ctx: Option<&SpilloverContext>,
 ) {
@@ -2124,7 +2520,8 @@ fn handle_bookmark_subscribe(
         }
     };
 
-    let conflation_ms = topic.conflation_ms();
+    // Client request wins (incl. `0` = opt-out); else topic baseline.
+    let conflation_ms = requested_conflation_ms.or_else(|| topic.conflation_ms());
     let (query, captured) = match topic.subscribe_with_bookmark(sub_id.clone(), sql) {
         Ok(x) => x,
         Err(e) => {
@@ -2187,6 +2584,7 @@ fn handle_bookmark_subscribe(
             }
         };
         let mut replayed: u64 = 0;
+        let mut scanned: u64 = 0;
         loop {
             // Pause handshake: if paused, await Resume. The
             // `resume_notify` is `notify_waiters`-style — i.e. it
@@ -2196,6 +2594,14 @@ fn handle_bookmark_subscribe(
                 while r.paused.load(std::sync::atomic::Ordering::Acquire) {
                     r.resume_notify.notified().await;
                 }
+            }
+            // A long replay (bookmark at 0, millions of entries) would
+            // otherwise drive this blocking-read loop with no await points
+            // between entries, monopolizing the runtime worker. Yield
+            // periodically so other tasks on this worker make progress.
+            scanned = scanned.wrapping_add(1);
+            if scanned % 256 == 0 {
+                tokio::task::yield_now().await;
             }
             match reader.read_next() {
                 Ok(Some(entry)) => {
@@ -2310,10 +2716,12 @@ fn handle_subscribe(session: &mut Session, msg: CqMessage, ctx: &RouterContext) 
     let topics = &ctx.topics;
     let registry = &ctx.sessions;
     let sql = build_sql(&msg);
+    let req_conflation = requested_conflation_ms(&msg);
     let sub_id = session.next_sub_id();
 
     if let Some(topic) = topics.get(&topic_name) {
-        let conflation_ms = topic.conflation_ms();
+        // Client request wins (incl. `0` = opt-out); else topic baseline.
+        let conflation_ms = req_conflation.or_else(|| topic.conflation_ms());
         // Live-only subscribe (no snapshot delivery on this path) —
         // register without materializing any Vec<Map>.
         match topic.subscribe_register(sub_id.clone(), &sql, false) {
@@ -2816,6 +3224,108 @@ fn parse_option(options: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Server-side ceiling on a client-requested conflation interval.
+/// A subscribe option `conflation=<ms>` is clamped to this value so a
+/// client can't pin a multi-second interval that starves liveness for
+/// the whole subscription. Tuned via `CQSERVER_MAX_CONFLATION_MS`;
+/// default 60000 (60 s). `0` = uncapped (honor whatever the client asks).
+fn max_conflation_ms() -> u64 {
+    std::env::var("CQSERVER_MAX_CONFLATION_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60_000)
+}
+
+/// Parse a client-requested conflation interval from the subscribe
+/// `options` string (`conflation=<ms>`), clamped to `cap` (0 = uncapped).
+///
+/// Returns:
+///   - `None` — the client did not request conflation; the caller falls
+///     back to the topic's configured baseline (`topic.conflation_ms()`).
+///   - `Some(0)` — the client explicitly opted *out*; this overrides any
+///     topic baseline (the route builder treats `0` as "no conflation").
+///   - `Some(ms)` — the client's requested interval, capped.
+///
+/// Pure (cap passed in) so it can be unit-tested without touching env.
+fn requested_conflation_ms_capped(msg: &CqMessage, cap: u64) -> Option<u64> {
+    let options = msg.options.as_deref().unwrap_or("");
+    parse_option(options, "conflation")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| if cap > 0 { ms.min(cap) } else { ms })
+}
+
+/// Production wrapper around [`requested_conflation_ms_capped`] that reads
+/// the server-side cap from [`max_conflation_ms`].
+fn requested_conflation_ms(msg: &CqMessage) -> Option<u64> {
+    requested_conflation_ms_capped(msg, max_conflation_ms())
+}
+
+#[cfg(test)]
+mod conflation_option_tests {
+    use super::*;
+    use cq_protocol::command::Command;
+
+    fn sub_with_opts(opts: Option<&str>) -> CqMessage {
+        let mut m = CqMessage::new(Command::Subscribe);
+        m.topic = Some("/t".into());
+        m.options = opts.map(|s| s.to_string());
+        m
+    }
+
+    /// The effective interval the route builder will see, mirroring the
+    /// `req.or_else(|| topic_baseline)` resolution at the subscribe sites.
+    fn effective(opts: Option<&str>, cap: u64, topic_baseline: Option<u64>) -> Option<u64> {
+        requested_conflation_ms_capped(&sub_with_opts(opts), cap)
+            .or(topic_baseline)
+    }
+
+    #[test]
+    fn no_option_falls_back_to_topic_baseline() {
+        assert_eq!(effective(None, 60_000, Some(100)), Some(100));
+        assert_eq!(effective(Some("select=[a,b]"), 60_000, Some(250)), Some(250));
+        // No client option AND no topic baseline → no conflation.
+        assert_eq!(effective(None, 60_000, None), None);
+    }
+
+    #[test]
+    fn client_value_overrides_topic_baseline() {
+        // Client asks for 200ms even though the topic baseline is 100ms.
+        assert_eq!(effective(Some("conflation=200"), 60_000, Some(100)), Some(200));
+        // And works with no baseline configured.
+        assert_eq!(effective(Some("conflation=50"), 60_000, None), Some(50));
+    }
+
+    #[test]
+    fn client_zero_is_explicit_opt_out() {
+        // `conflation=0` disables conflation even if the topic configures
+        // a baseline; the route builder treats Some(0) as "no conflation".
+        assert_eq!(effective(Some("conflation=0"), 60_000, Some(100)), Some(0));
+    }
+
+    #[test]
+    fn client_value_is_capped_to_server_ceiling() {
+        // Client asks for 5 minutes; server cap is 60s.
+        assert_eq!(effective(Some("conflation=300000"), 60_000, None), Some(60_000));
+        // cap == 0 means uncapped — honor whatever the client asks.
+        assert_eq!(effective(Some("conflation=300000"), 0, None), Some(300_000));
+    }
+
+    #[test]
+    fn garbage_value_is_ignored_and_falls_back() {
+        // Non-numeric → treated as "not requested" → topic baseline.
+        assert_eq!(effective(Some("conflation=fast"), 60_000, Some(100)), Some(100));
+        assert_eq!(effective(Some("conflation="), 60_000, None), None);
+    }
+
+    #[test]
+    fn conflation_parses_alongside_other_options() {
+        assert_eq!(
+            effective(Some("select=[a,b],conflation=150,order_by=ts"), 60_000, None),
+            Some(150)
+        );
+    }
+}
+
 /// Walk a session's subscription list on disconnect and remove each entry
 /// from the registry + the owning topic / queue. Both transports call this
 /// on connection close.
@@ -3288,4 +3798,187 @@ async fn deliver_join_snapshot(
         elapsed_ms,
         "JOIN SOW snapshot delivered"
     );
+}
+
+#[cfg(test)]
+mod sync_repl_tests {
+    use super::*;
+    use crate::session::{new_registry, OutboundFrame, Session};
+    use cq_core::schema::{ColumnType, Schema};
+    use cq_core::topic::{Topic, TopicConfig};
+    use cq_protocol::command::{AckType, Command, Status};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn build_topic() -> SharedTopic {
+        let schema = Arc::new(Schema::from_strs(
+            &["symbol", "price"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        Arc::new(Topic::new(
+            TopicConfig {
+                name: "/repl".into(),
+                key_fields: vec!["symbol".into()],
+                persist: false,
+                conflation_ms: None,
+                index_columns: vec![],
+                expire_seconds: None,
+            },
+            schema,
+            32,
+        ))
+    }
+
+    fn ctx_with(sync: SyncReplication) -> RouterContext {
+        RouterContext {
+            topics: Arc::new(DashMap::new()),
+            sessions: new_registry(),
+            queues: crate::queue::new_queue_registry(),
+            auth: Arc::new(crate::auth::AuthStore::disabled()),
+            sow_batch_size: 64,
+            bookmark_store: new_bookmark_store(),
+            spillover: None,
+            read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: sync,
+        }
+    }
+
+    fn publish_msg(ack: Option<AckType>) -> CqMessage {
+        let mut m = CqMessage::new(Command::Publish);
+        m.command_id = Some("cid-1".into());
+        m.ack_type = ack;
+        m
+    }
+
+    fn ok_ack(seq: u64) -> CqMessage {
+        let mut a = CqMessage::ack_ok(Some("cid-1".into()));
+        a.sequence = Some(seq);
+        a
+    }
+
+    fn decode(frame: &OutboundFrame) -> CqMessage {
+        serde_json::from_slice(frame.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_replicated_ack_is_sent_inline() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let session = Session::new("t".into(), tx);
+        let ctx = ctx_with(SyncReplication::default());
+        let topic = build_topic();
+
+        finish_publish_ack(&session, &publish_msg(None), &ctx, &topic, 7, ok_ack(7));
+
+        let frame = rx.try_recv().expect("ack sent synchronously");
+        let m = decode(&frame);
+        assert_eq!(m.status, Some(Status::Ok));
+        assert_eq!(m.sequence, Some(7));
+    }
+
+    #[tokio::test]
+    async fn replicated_ack_without_target_is_rejected() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let session = Session::new("t".into(), tx);
+        let ctx = ctx_with(SyncReplication {
+            active: false,
+            ack_timeout: Duration::from_secs(5),
+        });
+        let topic = build_topic();
+
+        finish_publish_ack(
+            &session,
+            &publish_msg(Some(AckType::Replicated)),
+            &ctx,
+            &topic,
+            7,
+            ok_ack(7),
+        );
+
+        let m = decode(&rx.try_recv().expect("error sent synchronously"));
+        assert_eq!(m.status, Some(Status::Error));
+    }
+
+    #[tokio::test]
+    async fn replicated_ack_already_satisfied_sends_inline() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let session = Session::new("t".into(), tx);
+        let ctx = ctx_with(SyncReplication {
+            active: true,
+            ack_timeout: Duration::from_secs(5),
+        });
+        let topic = build_topic();
+        topic.mark_replicated(10);
+
+        finish_publish_ack(
+            &session,
+            &publish_msg(Some(AckType::Replicated)),
+            &ctx,
+            &topic,
+            7,
+            ok_ack(7),
+        );
+
+        let m = decode(&rx.try_recv().expect("ack sent synchronously"));
+        assert_eq!(m.status, Some(Status::Ok));
+        assert_eq!(m.sequence, Some(7));
+    }
+
+    #[tokio::test]
+    async fn replicated_ack_waits_for_standby_then_acks() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let session = Session::new("t".into(), tx);
+        let ctx = ctx_with(SyncReplication {
+            active: true,
+            ack_timeout: Duration::from_secs(5),
+        });
+        let topic = build_topic();
+
+        finish_publish_ack(
+            &session,
+            &publish_msg(Some(AckType::Replicated)),
+            &ctx,
+            &topic,
+            7,
+            ok_ack(7),
+        );
+        // Nothing yet — the standby hasn't confirmed.
+        assert!(rx.try_recv().is_err());
+
+        topic.mark_replicated(7);
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("ack should arrive after mark_replicated")
+            .expect("frame");
+        let m = decode(&frame);
+        assert_eq!(m.status, Some(Status::Ok));
+        assert_eq!(m.sequence, Some(7));
+    }
+
+    #[tokio::test]
+    async fn replicated_ack_times_out_when_standby_never_confirms() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
+        let session = Session::new("t".into(), tx);
+        let ctx = ctx_with(SyncReplication {
+            active: true,
+            ack_timeout: Duration::from_millis(150),
+        });
+        let topic = build_topic();
+
+        finish_publish_ack(
+            &session,
+            &publish_msg(Some(AckType::Replicated)),
+            &ctx,
+            &topic,
+            7,
+            ok_ack(7),
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a timeout error should arrive")
+            .expect("frame");
+        let m = decode(&frame);
+        assert_eq!(m.status, Some(Status::Error));
+    }
 }

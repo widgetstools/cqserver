@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { AgGridReact } from 'ag-grid-react';
 import {
   AllCommunityModule,
@@ -6,42 +6,35 @@ import {
   type ColDef,
   type GridApi,
   type GridReadyEvent,
+  type GetRowIdParams,
 } from 'ag-grid-community';
 import { AllEnterpriseModule } from 'ag-grid-enterprise';
 import { getAtlasGridTheme } from '../aggrid';
-import type { SubscriptionHandle } from '@/lib/use-subscription';
+import {
+  ATLAS_LIVE_DEFAULT_COL_DEF,
+  ATLAS_LIVE_GRID_PROPS,
+  ATLAS_STATUS_BAR,
+  enrichColDefsForLiveFlash,
+} from '../aggridLive';
+import { useLiveGridSync } from '../hooks/useLiveGridSync';
+import { useAtlasTheme } from '../theme/ThemeContext';
+import type { SubscriptionHandle, Row } from '@/lib/use-subscription';
 
 ModuleRegistry.registerModules([AllCommunityModule, AllEnterpriseModule]);
 
-interface DataTableProps<T extends Record<string, unknown>> {
-  /** Title strip above the grid, e.g. 'POSITIONS · 23 of 207 cols'. */
+const EMPTY_ROWS: Row[] = [];
+
+interface DataTableProps<T extends Row> {
   title?: string;
-  /** Right-aligned status, e.g. '4,827 rows · ticking'. */
   status?: string;
-  /** Static rows. Ignored when `liveSubscription` is set. */
   rows?: T[];
   colDefs: ColDef[];
-  /** Stable row id extractor — required when `liveSubscription` is set so
-   *  `applyTransactionAsync({update})` can match incoming rows. */
-  getRowId?: (row: T) => string;
-  /**
-   * Per-component cqserver subscription handle (from `useSubscription` /
-   * `useFilteredSubscription`). When set, the grid:
-   *   - waits for the worker to finish SOW (or has rows + 'live' status);
-   *   - seeds rowData ONCE via React state (`boundRows`) so the snapshot
-   *     lands without depending on chunk-listener registration timing;
-   *   - applies all subsequent deltas via `applyTransactionAsync`.
-   *
-   * This pattern is the legacy GridPanel pattern — proven to populate
-   * tiny views (≤100 rows) AND large topics (40k+) reliably without the
-   * race condition that empty grids on small views had in the chunked-
-   * listener-only approach.
-   * `rows` is ignored when `liveSubscription` is set.
-   */
+  /** Stable row id — required so applyTransaction can match rows without full reloads. */
+  getRowId: (row: T) => string;
   liveSubscription?: SubscriptionHandle;
 }
 
-export function DataTable<T extends Record<string, unknown>>({
+export function DataTable<T extends Row>({
   title,
   status,
   rows,
@@ -49,91 +42,49 @@ export function DataTable<T extends Record<string, unknown>>({
   getRowId,
   liveSubscription,
 }: DataTableProps<T>) {
-  const theme = useMemo(() => getAtlasGridTheme(), []);
+  const { theme } = useAtlasTheme();
+  const gridTheme = useMemo(() => getAtlasGridTheme(theme), [theme]);
+  const apiRef = useRef<GridApi<T> | null>(null);
+
   const agGetRowId = useMemo(
-    () => (getRowId ? ({ data }: { data: T }) => getRowId(data) : undefined),
+    () => (params: GetRowIdParams<T>) => getRowId(params.data),
     [getRowId],
   );
 
-  // AG-Grid v35 requires per-column `enableCellChangeFlash` to actually
-  // emit the value-change flash under React + immutable data mode.
-  // Default ColDef propagation does NOT work; the legacy GridPanel
-  // injected this column-by-column for the same reason. When we're
-  // bound to a liveSubscription, opt every column in so the user sees
-  // amber-flash on every tick.
+  const { sowRowData, onGridReady: syncOnGridReady } = useLiveGridSync<T>(
+    liveSubscription,
+    apiRef,
+    getRowId,
+  );
+
   const flashColDefs = useMemo<ColDef[]>(
-    () =>
-      liveSubscription
-        ? colDefs.map((c) => ({ ...c, enableCellChangeFlash: true }))
-        : colDefs,
+    () => (liveSubscription ? enrichColDefsForLiveFlash(colDefs) : colDefs),
     [colDefs, liveSubscription],
   );
 
-  const apiRef = useRef<GridApi<T> | null>(null);
-  const seededRef = useRef<SubscriptionHandle | null>(null);
-  const [boundRows, setBoundRows] = useState<T[] | null>(null);
+  const defaultColDef = useMemo<ColDef>(
+    () => (liveSubscription ? ATLAS_LIVE_DEFAULT_COL_DEF : {}),
+    [liveSubscription],
+  );
 
+  // Static rows: push into the grid only when the rows reference changes.
+  const staticRowsRef = useRef<T[] | undefined>(undefined);
   useEffect(() => {
-    if (!liveSubscription) return;
-
-    // Subscription identity changed (e.g. filter swap rebuilt the sub):
-    // wipe the grid and reset the seed gate.
-    if (seededRef.current !== liveSubscription) {
-      seededRef.current = liveSubscription;
-      setBoundRows(null);
-      const api = apiRef.current;
-      if (api) api.setGridOption('rowData', []);
-    }
-
-    // Seed gate. The Sub's row mirror always reflects the worker's
-    // current snapshot, so we can safely read it whenever:
-    //   - the sub is 'live' (SOW done), OR
-    //   - rows have already started arriving (so the partial SOW is
-    //     visible immediately, then later snapshot chunks land via
-    //     this same callback).
-    const trySeed = () => {
-      if (seededRef.current !== liveSubscription) return;
-      if (boundRows !== null) return;
-      const snap = liveSubscription.getSnapshot();
-      if (liveSubscription.getStatus() !== 'live' && snap.length === 0) return;
-      setBoundRows(snap as T[]);
-    };
-    trySeed();
-    const unsubStatus = liveSubscription.subscribeStatus(trySeed);
-    const unsubChunks = liveSubscription.subscribeSnapshotChunks(() => trySeed());
-
-    // Post-seed live deltas — coalesced 50ms batches from the worker.
-    const unsubDeltas = liveSubscription.subscribeDeltas((batch) => {
-      const api = apiRef.current;
-      if (!api) return;
-      api.applyTransactionAsync({
-        add: batch.add as unknown as T[],
-        update: batch.update as unknown as T[],
-        remove: batch.remove as unknown as T[],
-      });
-    });
-
-    return () => {
-      unsubStatus();
-      unsubChunks();
-      unsubDeltas();
-    };
-    // boundRows intentionally excluded — its setter inside trySeed would
-    // otherwise loop the effect.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveSubscription]);
+    if (liveSubscription) return;
+    const next = rows ?? (EMPTY_ROWS as T[]);
+    if (next === staticRowsRef.current) return;
+    staticRowsRef.current = next;
+    apiRef.current?.setGridOption('rowData', next);
+  }, [rows, liveSubscription]);
 
   const handleGridReady = (e: GridReadyEvent<T>) => {
-    apiRef.current = e.api;
+    syncOnGridReady(e.api);
+    if (!liveSubscription && rows && rows.length > 0) {
+      e.api.setGridOption('rowData', rows);
+    }
   };
 
-  // When liveSubscription is set, boundRows drives rowData (null until
-  // seed; then the snapshot array reference). Deltas after seed apply
-  // through `applyTransactionAsync` against AG-Grid's internal state —
-  // they don't re-trigger React rendering.
-  const effectiveRowData = liveSubscription
-    ? (boundRows ?? undefined)
-    : (rows ?? []);
+  const rowData = liveSubscription ? sowRowData : rows;
 
   return (
     <div
@@ -166,14 +117,16 @@ export function DataTable<T extends Record<string, unknown>>({
       )}
       <div style={{ flex: 1, minHeight: 280, width: '100%', height: '100%' }}>
         <AgGridReact<T>
-          theme={theme}
-          rowData={effectiveRowData}
+          theme={gridTheme}
+          rowData={rowData}
           columnDefs={flashColDefs}
+          defaultColDef={defaultColDef}
           rowHeight={26}
           headerHeight={28}
-          animateRows={false}
           getRowId={agGetRowId}
           onGridReady={handleGridReady}
+          statusBar={ATLAS_STATUS_BAR}
+          {...(liveSubscription ? ATLAS_LIVE_GRID_PROPS : { animateRows: false })}
         />
       </div>
     </div>

@@ -54,6 +54,17 @@ enum Scenario {
     /// online every 5 seconds. Reports publish ack p50/p99 and the
     /// number of columns added in the window.
     SchemaEvolutionUnderLoad,
+    /// Heavy SOW: seed `--rows` × `--cols` (default 30000 × 400),
+    /// measure the full snapshot delivery, then drive `--rate` sparse
+    /// `delta_publish` updates/s for `--duration-secs` and report
+    /// publish→delivery latency on the live subscription.
+    SowWide,
+    /// Wire-egress ceiling: ramp `--subscribers N` lightweight firehose
+    /// subscribers (drain-and-discard), then publish `--rate` msg/s of
+    /// `--payload-bytes` bodies. Reports achieved deltas/s + MB/s, the
+    /// delivered fraction vs ideal `rate × N` fanout, and peak server RSS.
+    /// Use for 2000/5000/10000-connection egress tests.
+    EgressFanout,
 }
 
 #[derive(Parser, Debug)]
@@ -88,6 +99,19 @@ struct Args {
     /// Admin-API URL for /stats polling (stress-2k only).
     #[arg(long, default_value = "http://127.0.0.1:8085")]
     admin_url: String,
+
+    /// Target serialized JSON body size in bytes per publish (publish-throughput
+    /// only). 0 = tiny `{k,v}` body; larger values pad with a filler field.
+    #[arg(long, default_value_t = 0)]
+    payload_bytes: usize,
+
+    /// sow-wide: rows to seed before the snapshot. 0 ⇒ 30000.
+    #[arg(long, default_value_t = 0)]
+    rows: usize,
+
+    /// sow-wide: columns per row (including the `k` key). 0 ⇒ 400.
+    #[arg(long, default_value_t = 0)]
+    cols: usize,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -102,6 +126,9 @@ async fn main() -> Result<()> {
         subscribers: args.subscribers,
         warmup: Duration::from_secs_f64(args.warmup_secs),
         admin_url: args.admin_url,
+        payload_bytes: args.payload_bytes,
+        wide_rows: args.rows,
+        wide_cols: args.cols,
     };
     match args.scenario {
         Scenario::PublishThroughput => scenarios::publish_throughput(&cfg).await?.print(),
@@ -121,6 +148,12 @@ async fn main() -> Result<()> {
         }
         Scenario::SchemaEvolutionUnderLoad => {
             scenarios::schema_evolution_under_load(&cfg).await?.print();
+        }
+        Scenario::SowWide => {
+            scenarios::sow_wide(&cfg).await?;
+        }
+        Scenario::EgressFanout => {
+            scenarios::egress_fanout(&cfg).await?;
         }
     };
     Ok(())

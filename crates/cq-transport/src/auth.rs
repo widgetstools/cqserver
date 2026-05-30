@@ -245,17 +245,14 @@ impl std::fmt::Debug for JwtValidator {
 }
 
 impl JwtValidator {
-    /// Build an HS256 validator. `issuer` and `audience` are optional;
-    /// when set, the corresponding `iss`/`aud` claims are also
-    /// validated.
-    pub fn new_hs256(
-        secret: &[u8],
+    /// Build a `Validation` for `algorithm` with optional `iss`/`aud`
+    /// requirements. Shared by the HS256 and RS256 constructors.
+    fn build_validation(
+        algorithm: jsonwebtoken::Algorithm,
         issuer: Option<&str>,
         audience: Option<&str>,
-        username_claim: &str,
-        entitlements_claim: &str,
-    ) -> Self {
-        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    ) -> jsonwebtoken::Validation {
+        let mut validation = jsonwebtoken::Validation::new(algorithm);
         if let Some(iss) = issuer {
             validation.set_issuer(&[iss]);
         } else {
@@ -269,12 +266,53 @@ impl JwtValidator {
             // Don't require the audience claim either.
             validation.validate_aud = false;
         }
+        validation
+    }
+
+    /// Build an HS256 validator. `issuer` and `audience` are optional;
+    /// when set, the corresponding `iss`/`aud` claims are also
+    /// validated.
+    pub fn new_hs256(
+        secret: &[u8],
+        issuer: Option<&str>,
+        audience: Option<&str>,
+        username_claim: &str,
+        entitlements_claim: &str,
+    ) -> Self {
         Self {
             decoding_key: jsonwebtoken::DecodingKey::from_secret(secret),
-            validation,
+            validation: Self::build_validation(
+                jsonwebtoken::Algorithm::HS256,
+                issuer,
+                audience,
+            ),
             username_claim: username_claim.to_string(),
             entitlements_claim: entitlements_claim.to_string(),
         }
+    }
+
+    /// Build an RS256 validator from a PEM-encoded RSA public key.
+    /// Tokens are verified against the asymmetric public key — the
+    /// matching private key lives with the issuer (e.g. an identity
+    /// provider), so the server never holds signing material.
+    /// `issuer` and `audience` behave as in [`new_hs256`].
+    pub fn new_rs256(
+        public_key_pem: &[u8],
+        issuer: Option<&str>,
+        audience: Option<&str>,
+        username_claim: &str,
+        entitlements_claim: &str,
+    ) -> Result<Self, jsonwebtoken::errors::Error> {
+        Ok(Self {
+            decoding_key: jsonwebtoken::DecodingKey::from_rsa_pem(public_key_pem)?,
+            validation: Self::build_validation(
+                jsonwebtoken::Algorithm::RS256,
+                issuer,
+                audience,
+            ),
+            username_claim: username_claim.to_string(),
+            entitlements_claim: entitlements_claim.to_string(),
+        })
     }
 
     /// Verify a JWT and extract a `User`. The username is read from
@@ -543,6 +581,114 @@ mod tests {
             "exp": (chrono_unix_now() + 3600) as i64,
         }));
         assert!(validator.verify(&token).is_none());
+    }
+
+    // Throwaway 2048-bit RSA keypair generated solely for these tests
+    // (never used to sign anything real).
+    const TEST_RSA_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3n6HOSbrrYORQ
+6YXOqRf60PLQ6jM8ypDxDvgUXe/QwIbjOxs+t8/wmwXUutUjcQPCy6yQQOkHSsw4
+qiGFS3TJrUhaf3hGCN2psyNYIHA5R/JO5u9lXVfMASTWvsEtIprODGyPwWJ1xy8i
+4OdTyo4u2RX6HujZoRnP+h1a6nIB7EyXLc8814M7Ei7iDP2wLgBhLt7DCpATTieI
+idSs5tIw1taYvX6h2U+6JNlwDOkeFMkqVJwWMD2GpJv03vEhQkYybWz1/BRY28Cj
+DeGCiqMdcWyEn1rbI/QHCnVH+myVePzfwuEUJ4zcbxbNLbsieMx5+GerJoVMHSON
+bQUpk8HpAgMBAAECggEAPN8E1ytW9R9+IJqBWpRwmBt7WylASgdGzDqvn6TSUqv4
+K0zVR9HMc5EYekBjVqfo3MMDFiEGfv3bPG+dxB/S++ZfRWzbVLAst0xky5qZSUvh
+9ikVNE+gwsagTTYYONuvYN36gR9VAgFBTXksBnlv7/TUFcH4Y+jFc04RPCnbGGqK
+O7DKzAASzZUQTtLJw3JCUuFoPTseJCFMmCEbQ5R/k9uVMM1M9p8zR73VM/BVkMy9
+SAHIt6aUdVlXG+kmdi2wM96OYLtyJ8LAr8h/3+gTKkzXqEaZ0//pk4BIzblosU2r
+W75E9iMoQJr0Bhwd/ZZ79injKa7vQX/Ovl0AxY2ntwKBgQDvE8ufbCszXDpRA86Q
+T9zTPXNUyoY4iWeL435PXg/VMO5huIwwRfqi2A5/BsJTdSwvKxBJHgyX3kCOadsg
+6e+eH/zAAgEbCaIyaIkK+7YZdca3hE186Xv7vPuS+KWPnbqkmfPleutPu3AH3gLY
+bwMGpvaooAVYKaCnTRorbo9TuwKBgQDEnvxfYBWXzmUrIJPKfeAeD6OhCP3oIrbh
+832UTNViRg781vjiVGWwxztM9pdmhM59FWy+juv/rwb59kOlPPunwNHHkv/P8QMH
+UHOUUSJInjXnmoakvwgoIwJ3dUD6y34eF96WZeZKw9ul0d3Qq4Y0QCJyfGh16+Yj
+ZAY+v7U8qwKBgFhtSfM9Xv0wL6Gnds+JunOnVvEVt29R4yqqih1w/Qotfv5F9BQm
+zf1NTI9PQLD9tcn8c5mXs7C4U8hY/uO9oxMpYaLjGuWVOpjKcWXOlBv2o/lcxgxd
+j64cyDAkJ5hnDpGzH7LRNBfZjCZcx1CmPshHGRRlm5RwUSuQKQ3HZtvhAoGBAI9B
+31OGaHUw9llT5RqWWCLO9kOwj38BPAqpJAhXaumtbeIepzwQjf8dSkGrMWiKvwA4
+CgFVlPG4Dvc0zNip9BmnzbEBk81oJvK/VVbtPnN2goP6/LswTLshtvxevDd+6Kb4
+cT9Xg1FaHsFUha8yKhgL2o1bw6iXdhi3Gi3B9ET9AoGAewoHOVwydKtZujX+Pwg7
+sZBvvSudl5J1VZJaG5UBV+D6VHaRvZMysDUh8ZcbadYVmewChtmoQfm/uRd8wHY4
+tP+uTizPtPDU+ACu+3wD/clI/cmi80QIeB9tuXSGZLXCMslnUU/wZOiKxyL2M/Gs
+IlVX9kUfhE6EfAHJUGsFAqg=
+-----END PRIVATE KEY-----";
+    const TEST_RSA_PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt5+hzkm662DkUOmFzqkX
++tDy0OozPMqQ8Q74FF3v0MCG4zsbPrfP8JsF1LrVI3EDwsuskEDpB0rMOKohhUt0
+ya1IWn94RgjdqbMjWCBwOUfyTubvZV1XzAEk1r7BLSKazgxsj8FidccvIuDnU8qO
+LtkV+h7o2aEZz/odWupyAexMly3PPNeDOxIu4gz9sC4AYS7ewwqQE04niInUrObS
+MNbWmL1+odlPuiTZcAzpHhTJKlScFjA9hqSb9N7xIUJGMm1s9fwUWNvAow3hgoqj
+HXFshJ9a2yP0Bwp1R/pslXj838LhFCeM3G8WzS27InjMefhnqyaFTB0jjW0FKZPB
+6QIDAQAB
+-----END PUBLIC KEY-----";
+
+    fn issue_jwt_rs256(priv_pem: &[u8], claims: serde_json::Value) -> String {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(priv_pem)
+            .expect("load test RSA private key");
+        jsonwebtoken::encode(&header, &claims, &key).expect("encode RS256 test JWT")
+    }
+
+    #[test]
+    fn jwt_rs256_valid_token_extracts_user() {
+        let validator = JwtValidator::new_rs256(
+            TEST_RSA_PUB_PEM.as_bytes(),
+            None,
+            None,
+            "sub",
+            "entitlements",
+        )
+        .expect("public key parses");
+        let token = issue_jwt_rs256(
+            TEST_RSA_PRIV_PEM.as_bytes(),
+            serde_json::json!({
+                "sub": "dave",
+                "entitlements": ["subscribe:/feeds-*"],
+                "exp": (chrono_unix_now() + 3600) as i64,
+            }),
+        );
+        let u = validator.verify(&token).expect("valid RS256 token should pass");
+        assert_eq!(u.username, "dave");
+        assert!(u.can(Op::Subscribe, "/feeds-eu"));
+        assert!(!u.can(Op::Publish, "/feeds-eu"));
+    }
+
+    #[test]
+    fn jwt_rs256_rejects_hs256_token_with_pubkey_as_secret() {
+        // "alg confusion" downgrade: an attacker signs an HS256 token
+        // using the public key bytes as the HMAC secret, hoping the
+        // server validates it with the same public key. Pinning the
+        // validator to RS256 must reject it.
+        let validator = JwtValidator::new_rs256(
+            TEST_RSA_PUB_PEM.as_bytes(),
+            None,
+            None,
+            "sub",
+            "entitlements",
+        )
+        .expect("public key parses");
+        let forged = issue_jwt(
+            TEST_RSA_PUB_PEM.as_bytes(),
+            serde_json::json!({
+                "sub": "attacker",
+                "entitlements": ["*:*"],
+                "exp": (chrono_unix_now() + 3600) as i64,
+            }),
+        );
+        assert!(validator.verify(&forged).is_none());
+    }
+
+    #[test]
+    fn jwt_rs256_malformed_public_key_errors() {
+        let err = JwtValidator::new_rs256(
+            b"not a pem key",
+            None,
+            None,
+            "sub",
+            "entitlements",
+        );
+        assert!(err.is_err());
     }
 
     #[test]

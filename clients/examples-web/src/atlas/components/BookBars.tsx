@@ -108,8 +108,8 @@ export function BookBars({
                       height: '100%',
                       width: `${pct * 100}%`,
                       background: positive
-                        ? 'rgba(244, 165, 43, .65)'
-                        : 'rgba(255, 96, 98, .65)',
+                        ? 'var(--atlas-pos-bar)'
+                        : 'var(--atlas-neg-bar)',
                       transition: 'width 600ms ease',
                     }}
                   />

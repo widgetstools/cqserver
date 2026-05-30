@@ -1,15 +1,12 @@
 /**
- * AppShell — the topmost band: cq · atlas wordmark on the left,
- * connection summary on the right. Sits above the stations rail.
+ * AppShell — wordmark, connection summary, theme toggle (top right).
  */
 import type { ReactNode } from 'react';
+import { ThemeToggle } from '../theme/ThemeContext';
 
 interface AppShellProps {
-  /** e.g. 'ws://127.0.0.1:9008'. Falls back to a sensible default. */
   connection?: string;
-  /** Optional right-side hint, e.g. '40,000 / 340,130'. */
   hint?: string;
-  /** The rest of the page (stations + chapter content). */
   children: ReactNode;
 }
 
@@ -35,9 +32,12 @@ export function AppShell({ connection = 'ws://127.0.0.1:9008', hint, children }:
         <div>
           <span style={{ color: 'var(--atlas-amber)', fontWeight: 700 }}>cq</span> · atlas
         </div>
-        <div style={{ color: 'var(--atlas-fg-dim)', fontSize: 10 }}>
-          cqserver · {connection}
-          {hint ? ` · ${hint}` : null}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <div style={{ color: 'var(--atlas-fg-dim)', fontSize: 10 }}>
+            cqserver · {connection}
+            {hint ? ` · ${hint}` : null}
+          </div>
+          <ThemeToggle />
         </div>
       </header>
       {children}

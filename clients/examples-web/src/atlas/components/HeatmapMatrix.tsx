@@ -6,6 +6,14 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SubscriptionHandle, Row } from '@/lib/use-subscription';
+import { cellValuesEqual } from '../aggridLive';
+import { useAtlasTheme } from '../theme/ThemeContext';
+
+/** Heat cell RGB — light mode uses a more saturated ramp than dark. */
+const HEAT_RGB = {
+  dark: { pos: '255, 87, 34', neg: '255, 96, 98' },
+  light: { pos: '234, 88, 12', neg: '255, 59, 72' },
+} as const;
 
 interface HeatmapMatrixProps {
   title?: string;
@@ -20,6 +28,9 @@ interface HeatmapMatrixProps {
   /** Optional field for the secondary label inside each cell. */
   countKey?: string;
 }
+
+/** Cell pulse duration (ms) — kept in sync with AG Grid flash timing. */
+const HEAT_FLASH_MS = 300;
 
 interface Cell {
   row: string;
@@ -37,6 +48,8 @@ export function HeatmapMatrix({
   valueKey,
   countKey,
 }: HeatmapMatrixProps) {
+  const { theme } = useAtlasTheme();
+  const heatRgb = HEAT_RGB[theme];
   // Live snapshot — pulled from the worker-backed Sub via the same
   // pattern DataTable uses (seed once from getSnapshot, then merge
   // deltas in place).
@@ -53,6 +66,7 @@ export function HeatmapMatrix({
       flashRef.current.clear();
     }
     const ingest = (rows: Row[], mark: boolean) => {
+      let flashed = false;
       setCells((prev) => {
         const next = new Map(prev);
         for (const r of rows) {
@@ -62,12 +76,20 @@ export function HeatmapMatrix({
           const key = `${row}|${col}`;
           const value = Number(r[valueKey] ?? 0);
           const count = countKey ? Number(r[countKey] ?? 0) : 0;
+          const existing = prev.get(key);
+          const changed =
+            !existing ||
+            !cellValuesEqual(existing.value, value) ||
+            !cellValuesEqual(existing.count, count);
           next.set(key, { row, col, value, count });
-          if (mark) flashRef.current.set(key, Date.now());
+          if (mark && changed) {
+            flashRef.current.set(key, Date.now());
+            flashed = true;
+          }
         }
         return next;
       });
-      if (mark) setFlashTick((t) => t + 1);
+      if (flashed) setFlashTick((t) => t + 1);
     };
 
     // Initial seed.
@@ -220,7 +242,7 @@ export function HeatmapMatrix({
                       <td
                         key={c}
                         style={{
-                          background: 'rgba(255,255,255,.02)',
+                          background: 'var(--atlas-cell-empty)',
                           padding: '8px',
                           minWidth: 80,
                           height: 38,
@@ -229,14 +251,16 @@ export function HeatmapMatrix({
                     );
                   }
                   const intensity = Math.min(1, Math.abs(cell.value) / max);
+                  const baseMin = theme === 'light' ? 0.16 : 0.12;
+                  const baseSpan = theme === 'light' ? 0.62 : 0.55;
                   const baseColor = cell.value >= 0
-                    ? `rgba(244, 165, 43, ${(0.12 + intensity * 0.55).toFixed(3)})`
-                    : `rgba(255, 96, 98, ${(0.12 + intensity * 0.55).toFixed(3)})`;
+                    ? `rgba(${heatRgb.pos}, ${(baseMin + intensity * baseSpan).toFixed(3)})`
+                    : `rgba(${heatRgb.neg}, ${(baseMin + intensity * baseSpan).toFixed(3)})`;
                   const flashedAt = flashRef.current.get(`${r}|${c}`) ?? 0;
                   const sinceFlash = now - flashedAt;
-                  const flashing = sinceFlash < 600;
+                  const flashing = sinceFlash < HEAT_FLASH_MS;
                   const flashColor = flashing
-                    ? `rgba(244, 165, 43, ${(0.85 - sinceFlash / 600 * 0.85).toFixed(3)})`
+                    ? `rgba(${heatRgb.pos}, ${(0.88 - sinceFlash / HEAT_FLASH_MS * 0.88).toFixed(3)})`
                     : baseColor;
                   return (
                     <td
@@ -249,8 +273,8 @@ export function HeatmapMatrix({
                         height: 38,
                         textAlign: 'right',
                         fontFeatureSettings: '"tnum"',
-                        transition: flashing ? undefined : 'background 600ms ease',
-                        color: intensity > 0.4 ? 'var(--atlas-ink)' : 'var(--atlas-fg)',
+                        transition: flashing ? undefined : `background ${HEAT_FLASH_MS}ms ease`,
+                        color: intensity > 0.4 ? 'var(--atlas-on-heat)' : 'var(--atlas-fg)',
                       }}
                     >
                       {fmtCellValue(cell.value)}

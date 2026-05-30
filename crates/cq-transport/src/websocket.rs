@@ -36,6 +36,14 @@ pub struct WsConfig {
     /// Query Guardrails (G1+) structural limits. Defaults to
     /// `cq_core::query::QueryLimits::default()`.
     pub query_limits: cq_core::query::QueryLimits,
+    /// Maximum inbound WebSocket message/frame size in bytes. Caps both
+    /// `max_message_size` and `max_frame_size` so a single client cannot
+    /// force unbounded buffering during the handshake/read path. Defaults
+    /// to 16 MiB to match the TCP codec's `cq_protocol::codec::MAX_FRAME_SIZE`.
+    pub max_message_bytes: usize,
+    /// S11 synchronous-replication policy for `AckType::Replicated`
+    /// publishes. See [`crate::router::SyncReplication`].
+    pub sync_replication: crate::router::SyncReplication,
 }
 
 impl Default for WsConfig {
@@ -49,6 +57,8 @@ impl Default for WsConfig {
             spillover: None,
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
+            max_message_bytes: cq_protocol::codec::MAX_FRAME_SIZE,
+            sync_replication: crate::router::SyncReplication::default(),
         }
     }
 }
@@ -81,11 +91,19 @@ pub async fn start_ws_server(
             spillover: config.spillover.clone(),
             read_only: config.read_only,
             query_limits: config.query_limits,
+            sync_replication: config.sync_replication,
         };
         let queue_capacity = config.outbound_queue_capacity;
+        let max_message_bytes = config.max_message_bytes;
 
         tokio::spawn(async move {
-            let ws = match tokio_tungstenite::accept_async(stream).await {
+            let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                max_message_size: Some(max_message_bytes),
+                max_frame_size: Some(max_message_bytes),
+                ..Default::default()
+            };
+            let ws = match tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await
+            {
                 Ok(ws) => ws,
                 Err(e) => {
                     warn!(addr = %addr, error = %e, "WebSocket handshake failed");
@@ -258,7 +276,7 @@ mod tests {
         registry.insert(sub_id.clone(), route);
 
         let make_delta = || Delta {
-            subscription_id: sub_id.clone(),
+            subscription_id: sub_id.as_str().into(),
             delta_type: DeltaType::Add,
             row: 0,
             sequence: 0,
@@ -290,7 +308,7 @@ mod tests {
 
         for i in 0..5 {
             let delta = Delta {
-                subscription_id: sub_id.clone(),
+                subscription_id: sub_id.as_str().into(),
                 delta_type: if i == 0 {
                     DeltaType::Add
                 } else {
@@ -351,7 +369,7 @@ mod tests {
         let pre_encoded = std::sync::Arc::new(b"{\"sentinel\":\"used\"}".to_vec());
 
         let delta = Delta {
-            subscription_id: sub_id.clone(),
+            subscription_id: sub_id.as_str().into(),
             delta_type: DeltaType::Add,
             row: 0,
             sequence: 1,
@@ -410,5 +428,55 @@ mod tests {
         let msg: CqMessage = serde_json::from_slice(received.as_bytes()).unwrap();
         assert_eq!(msg.delta_type.as_deref(), Some("add"));
         drop(topic);
+    }
+
+    #[test]
+    fn ws_default_caps_message_at_tcp_frame_size() {
+        assert_eq!(
+            WsConfig::default().max_message_bytes,
+            cq_protocol::codec::MAX_FRAME_SIZE
+        );
+    }
+
+    // A client message larger than the negotiated cap must be rejected by
+    // the server read path rather than buffered. This drives both WS roles
+    // over an in-memory duplex so it needs no sockets or full server setup.
+    #[tokio::test]
+    async fn oversized_inbound_message_is_rejected() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+        const CAP: usize = 1024;
+        let (server_io, client_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let cfg = WebSocketConfig {
+                max_message_size: Some(CAP),
+                max_frame_size: Some(CAP),
+                ..Default::default()
+            };
+            let mut ws = tokio_tungstenite::accept_async_with_config(server_io, Some(cfg))
+                .await
+                .expect("server handshake");
+            // First read should surface the oversized frame as an error.
+            ws.next().await
+        });
+
+        let (mut client, _resp) =
+            tokio_tungstenite::client_async("ws://localhost/cq/json", client_io)
+                .await
+                .expect("client handshake");
+
+        client
+            .send(Message::Binary(vec![0u8; CAP * 4].into()))
+            .await
+            .expect("client send");
+        let _ = client.flush().await;
+
+        let server_result = server.await.expect("server task join");
+        match server_result {
+            Some(Err(_)) => {} // capacity exceeded → protocol error, as required
+            other => panic!("expected oversized read to error, got {other:?}"),
+        }
     }
 }

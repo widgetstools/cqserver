@@ -117,12 +117,16 @@ export function useLiveQuery(spec: LiveQuerySpec | null): LiveQueryHandle | null
     NULL_ERROR,
   );
 
-  return useMemo<LiveQueryHandle | null>(() => {
+  // Stable handle identity (same pattern as useSubscription) — a fresh
+  // object every rows/status tick makes useLiveGridSync think the sub
+  // changed and wipe the Query tab grid.
+  const handle = useMemo<LiveQueryHandle | null>(() => {
     if (!wrap) return null;
     return {
-      rows,
-      status,
-      size: rows.length,
+      rows: [] as Row[],
+      status: 'connecting' as ConnectionStatus,
+      size: 0,
+      error: null,
       subscribeStatus: wrap.sub.subscribeStatus,
       subscribeSnapshotChunks: wrap.sub.subscribeSnapshotChunks,
       subscribeDeltas: wrap.sub.subscribeDeltas,
@@ -130,7 +134,13 @@ export function useLiveQuery(spec: LiveQuerySpec | null): LiveQueryHandle | null
       getSnapshot: wrap.sub.getSnapshot,
       getStatus: wrap.sub.getStatus,
       getSize: wrap.sub.getSize,
-      error,
     };
-  }, [wrap, rows, status, error]);
+  }, [wrap]);
+
+  if (!handle) return null;
+  handle.rows = rows;
+  handle.status = status;
+  handle.size = rows.length;
+  handle.error = error;
+  return handle;
 }

@@ -7,7 +7,7 @@ export const SLIP_CHIPS: readonly ChipSpec[] = [
 ];
 
 export const SLIP_COL_DEFS: ColDef[] = [
-  { field: 'execution_venue', headerName: 'venue', width: 160, cellStyle: { color: '#f4a52b' } },
+  { field: 'execution_venue', headerName: 'venue', width: 160, cellStyle: { color: 'var(--atlas-amber)' } },
   { field: 'execution_algo', headerName: 'algo', width: 140 },
   { field: 'n_trades', headerName: 'n_trades', width: 120, type: 'numericColumn',
     valueFormatter: (p) => (p.value as number)?.toLocaleString('en-US') ?? '—' },
@@ -15,7 +15,7 @@ export const SLIP_COL_DEFS: ColDef[] = [
     valueFormatter: (p) => fmtBps(p.value as number),
     cellStyle: (p) =>
       typeof p.value === 'number' && p.value > 0 ? { color: '#ff6062' } :
-      typeof p.value === 'number' ? { color: '#f4a52b' } : null },
+      typeof p.value === 'number' ? { color: 'var(--atlas-amber)' } : null },
   { field: 'avg_slip_vwap', headerName: 'avg_slip_vwap', width: 150, type: 'numericColumn',
     valueFormatter: (p) => fmtBps(p.value as number) },
   { field: 'max_slip_arr', headerName: 'max_slip_arr', width: 140, type: 'numericColumn',

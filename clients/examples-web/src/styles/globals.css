@@ -1,21 +1,17 @@
 /*
  * cqserver examples-web — global reset.
- *
- * Atlas paints every surface itself via .atlas-root + tokens.css; this
- * file just clears the browser defaults and gives the body the same
- * ink colour as the chapter app so there's no white flash before
- * React hydrates. The Stockflux design system + tabstrip CSS + dock
- * manager imports the legacy 8-tab dock relied on were retired in
- * Phase 5 with the rest of the legacy shell.
+ * Page colours follow html[data-theme] via atlas/tokens.css variables.
  */
 *, *::before, *::after { box-sizing: border-box; }
+
 html, body, #root {
   margin: 0;
   padding: 0;
   height: 100%;
-  background: #0e0e10;
-  color: #e6e6e6;
+  background: var(--atlas-page-bg, #0e0e10);
+  color: var(--atlas-page-fg, #e6e6e6);
   font-family: ui-monospace, 'SF Mono', monospace;
   -webkit-font-smoothing: antialiased;
 }
+
 button { font: inherit; }

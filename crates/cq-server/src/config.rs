@@ -7,8 +7,23 @@ pub struct ServerConfig {
     pub tcp_addr: String,
     pub websocket_addr: String,
     pub websocket_path: String,
+    /// Maximum inbound WebSocket message/frame size in bytes. Caps both
+    /// tungstenite's `max_message_size` and `max_frame_size` so a single
+    /// client cannot force unbounded buffering on the read path. `None`
+    /// (the default) uses the transport default of 16 MiB, which matches
+    /// the TCP codec's frame cap.
+    #[serde(default)]
+    pub ws_max_message_bytes: Option<usize>,
     #[serde(default = "default_admin_addr")]
     pub admin_addr: String,
+    /// Optional bearer token guarding the admin API. When set, every
+    /// admin endpoint except the unauthenticated `GET /healthz` liveness
+    /// probe requires an `Authorization: Bearer <token>` header that
+    /// matches. `None` (the default) leaves the API open — acceptable
+    /// only because the port now binds to loopback by default. Set this
+    /// before exposing the admin port beyond localhost.
+    #[serde(default)]
+    pub admin_token: Option<String>,
     #[serde(default = "default_heartbeat_interval_s")]
     pub heartbeat_interval_s: u64,
     #[serde(default = "default_heartbeat_idle_timeout_s")]
@@ -60,6 +75,35 @@ pub struct ServerConfig {
     /// registration time. See `cq_core::query::QueryLimits`.
     #[serde(default)]
     pub query_limits: QueryLimitsConfig,
+    /// Number of parallel evaluator lanes per topic (S?? multi-threaded
+    /// evaluator sharding). Each lane owns a disjoint subset of a topic's
+    /// subscriptions and runs on its own thread, so delta evaluation
+    /// (predicate matching + delta build) fans across cores while
+    /// per-subscription ordering is preserved. `None` (the default)
+    /// means **1 lane** — sharding is opt-in. It only helps topics whose
+    /// bottleneck is per-event matching across many subscriptions; it
+    /// *costs* delivery efficiency, because each lane owns its own
+    /// encode-once-fanout body cache, so a row delivered to subscribers
+    /// spread across L active lanes is serialized L times instead of
+    /// once. Set this (globally or per-topic) only for genuinely
+    /// matching-bound hot topics. A per-topic `evaluator_lanes` override
+    /// takes precedence. Distinct from the `shards` table above, which
+    /// routes topics across *instances*.
+    #[serde(default)]
+    pub evaluator_lanes: Option<usize>,
+}
+
+impl ServerConfig {
+    /// Resolve the global default evaluator lane count: the explicit
+    /// `evaluator_lanes` if set (clamped `>= 1`), else `1`. Sharding is
+    /// opt-in: the single-lane path preserves global encode-once-fanout
+    /// (one body serialize per delta event, reused across all subscribers
+    /// on the topic) at zero thread overhead. Multi-lane sharding trades
+    /// that for parallel matching and is only worth it on matching-bound
+    /// hot topics, so operators enable it deliberately.
+    pub fn resolved_default_eval_lanes(&self) -> usize {
+        self.evaluator_lanes.unwrap_or(1).max(1)
+    }
 }
 
 /// TOML representation of `cq_core::query::QueryLimits`. Defined here
@@ -336,6 +380,34 @@ pub struct ReplicationConfig {
     /// JSON fields from outbound entries.
     #[serde(default)]
     pub transform: Option<cq_replication::filter::TransformSpec>,
+    /// Shared secret authenticating the replication channel. When set,
+    /// a `primary` presents it on connect and a `standby` requires a
+    /// matching token before accepting any entries. Both ends must agree.
+    /// `None` (default) leaves the channel unauthenticated — only safe
+    /// when the replication port is confined to a trusted network.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// S11 — upper bound (ms) a publish requesting `ack_type =
+    /// "replicated"` waits for a standby to confirm the write before the
+    /// publish is failed back to the client. Only meaningful when `role
+    /// = primary` with at least one peer; on a standalone node a
+    /// `replicated` ack is rejected outright. Defaults to 5000 ms.
+    #[serde(default = "default_repl_sync_ack_timeout_ms")]
+    pub sync_ack_timeout_ms: u64,
+    /// S20 — stable AMPS-style instance identity for this node. Stamped as
+    /// the `origin` on every local txlog write and reported to peers in the
+    /// replication handshake, so re-delivery of the same `(origin, sequence)`
+    /// over any path is deduplicated idempotently (the anti-split-brain
+    /// convergence guarantee). Must be unique per node and stable across
+    /// restarts. `None` (default) disables origin tagging — only safe for a
+    /// standalone node; an HA deployment that leaves this unset gets a
+    /// startup warning and no convergence protection.
+    #[serde(default)]
+    pub instance_name: Option<String>,
+}
+
+fn default_repl_sync_ack_timeout_ms() -> u64 {
+    5000
 }
 
 impl ReplicationConfig {
@@ -357,6 +429,13 @@ impl ReplicationConfig {
         }
         out
     }
+
+    /// Resolve this node's instance id for origin tagging. Returns the
+    /// configured `instance_name`, or an empty string when unset (which
+    /// disables origin tagging / convergence dedup).
+    pub fn resolve_instance_name(&self) -> String {
+        self.instance_name.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -366,6 +445,16 @@ pub enum ReplicationRole {
     Standalone,
     Primary,
     Standby,
+    /// S21 — full-mesh active-active. Every node both ships its local
+    /// writes to all `peers` AND listens on `listen` for inbound entries
+    /// from those same peers. All nodes are writable; convergence is the
+    /// existing per-`(origin, sequence)` dedup (replicated entries are
+    /// applied via `replay_*_origin`, which never re-enters the local
+    /// txlog, so each node ships only its own local writes — no echo
+    /// loops, no transitive forwarding). Failover is implicit: any node
+    /// can serve writes, and a recovering node re-syncs each origin
+    /// stream past its high-water on reconnect.
+    ActiveActive,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +473,11 @@ pub struct QueueEntry {
     /// Must reference another queue declared in the same config.
     #[serde(default)]
     pub dlq: Option<String>,
+    /// Cap on undelivered (buffered) messages. When exceeded, the oldest
+    /// buffered message is evicted (ring-buffer) so a producerless queue
+    /// can't exhaust memory. `None` uses the engine default (1M).
+    #[serde(default)]
+    pub max_buffer: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -402,14 +496,44 @@ pub struct AuthConfig {
     pub jwt: Option<JwtConfig>,
 }
 
+/// JWT signing algorithm the validator should enforce. Tokens signed
+/// with any other algorithm are rejected (the `alg` header is pinned),
+/// which closes the classic "alg confusion" downgrade attack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum JwtAlgorithm {
+    /// Symmetric HMAC-SHA256 — validated with a shared `secret`.
+    #[serde(rename = "HS256")]
+    Hs256,
+    /// Asymmetric RSA-SHA256 — validated with a PEM RSA public key.
+    /// The matching private key stays with the token issuer.
+    #[serde(rename = "RS256")]
+    Rs256,
+}
+
+fn default_jwt_algorithm() -> JwtAlgorithm {
+    JwtAlgorithm::Hs256
+}
+
 /// S16 JWT validator config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JwtConfig {
-    /// Shared secret used to validate HS256 tokens. Future revisions
-    /// may add asymmetric-key support (RS256 etc.); for now we only
-    /// support HS256 because it keeps the deployment story to a
-    /// single secret value.
-    pub secret: String,
+    /// Signing algorithm to enforce. Defaults to `HS256` for backward
+    /// compatibility; set to `RS256` to validate asymmetric tokens via
+    /// `public_key` / `public_key_path`.
+    #[serde(default = "default_jwt_algorithm")]
+    pub algorithm: JwtAlgorithm,
+    /// Shared secret used to validate HS256 tokens. Required when
+    /// `algorithm = "HS256"`; ignored for RS256.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// PEM-encoded RSA public key (inline) used to validate RS256
+    /// tokens. Mutually exclusive with `public_key_path`.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    /// Path to a PEM-encoded RSA public key file used to validate
+    /// RS256 tokens. Read once at startup.
+    #[serde(default)]
+    pub public_key_path: Option<String>,
     /// Optional issuer claim ("iss") the token must carry. When set,
     /// tokens with a missing or non-matching `iss` are rejected.
     #[serde(default)]
@@ -489,7 +613,12 @@ impl QueryBudgetConfig {
 }
 
 fn default_admin_addr() -> String {
-    "0.0.0.0:8085".into()
+    // Loopback by default: the admin port exposes mutating endpoints
+    // (unsubscribe, journal rotation, store shrink, view create/delete,
+    // schema mutation) and unauthenticated config disclosure. Binding it
+    // to all interfaces out of the box would expose those to the network.
+    // Operators who front it with auth / a reverse proxy can override.
+    "127.0.0.1:8085".into()
 }
 
 fn default_heartbeat_interval_s() -> u64 {
@@ -521,6 +650,38 @@ pub struct TxLogConfig {
     /// payloads). The reader transparently decompresses on replay.
     #[serde(default)]
     pub archive_compress: bool,
+    /// Interval (milliseconds) between fsyncs when `fsync = "interval"`.
+    /// Ignored for the other modes. Bounds data-loss-on-power-failure to
+    /// roughly this much wall-clock time of writes. Defaults to 200 ms.
+    #[serde(default = "default_fsync_interval_ms")]
+    pub fsync_interval_ms: u64,
+    /// When `true`, each segment's disk blocks are reserved up front
+    /// (`fallocate`/`F_PREALLOCATE`) so steady-state appends avoid
+    /// per-write extent allocation. Best-effort: unsupported filesystems
+    /// fall back to on-demand allocation. Off by default — enable for
+    /// hot persistent topics on filesystems that benefit (ext4/xfs/APFS).
+    #[serde(default)]
+    pub preallocate: bool,
+    /// When `true` (default), each persistent topic writes a SOW snapshot
+    /// (a point-in-time checkpoint of its live store + sequence watermark)
+    /// on graceful shutdown. On the next start the server loads the
+    /// snapshot and replays only the txlog tail instead of the whole log —
+    /// turning a multi-minute restart on a large log into a near-instant
+    /// one. Cheap and safe (adds one file); disable only if you have a
+    /// specific reason to.
+    #[serde(default = "default_true")]
+    pub snapshot_on_shutdown: bool,
+    /// When `true`, after a *durable* shutdown snapshot is written, the
+    /// fully-covered sealed segments (every segment older than the active
+    /// one) are deleted to reclaim disk. Off by default because it is
+    /// irreversible and unsafe for a replication **source** whose standbys
+    /// may still need those segments to catch up — enable it on standalone
+    /// nodes (or where standbys are known to be caught up) that want the
+    /// log's disk footprint bounded to roughly one segment after a clean
+    /// shutdown. Fast restart does **not** require this: the snapshot +
+    /// tail-scan already make startup O(one segment) regardless.
+    #[serde(default)]
+    pub snapshot_reclaim: bool,
 }
 
 impl Default for TxLogConfig {
@@ -531,8 +692,20 @@ impl Default for TxLogConfig {
             archive_directory: None,
             segment_size: None,
             archive_compress: false,
+            fsync_interval_ms: default_fsync_interval_ms(),
+            preallocate: false,
+            snapshot_on_shutdown: true,
+            snapshot_reclaim: false,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fsync_interval_ms() -> u64 {
+    200
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -541,6 +714,8 @@ pub enum TxLogFsyncConfig {
     #[default]
     None,
     EveryWrite,
+    /// Group commit — fsync at most once per `fsync_interval_ms`.
+    Interval,
 }
 
 fn default_txlog_dir() -> String {
@@ -578,6 +753,13 @@ pub struct TopicEntry {
     /// this. `None` (default) disables TTL.
     #[serde(default)]
     pub expire_seconds: Option<u64>,
+    /// Per-topic override for the number of parallel evaluator lanes
+    /// (see `ServerConfig::evaluator_lanes`). `None` (default) inherits
+    /// the server-wide resolved default. Set this on hot topics with many
+    /// subscriptions that need the extra fanout, leaving low-traffic
+    /// topics on the global default.
+    #[serde(default)]
+    pub evaluator_lanes: Option<usize>,
 }
 
 /// Column declaration in a TOML topic spec. `name` may be a dotted
@@ -665,7 +847,9 @@ impl Default for ServerConfig {
             tcp_addr: "0.0.0.0:9007".into(),
             websocket_addr: "0.0.0.0:9008".into(),
             websocket_path: "/cq/json".into(),
+            ws_max_message_bytes: None,
             admin_addr: default_admin_addr(),
+            admin_token: None,
             heartbeat_interval_s: default_heartbeat_interval_s(),
             heartbeat_idle_timeout_s: default_heartbeat_idle_timeout_s(),
             topics: vec![
@@ -679,6 +863,7 @@ impl Default for ServerConfig {
                     schema_file: None,
                     index_columns: Vec::new(),
                     expire_seconds: None,
+                    evaluator_lanes: None,
                 },
                 TopicEntry {
                     name: "/orders".into(),
@@ -690,6 +875,7 @@ impl Default for ServerConfig {
                     schema_file: None,
                     index_columns: Vec::new(),
                     expire_seconds: None,
+                    evaluator_lanes: None,
                 },
             ],
             views: Vec::new(),
@@ -702,6 +888,7 @@ impl Default for ServerConfig {
             logging: crate::logging::LoggingConfig::default(),
             shards: Vec::new(),
             query_limits: QueryLimitsConfig::default(),
+            evaluator_lanes: None,
         }
     }
 }

@@ -310,25 +310,38 @@ export type { Sub };
  */
 export function runOneShotSql(topic: string, sql: string): Promise<Row[]> {
   return new Promise((resolve, reject) => {
+    // Use the worker's one-shot `sow` path (wire `c:'sow'`), NOT a live
+    // subscription. The server evaluates JOINs and derived tables only on
+    // the one-shot SOW path; routing these through `sow_and_subscribe`
+    // fails with errors like "Unknown column: trade_id" because the live
+    // evaluator binds against a single topic's schema.
+    const port = getCqPort();
+    const reqId = `q${Math.random().toString(36).slice(2, 10)}`;
     const collected: Row[] = [];
-    const sub = makeSqlSub(topic, sql, () => `r${collected.length}`);
-    const offChunks = sub.subscribeSnapshotChunks((chunk, more) => {
-      for (const r of chunk) collected.push(r);
-      if (!more) {
-        offChunks();
-        offStatus();
-        sub.close();
-        resolve(collected);
+    // Single teardown path shared by success, error and timeout so the
+    // port listener and timer are never leaked, no matter which fires.
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      off();
+      fn();
+    };
+    const off = port.onMessage((m) => {
+      if (m.kind === 'snapshot' && m.subId === reqId) {
+        for (const r of m.chunk) collected.push(r);
+        if (!m.more) finish(() => resolve(collected));
+      } else if (m.kind === 'error' && m.subId === reqId) {
+        finish(() => reject(new Error(m.message)));
       }
     });
-    const offStatus = sub.subscribeStatus(() => {
-      if (sub.getStatus() === 'error') {
-        offChunks();
-        offStatus();
-        const msg = sub.getErrorMessage() ?? 'one-shot query failed';
-        sub.close();
-        reject(new Error(msg));
-      }
-    });
+    // Without a timeout a dropped connection (no reply ever arrives)
+    // would leak the listener and leave the promise pending forever.
+    const timer = setTimeout(
+      () => finish(() => reject(new Error(`one-shot query timed out (topic=${topic})`))),
+      30_000,
+    );
+    port.send({ kind: 'sow', reqId, topic, sql });
   });
 }

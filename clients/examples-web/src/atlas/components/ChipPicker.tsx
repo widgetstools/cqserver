@@ -42,7 +42,7 @@ export function ChipPicker({ open, options, selected, onSelect, onClose }: ChipP
         background: '#14141a',
         border: '1px solid var(--atlas-rule)',
         borderRadius: 6,
-        boxShadow: '0 16px 40px -10px rgba(0,0,0,.6)',
+        boxShadow: 'var(--atlas-popover-shadow)',
         padding: 4,
       }}
     >
@@ -71,7 +71,7 @@ export function ChipPicker({ open, options, selected, onSelect, onClose }: ChipP
                 cursor: 'pointer',
               }}
               onMouseEnter={(e) => {
-                if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,.04)';
+                if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'var(--atlas-hover-surface)';
               }}
               onMouseLeave={(e) => {
                 if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'transparent';

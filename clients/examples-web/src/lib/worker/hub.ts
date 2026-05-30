@@ -46,6 +46,11 @@ interface SharedSub {
    *  on the first port's open instead of racing it and leaking a
    *  duplicate upstream sub on the server. */
   openingPromise: Promise<void> | null;
+  /** Bumped on every `openShared`. The async-iterator drain loop and the
+   *  snapshot-complete callback carry the generation they were started
+   *  with and bail the moment it changes, so a stale upstream sub left
+   *  over from a reconnect can't push rows into the replaced state. */
+  generation: number;
   /** Set after `whenSnapshotComplete()`. */
   isLive: boolean;
   /** Worker-side row mirror for SOW replay on late join + Task 6 resub. */
@@ -87,12 +92,42 @@ class Hub {
   }
 
   private broadcast(msg: ServerMsg): void {
-    for (const p of this.ports.values()) p.port.postMessage(msg);
+    // Collect dead ports first; removePort mutates this.ports.
+    let dead: string[] | null = null;
+    for (const p of this.ports.values()) {
+      if (!this.tryPost(p, msg)) (dead ??= []).push(p.id);
+    }
+    if (dead) for (const id of dead) this.removePort(id);
   }
 
   private send(portId: string, msg: ServerMsg): void {
     const p = this.ports.get(portId);
-    if (p) p.port.postMessage(msg);
+    if (p && !this.tryPost(p, msg)) this.removePort(portId);
+  }
+
+  /** postMessage that survives a closed MessagePort. A SharedWorker
+   *  never gets a reliable close event when a tab goes away, so the
+   *  first failed post is how we learn a port is gone. */
+  private tryPost(p: PortState, msg: ServerMsg): boolean {
+    try {
+      p.port.postMessage(msg);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Drop a dead port and release every subscription ref it held, so
+   *  `subs`, the per-sub `refs` sets, and upstream cqserver subs don't
+   *  accumulate orphans across tab churn. */
+  private removePort(portId: string): void {
+    const state = this.ports.get(portId);
+    if (!state) return;
+    this.ports.delete(portId);
+    // Snapshot ids — handleUnsubscribe mutates state.subs as it goes.
+    for (const portSubId of Array.from(state.subs.keys())) {
+      this.handleUnsubscribe(state, portSubId);
+    }
   }
 
   private onClientMsg(state: PortState, msg: ClientMsg): void {
@@ -109,6 +144,35 @@ class Hub {
       case 'unsubscribe':
         this.handleUnsubscribe(state, msg.subId);
         return;
+      case 'sow':
+        void this.handleSow(state, msg);
+        return;
+    }
+  }
+
+  /**
+   * One-shot SQL fetch. Runs the server's one-shot SOW path (which
+   * evaluates JOINs / derived tables that the live evaluator can't) and
+   * replies with `snapshot` chunks tagged with the request's `reqId`,
+   * then a terminating `more:false`. Never registers a live sub.
+   */
+  private async handleSow(
+    state: PortState,
+    msg: Extract<ClientMsg, { kind: 'sow' }>,
+  ): Promise<void> {
+    try {
+      const client = await this.ensureClient();
+      const rows = (await client.sow(msg.topic, { sql: msg.sql })) as Row[];
+      // Reuse the chunked snapshot delivery so a large JOIN result stays
+      // within cheap postMessage payloads. `reqId` doubles as the subId
+      // the main-thread one-shot listener matches on.
+      this.sendSowChunked({ portId: state.id, portSubId: msg.reqId }, rows);
+    } catch (err) {
+      this.send(state.id, {
+        kind: 'error',
+        subId: msg.reqId,
+        message: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -141,6 +205,7 @@ class Hub {
         refs: new Set(),
         sub: null,
         openingPromise: null,
+        generation: 0,
         isLive: false,
         rows: new Map(),
         pendingAdd: [],
@@ -186,14 +251,24 @@ class Hub {
   }
 
   private async openShared(shared: SharedSub, client: Client): Promise<void> {
+    // Claim this open. Any iterator/callback from a prior open carries an
+    // older generation and self-cancels below.
+    const gen = ++shared.generation;
     const sub = await client.sowAndSubscribe(shared.topic, {
       filter: shared.filter,
       sql: shared.sql,
     });
+    // A newer open (or a teardown) raced us during the await — drop this
+    // sub so we don't overwrite the live state with a now-stale handle.
+    if (shared.generation !== gen) {
+      void client.unsubscribe(sub.subId).catch(() => {});
+      return;
+    }
     shared.sub = sub;
     const sowBuffer: Row[] = [];
     let sowDone = false;
     void sub.whenSnapshotComplete().then(() => {
+      if (shared.generation !== gen) return;
       sowDone = true;
       this.flushSowChunks(shared, sowBuffer);
       sowBuffer.length = 0;
@@ -205,6 +280,9 @@ class Hub {
     void (async () => {
       try {
         for await (const d of sub) {
+          // Stale generation → a reconnect/teardown replaced this sub.
+          // Stop touching `shared` and let the loop unwind.
+          if (shared.generation !== gen) break;
           const row = d.data as Row;
           const key = this.rowKey(row);
           if (d.deltaType === 'remove' || d.deltaType === 'oof') {
@@ -219,6 +297,7 @@ class Hub {
           }
         }
       } catch (err) {
+        if (shared.generation !== gen) return;
         for (const ref of shared.refs) {
           this.send(ref.portId, {
             kind: 'error',
@@ -340,21 +419,29 @@ class Hub {
         this.reconnectAttempts = 0;
         c.onClose(() => this.handleClose());
         this.broadcast({ kind: 'connected' });
-        // Re-open every shared sub that still has refs.
+        // Re-open every shared sub that still has refs. Guard with
+        // `openingPromise` exactly like `handleSubscribe` so a port that
+        // subscribes to the same key during reconnect awaits this open
+        // instead of racing it into a duplicate upstream sub.
         for (const shared of this.subs.values()) {
           if (shared.refs.size === 0) continue;
           for (const ref of shared.refs) {
             this.send(ref.portId, { kind: 'status', subId: ref.portSubId, status: 'snapshotting' });
           }
-          void this.openShared(shared, c).catch((err) => {
-            for (const ref of shared.refs) {
-              this.send(ref.portId, {
-                kind: 'error',
-                subId: ref.portSubId,
-                message: err instanceof Error ? err.message : String(err),
-              });
-            }
-          });
+          if (shared.openingPromise != null) continue;
+          shared.openingPromise = this.openShared(shared, c)
+            .catch((err) => {
+              for (const ref of shared.refs) {
+                this.send(ref.portId, {
+                  kind: 'error',
+                  subId: ref.portSubId,
+                  message: err instanceof Error ? err.message : String(err),
+                });
+              }
+            })
+            .finally(() => {
+              shared.openingPromise = null;
+            });
         }
         return c;
       })

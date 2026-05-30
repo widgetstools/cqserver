@@ -644,6 +644,26 @@ impl ColumnStore {
         }
     }
 
+    /// Move a `Value` into a column without cloning its heap payload.
+    /// For `String`/`Bytes` this hands the column store ownership of the
+    /// `CompactString`/`Vec<u8>` directly — avoiding the clone `set` does
+    /// when the caller no longer needs the `Value`. Every other case
+    /// (primitives, nulls, type coercions) forwards to `set` by reference.
+    pub fn set_owned(&mut self, col: usize, row: u32, value: Value) {
+        let kind = self.mappings[col].kind;
+        match (kind, value) {
+            (ColumnType::String, Value::String(v)) => {
+                let ai = self.mappings[col].array_index;
+                self.string_cols[ai][row as usize] = v;
+            }
+            (ColumnType::Bytes, Value::Bytes(v)) => {
+                let ai = self.mappings[col].array_index;
+                self.bytes_cols[ai][row as usize] = v;
+            }
+            (_, other) => self.set(col, row, &other),
+        }
+    }
+
     // ========================= Row operations =========================
 
     /// Append a new row. Returns the assigned row index.
@@ -685,6 +705,42 @@ impl ColumnStore {
         self.global_version.fetch_add(1, Ordering::AcqRel);
 
         // Make the row visible to readers (must be last)
+        self.row_count.store(row + 1, Ordering::Release);
+
+        row
+    }
+
+    /// Owned-value variant of [`append_row`]: consumes `values` and moves
+    /// each into its column (see [`set_owned`]). Avoids the per-field clone
+    /// `append_row` incurs when the caller built a throwaway `Vec<Value>` —
+    /// the wide-row publish path. Identical seqlock/visibility protocol.
+    pub fn append_row_owned(&mut self, values: Vec<Value>) -> u32 {
+        let row = self.row_count.load(Ordering::Relaxed);
+
+        if row as usize >= self.capacity {
+            self.grow();
+        }
+
+        let r = row as usize;
+        debug_assert_eq!(
+            self.row_versions[r].load(Ordering::Relaxed),
+            0,
+            "append_row_owned slot {row} not in expected even=0 state — was the slot reused?"
+        );
+        self.row_versions[r].store(1, Ordering::Release);
+        fence(Ordering::Release);
+
+        let ncols = self.mappings.len();
+        for (col_idx, value) in values.into_iter().enumerate() {
+            if col_idx < ncols {
+                self.set_owned(col_idx, row, value);
+            }
+        }
+
+        fence(Ordering::Release);
+        self.row_versions[r].store(2, Ordering::Release);
+        self.global_version.fetch_add(1, Ordering::AcqRel);
+
         self.row_count.store(row + 1, Ordering::Release);
 
         row

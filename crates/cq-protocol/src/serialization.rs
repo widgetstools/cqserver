@@ -3,19 +3,27 @@
 //!
 //! The codec is chosen per-connection at the transport layer:
 //! - WebSocket: text frames imply JSON; binary frames imply MessagePack.
-//! - TCP: JSON-only in the current build (binary TCP needs a magic-byte
-//!   handshake that's a future addition).
+//! - TCP: JSON by default; a client may advertise a `codecs` preference
+//!   list on `Logon` (S30) and the server echoes the negotiated codec on
+//!   the ack. Both sides then switch to it for every post-ack frame —
+//!   the Logon itself is always JSON, so the handshake is race-free.
+//!   See [`negotiate_codec`] / [`SUPPORTED_CODECS`].
 //!
 //! Both codecs go through `serde::{Serialize, Deserialize}` on
 //! `CqMessage`, so the field renames (`c`, `cid`, `sid`, etc.) are
 //! preserved across both wire shapes.
 
 use crate::message::CqMessage;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Hash,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Codec {
     #[default]
     Json,
+    #[serde(rename = "msgpack")]
     MessagePack,
     Bson,
     /// S23 — FIX 4.x SOH-delimited tag=value. The envelope codec
@@ -24,6 +32,77 @@ pub enum Codec {
     /// JSON under tag 5002. Out of scope: FIX 5.x repeating groups
     /// and DataDictionary-driven field typing.
     Fix,
+}
+
+impl Codec {
+    /// Stable wire token. Used by the `codecs` negotiation field on
+    /// `CqMessage` so old + new code can round-trip the value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Codec::Json => "json",
+            Codec::MessagePack => "msgpack",
+            Codec::Bson => "bson",
+            Codec::Fix => "fix",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "json" => Some(Codec::Json),
+            "msgpack" => Some(Codec::MessagePack),
+            "bson" => Some(Codec::Bson),
+            "fix" => Some(Codec::Fix),
+            _ => None,
+        }
+    }
+}
+
+/// Codecs this build can speak, in negotiation preference order. When a
+/// client offers `["msgpack", "json"]` the server picks `msgpack` if
+/// it's in this list; otherwise it falls through to the next mutual
+/// choice (ultimately `json`, the legacy default).
+pub const SUPPORTED_CODECS: &[Codec] =
+    &[Codec::MessagePack, Codec::Bson, Codec::Fix, Codec::Json];
+
+/// Default codec assumed when a Logon arrives without an explicit
+/// `codecs` field — preserves compatibility with pre-S30 clients that
+/// only ever speak JSON on the wire.
+pub const DEFAULT_LEGACY_CODEC: Codec = Codec::Json;
+
+/// Result of a Logon-time codec negotiation. Mirrors the compression
+/// module's `NegotiationOutcome` shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecNegotiationOutcome {
+    /// Both sides share at least one codec; the client's most-preferred
+    /// mutual codec is selected.
+    Negotiated(Codec),
+    /// Disjoint sets. Can only happen if both sides explicitly rule out
+    /// `json` — otherwise the legacy default applies. Treated as an
+    /// error so the client fails fast.
+    NoOverlap,
+}
+
+/// Negotiate the active codec given the client's advertised list (in
+/// preference order) and the server's supported list. Returns the first
+/// client choice the server can speak.
+///
+/// An empty `client_codecs` is treated as legacy (`Codec::Json`).
+pub fn negotiate_codec(
+    client_codecs: &[Codec],
+    server_codecs: &[Codec],
+) -> CodecNegotiationOutcome {
+    if client_codecs.is_empty() {
+        if server_codecs.contains(&DEFAULT_LEGACY_CODEC) {
+            return CodecNegotiationOutcome::Negotiated(DEFAULT_LEGACY_CODEC);
+        }
+        return CodecNegotiationOutcome::NoOverlap;
+    }
+    for &c in client_codecs {
+        if server_codecs.contains(&c) {
+            return CodecNegotiationOutcome::Negotiated(c);
+        }
+    }
+    CodecNegotiationOutcome::NoOverlap
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -275,5 +354,50 @@ mod tests {
             Codec::Fix.decode(&j).is_err(),
             "FIX decoder must reject JSON-encoded bytes"
         );
+    }
+
+    #[test]
+    fn codec_wire_token_round_trips() {
+        for c in [Codec::Json, Codec::MessagePack, Codec::Bson, Codec::Fix] {
+            assert_eq!(Codec::from_wire(c.as_str()), Some(c));
+        }
+        assert_eq!(Codec::from_wire("protobuf"), None);
+    }
+
+    #[test]
+    fn negotiate_picks_client_preferred_when_supported() {
+        let client = vec![Codec::MessagePack, Codec::Json];
+        assert_eq!(
+            negotiate_codec(&client, SUPPORTED_CODECS),
+            CodecNegotiationOutcome::Negotiated(Codec::MessagePack)
+        );
+    }
+
+    #[test]
+    fn negotiate_empty_client_implies_legacy_json() {
+        assert_eq!(
+            negotiate_codec(&[], SUPPORTED_CODECS),
+            CodecNegotiationOutcome::Negotiated(Codec::Json)
+        );
+    }
+
+    #[test]
+    fn negotiate_no_overlap_when_json_excluded_both_sides() {
+        let client = vec![Codec::Fix];
+        let server = vec![Codec::MessagePack, Codec::Bson];
+        assert_eq!(
+            negotiate_codec(&client, &server),
+            CodecNegotiationOutcome::NoOverlap
+        );
+    }
+
+    #[test]
+    fn codec_serde_uses_wire_tokens() {
+        // The `codecs` field on the wire must use the lowercase tokens
+        // (with msgpack renamed) so old + new peers agree.
+        let json = serde_json::to_string(&Codec::MessagePack).unwrap();
+        assert_eq!(json, "\"msgpack\"");
+        let back: Codec = serde_json::from_str("\"bson\"").unwrap();
+        assert_eq!(back, Codec::Bson);
     }
 }

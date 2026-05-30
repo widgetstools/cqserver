@@ -26,6 +26,26 @@ info()  { printf "  ${c_dim}%s${c_reset}\n" "$*"; }
 ok()    { printf "  ${c_green}✓ %s${c_reset}\n" "$*"; }
 fail()  { printf "  ${c_red}✗ %s${c_reset}\n" "$*"; exit 1; }
 
+# Tear down any children we already started before exiting with an error,
+# so a failed healthz wait doesn't leave an orphan cqserver replaying txlog
+# in the background and blocking the next run on a port-in-use error.
+cleanup_on_error() {
+  local code=$?
+  if [ "$code" -ne 0 ]; then
+    for name in examples-web publisher server; do
+      local pidfile="$RUN_DIR/${name}.pid"
+      if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+          kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+      fi
+    done
+  fi
+}
+
 step "Pre-flight"
 
 for name in server publisher examples-web; do
@@ -89,6 +109,11 @@ else
   info "txlog preserved (set RESEED=1 to wipe and re-seed)"
 fi
 
+# Arm the cleanup trap only now that pre-flight has passed — before this
+# point the pidfiles belong to a previously-running demo, and a pre-flight
+# `fail` must not tear that down (it tells the user to run ./stop-demo.sh).
+trap cleanup_on_error EXIT
+
 step "Starting cqserver"
 (
   cd "$ROOT"
@@ -97,14 +122,22 @@ step "Starting cqserver"
 echo $! > "$RUN_DIR/server.pid"
 info "pid=$(cat "$RUN_DIR/server.pid")  log=$RUN_DIR/server.log"
 
-# Healthz wait — 60s is generous for a cold start with txlog recovery.
-# On a clean Atlas start this completes in well under a second.
-for _ in $(seq 1 240); do
+# Healthz wait — up to 5 minutes. Cold start with a clean txlog is <1s, but
+# replaying a fat /positions txlog (millions of entries) can take 2+ minutes
+# before the admin listener binds. Override with HEALTHZ_TIMEOUT_S to taste.
+healthz_timeout_s="${HEALTHZ_TIMEOUT_S:-300}"
+healthz_iters=$(( healthz_timeout_s * 4 ))
+info "waiting for admin /healthz (up to ${healthz_timeout_s}s)..."
+for _ in $(seq 1 "$healthz_iters"); do
   if curl -fsS "$ADMIN_URL/healthz" >/dev/null 2>&1; then break; fi
+  # Bail early if the server crashed instead of waiting the full timeout.
+  if ! kill -0 "$(cat "$RUN_DIR/server.pid")" 2>/dev/null; then
+    fail "cqserver process exited — check $RUN_DIR/server.log"
+  fi
   sleep 0.25
 done
 if ! curl -fsS "$ADMIN_URL/healthz" >/dev/null 2>&1; then
-  fail "cqserver did not come up — check $RUN_DIR/server.log"
+  fail "cqserver did not come up within ${healthz_timeout_s}s — check $RUN_DIR/server.log"
 fi
 ok "cqserver healthy"
 

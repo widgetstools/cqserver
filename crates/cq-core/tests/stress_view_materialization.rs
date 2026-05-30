@@ -64,7 +64,7 @@ fn view_converges_under_concurrent_pressure() {
         None,
     )
     .expect("view");
-    let _runner = spawn_view_runner(view.clone(), tap_rx);
+    let _runner = spawn_view_runner(view.clone(), tap_rx).expect("spawn view runner");
 
     // 8 writer threads × 250 rows each — 2K source publishes total. A
     // small desk set (3 desks) plus mod-3 rotation ensures contention

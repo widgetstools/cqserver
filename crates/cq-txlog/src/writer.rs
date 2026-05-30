@@ -7,10 +7,14 @@
 
 use crate::reader::TxLogReader;
 use crate::segment::{list_segments, segment_path};
-use crate::{now_ms, FsyncPolicy, TxLogError, DEFAULT_SEGMENT_SIZE, MAX_ENTRY_SIZE, MAX_TOPIC_LEN};
+use crate::{
+    now_ms, FsyncPolicy, TxLogError, DEFAULT_SEGMENT_SIZE, MAX_ENTRY_SIZE, MAX_ORIGIN_LEN,
+    MAX_TOPIC_LEN, TXLOG_FORMAT_V2,
+};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub struct TxLogWriter {
     dir: PathBuf,
@@ -22,6 +26,21 @@ pub struct TxLogWriter {
     current_bytes: u64,
     entries_written: u64,
     max_sequence: u64,
+    /// Wall-clock instant of the last `fsync`. Only meaningful under
+    /// `FsyncPolicy::Interval`, where it gates group-commit: an append
+    /// fsyncs only once `interval` has elapsed since this instant.
+    last_fsync: Instant,
+    /// When `true`, the active segment's blocks are reserved up front
+    /// (`fallocate`/`F_PREALLOCATE`) so steady-state appends don't pay
+    /// per-write extent-allocation cost. Best-effort — unsupported
+    /// filesystems silently fall back to on-demand allocation. The file
+    /// stays in append mode and its *logical* length still tracks the
+    /// bytes actually written, so readers and recovery are unaffected.
+    preallocate: bool,
+    /// Physical byte offset up to which blocks are currently reserved for
+    /// the active segment. `0` when nothing is reserved. Reset on
+    /// rotation and after a tail-trim in `sync`.
+    prealloc_end: u64,
     /// Optional archive directory. When set, sealed segments are
     /// moved here on rotation, keeping the live `dir` small. The
     /// archive directory is created on first rotation if missing.
@@ -82,16 +101,28 @@ impl TxLogWriter {
         // Discover existing segments to figure out where to resume.
         let existing = list_segments(&dir)?;
         let (current_id, max_sequence) = if let Some((last_id, _)) = existing.last() {
+            // The local txlog only ever records *this* node's own writes,
+            // appended in strictly increasing sequence order — replicated
+            // foreign-origin entries are applied to the store but are never
+            // written here. So the highest sequence lives in the
+            // newest-numbered segment that holds any entry. Scan backward
+            // from the last segment and stop at the first non-empty one,
+            // rather than reading the entire (possibly multi-GB) log just
+            // to seed the counter. This keeps startup O(one segment)
+            // regardless of total log size — the difference between a
+            // multi-minute and a near-instant restart on a large log.
             let mut max_seq = 0u64;
-            // Scan the whole directory for the highest sequence — the
-            // current segment may have been only partially written, or
-            // earlier segments may carry higher sequences due to
-            // out-of-order writes (the writer guarantees in-order so this
-            // is conservative).
-            let mut reader = TxLogReader::open(&dir)?;
-            while let Some(entry) = reader.read_next()? {
-                if entry.sequence > max_seq {
-                    max_seq = entry.sequence;
+            for (_, path) in existing.iter().rev() {
+                let mut reader = TxLogReader::open(path)?;
+                let mut found = false;
+                while let Some(entry) = reader.read_next()? {
+                    found = true;
+                    if entry.sequence > max_seq {
+                        max_seq = entry.sequence;
+                    }
+                }
+                if found {
+                    break;
                 }
             }
             (*last_id, max_seq)
@@ -117,9 +148,73 @@ impl TxLogWriter {
             current_bytes,
             entries_written: 0,
             max_sequence,
+            last_fsync: Instant::now(),
+            preallocate: false,
+            prealloc_end: 0,
             archive_dir: None,
             archive_compress: false,
         })
+    }
+
+    /// Enable (or disable) block preallocation for the active and all
+    /// future segments. When enabling, the active segment's tail is
+    /// reserved immediately. Preallocation is a throughput optimization
+    /// only: a failure to reserve (unsupported FS, etc.) is logged and
+    /// ignored, never surfaced as an error, because correctness does not
+    /// depend on it. Returns `self` for chaining after an `open_*` call.
+    pub fn with_preallocate(mut self, enabled: bool) -> Self {
+        self.preallocate = enabled;
+        if enabled {
+            self.ensure_prealloc();
+        }
+        self
+    }
+
+    /// Reserve blocks for the active segment up to `segment_size` when
+    /// preallocation is enabled and the current reservation doesn't
+    /// already cover the whole segment. Cheap no-op once reserved.
+    fn ensure_prealloc(&mut self) {
+        if !self.preallocate || self.prealloc_end >= self.segment_size {
+            return;
+        }
+        let len = self.segment_size.saturating_sub(self.current_bytes);
+        if len == 0 {
+            self.prealloc_end = self.segment_size;
+            return;
+        }
+        match reserve_blocks(&self.current_file, self.current_bytes, len) {
+            Ok(()) => self.prealloc_end = self.segment_size,
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.current_path.display(),
+                    error = %e,
+                    "txlog preallocation failed — falling back to on-demand allocation"
+                );
+                // Don't retry every append on a FS that doesn't support
+                // it; treat the segment as "reserved" to suppress churn.
+                self.prealloc_end = self.segment_size;
+            }
+        }
+    }
+
+    /// Release any reserved-but-unwritten blocks past the logical end of
+    /// the active segment. Called when sealing a segment (rotation) and
+    /// on clean shutdown so a sealed/closed file occupies only the space
+    /// its real content needs. In append mode the logical length already
+    /// equals `current_bytes`, so truncating to it frees only the
+    /// preallocated tail.
+    fn trim_prealloc_tail(&mut self) {
+        if !self.preallocate || self.prealloc_end <= self.current_bytes {
+            return;
+        }
+        if let Err(e) = self.current_file.set_len(self.current_bytes) {
+            tracing::warn!(
+                path = %self.current_path.display(),
+                error = %e,
+                "txlog preallocation tail-trim failed"
+            );
+        }
+        self.prealloc_end = self.current_bytes;
     }
 
     pub fn dir(&self) -> &Path {
@@ -156,7 +251,12 @@ impl TxLogWriter {
     fn rotate(&mut self) -> Result<(), TxLogError> {
         // Flush current segment so a crash leaves it consistent.
         self.current_file.flush()?;
-        if self.fsync == FsyncPolicy::EveryWrite {
+        // Release any reserved-but-unwritten tail so the sealed segment
+        // occupies only its real content (and never carries trailing
+        // zero padding that a strict reader would reject on a non-active
+        // segment). Must happen before the sync/seal below.
+        self.trim_prealloc_tail();
+        if self.fsync != FsyncPolicy::None {
             self.current_file.sync_all()?;
         }
         // Capture the path of the segment we're about to seal before
@@ -175,6 +275,10 @@ impl TxLogWriter {
         self.current_path = next_path;
         self.current_file = next_file;
         self.current_bytes = 0;
+        // Fresh segment owns no reservation yet; reserve its blocks now
+        // so the first appends into it are already cheap.
+        self.prealloc_end = 0;
+        self.ensure_prealloc();
 
         // Move the just-sealed segment to the archive directory if
         // one is configured. We do this *after* opening the new
@@ -229,11 +333,30 @@ impl TxLogWriter {
     /// Append a single entry. `payload` may be empty to record a
     /// tombstone. `sequence` must be strictly greater than every
     /// previously appended sequence for this writer.
+    ///
+    /// Writes a legacy V1 body (no origin). Equivalent to
+    /// `append_with_origin(sequence, topic, key, "", payload)`.
     pub fn append(
         &mut self,
         sequence: u64,
         topic: &str,
         key: &str,
+        payload: &[u8],
+    ) -> Result<(), TxLogError> {
+        self.append_with_origin(sequence, topic, key, "", payload)
+    }
+
+    /// Append a single entry stamped with an originating instance id.
+    ///
+    /// When `origin` is empty, a legacy V1 body is written for backward
+    /// compatibility (so older readers and existing tests stay valid). When
+    /// `origin` is non-empty, a V2 (origin-tagged) body is written.
+    pub fn append_with_origin(
+        &mut self,
+        sequence: u64,
+        topic: &str,
+        key: &str,
+        origin: &str,
         payload: &[u8],
     ) -> Result<(), TxLogError> {
         if topic.len() > MAX_TOPIC_LEN {
@@ -242,10 +365,23 @@ impl TxLogWriter {
                 max: MAX_TOPIC_LEN,
             });
         }
+        if origin.len() > MAX_ORIGIN_LEN {
+            return Err(TxLogError::OriginTooLong {
+                len: origin.len(),
+                max: MAX_ORIGIN_LEN,
+            });
+        }
         let topic_bytes = topic.as_bytes();
         let key_bytes = key.as_bytes();
+        let origin_bytes = origin.as_bytes();
+        let v2 = !origin.is_empty();
 
-        let body_len = 8 + 8 + 2 + topic_bytes.len() + 2 + key_bytes.len() + payload.len();
+        let body_len = if v2 {
+            1 + 8 + 8 + 2 + topic_bytes.len() + 2 + key_bytes.len() + 2 + origin_bytes.len()
+                + payload.len()
+        } else {
+            8 + 8 + 2 + topic_bytes.len() + 2 + key_bytes.len() + payload.len()
+        };
         if body_len > MAX_ENTRY_SIZE {
             return Err(TxLogError::EntryTooLarge {
                 offset: self.current_bytes,
@@ -263,25 +399,58 @@ impl TxLogWriter {
             self.rotate()?;
         }
 
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&sequence.to_be_bytes());
-        body.extend_from_slice(&now_ms().to_be_bytes());
-        body.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
-        body.extend_from_slice(topic_bytes);
-        body.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-        body.extend_from_slice(key_bytes);
-        body.extend_from_slice(payload);
+        // Ensure the active segment's blocks are reserved. No-op unless
+        // preallocation is enabled and the reservation was dropped (e.g.
+        // after a mid-stream `sync` tail-trim).
+        self.ensure_prealloc();
 
-        let crc = crc32fast::hash(&body);
+        // Build the framed bytes in a single allocation: reserve the
+        // 8-byte header (len + crc), append the body in place, then patch
+        // the header once the body length and CRC are known. Avoids the
+        // previous body→frame copy on every append.
+        let mut frame = Vec::with_capacity(4 + 4 + body_len);
+        frame.extend_from_slice(&[0u8; 8]); // header placeholder: len(4) + crc(4)
+        if v2 {
+            frame.push(TXLOG_FORMAT_V2);
+        }
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        frame.extend_from_slice(&now_ms().to_be_bytes());
+        frame.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+        frame.extend_from_slice(topic_bytes);
+        frame.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
+        frame.extend_from_slice(key_bytes);
+        if v2 {
+            frame.extend_from_slice(&(origin_bytes.len() as u16).to_be_bytes());
+            frame.extend_from_slice(origin_bytes);
+        }
+        frame.extend_from_slice(payload);
 
-        let mut frame = Vec::with_capacity(4 + 4 + body.len());
-        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&crc.to_be_bytes());
-        frame.extend_from_slice(&body);
+        let body_actual_len = frame.len() - 8;
+        let crc = crc32fast::hash(&frame[8..]);
+        frame[0..4].copy_from_slice(&(body_actual_len as u32).to_be_bytes());
+        frame[4..8].copy_from_slice(&crc.to_be_bytes());
 
+        // The write goes straight through to the OS page cache — no
+        // userspace buffering — so the entry is immediately visible to
+        // any reader tailing this segment (the replication shipper opens
+        // a fresh reader every poll tick and expects to see the latest
+        // bytes). Durability is governed separately by `fsync`.
         self.current_file.write_all(&frame)?;
-        if self.fsync == FsyncPolicy::EveryWrite {
-            self.current_file.sync_data()?;
+        match self.fsync {
+            FsyncPolicy::EveryWrite => {
+                self.current_file.sync_data()?;
+            }
+            FsyncPolicy::Interval(interval) => {
+                // Group commit: fsync at most once per interval. The
+                // first append after the interval lapses pays the cost
+                // on behalf of every append buffered in the OS since the
+                // last fsync.
+                if self.last_fsync.elapsed() >= interval {
+                    self.current_file.sync_data()?;
+                    self.last_fsync = Instant::now();
+                }
+            }
+            FsyncPolicy::None => {}
         }
 
         self.current_bytes += frame.len() as u64;
@@ -296,7 +465,87 @@ impl TxLogWriter {
     /// regardless of the configured policy.
     pub fn sync(&mut self) -> Result<(), TxLogError> {
         self.current_file.flush()?;
+        // Drop any reserved-but-unwritten tail so a clean shutdown leaves
+        // the file sized to its real content (no trailing reserved
+        // blocks). If the writer keeps running afterwards, the next
+        // append re-reserves via `ensure_prealloc`.
+        self.trim_prealloc_tail();
         self.current_file.sync_all()?;
+        self.last_fsync = Instant::now();
         Ok(())
     }
+}
+
+/// Reserve disk blocks for `file` covering `[offset, offset + len)`
+/// without changing the file's logical length, so subsequent appends
+/// into that range don't trigger per-write extent allocation.
+///
+/// Implemented with `fallocate(FALLOC_FL_KEEP_SIZE)` on Linux and
+/// `fcntl(F_PREALLOCATE)` on macOS. On platforms (or filesystems)
+/// without support this is a no-op returning `Ok(())` — preallocation
+/// is purely a throughput optimization, never a correctness requirement.
+#[cfg(target_os = "linux")]
+fn reserve_blocks(file: &File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    // EOPNOTSUPP / ENOSYS: the filesystem doesn't support fallocate.
+    // Treat as a benign no-op — writes will allocate on demand.
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => Ok(()),
+        _ => Err(err),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reserve_blocks(file: &File, _offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    // F_PEOFPOSMODE allocates `fst_length` bytes starting at the physical
+    // end of the file (so `offset` is implied by the current EOF — which,
+    // in append mode, is exactly `current_bytes`). Try a contiguous
+    // allocation first, then fall back to a possibly-fragmented one.
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    let mut ret = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    if ret == -1 {
+        store.fst_flags = libc::F_ALLOCATEALL;
+        ret = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    }
+    if ret == -1 {
+        let err = std::io::Error::last_os_error();
+        // ENOTSUP: filesystem can't preallocate — benign no-op.
+        return match err.raw_os_error() {
+            Some(libc::ENOTSUP) => Ok(()),
+            _ => Err(err),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reserve_blocks(_file: &File, _offset: u64, _len: u64) -> std::io::Result<()> {
+    // No portable preallocation primitive — on-demand allocation only.
+    Ok(())
 }

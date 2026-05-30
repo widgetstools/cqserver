@@ -15,7 +15,7 @@
  */
 import type { QueryFeature } from '@/lib/queries/library';
 
-export { QUERIES, type QueryEntry, type QueryFeature } from '@/lib/queries/library';
+export { QUERIES, type QueryEntry, type QueryFeature, type PivotDisplayConfig } from '@/lib/queries/library';
 
 export const FEATURE_LABEL: Record<QueryFeature, string> = {
   join: 'Joins',
@@ -30,14 +30,27 @@ export const FEATURE_ORDER: QueryFeature[] = [
   'join', 'filter', 'agg', 'pivot', 'view', 'window',
 ];
 
-/** Heuristic — JOIN keyword anywhere outside a string literal forces
- *  static mode. Lifted from legacy ex08-query-builder; the pattern is
- *  `\bJOIN\b` case-insensitive applied after a crude comment-strip. */
+/** Heuristic — force static (one-shot SOW) mode for query shapes the
+ *  live subscription evaluator can't materialize:
+ *    - JOINs (the sub-time JOIN evaluator is one-shot only), and
+ *    - derived-table queries (a sub-query in `FROM (...)`), e.g. the
+ *      `RANK()`/`ROW_NUMBER() … FROM (SELECT … GROUP BY …)` window
+ *      catalog entries. A live `sowAndSubscribe` on those returns an
+ *      empty snapshot, so the grid would show 0 rows even though the
+ *      same SQL returns rows as a static SOW.
+ *  Everything else (single-topic SELECT/WHERE/GROUP BY, plain window
+ *  functions, pivots, views) stays live so the grid ticks.
+ *  Applied after a crude comment-strip so keywords inside `--`/`/* *​/`
+ *  comments don't trip the match. */
 export function detectRunMode(sql: string): 'live' | 'static' {
   const stripped = sql
     .replace(/--[^\n]*/g, ' ')
     .replace(/\/\*[\s\S]*?\*\//g, ' ');
-  return /\bJOIN\b/i.test(stripped) ? 'static' : 'live';
+  const hasJoin = /\bJOIN\b/i.test(stripped);
+  // A `(` after FROM (allowing whitespace/newlines) marks a derived
+  // table — `FROM ( SELECT … )`. Bare `FROM topic` never matches.
+  const hasDerivedTable = /\bFROM\s*\(/i.test(stripped);
+  return hasJoin || hasDerivedTable ? 'static' : 'live';
 }
 
 /** Pick the first topic referenced after `FROM`. The query runner uses

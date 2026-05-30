@@ -13,7 +13,7 @@
 import { Client } from '../../../client-sdks/ts/dist/index.js';
 import {
   detectTopic,
-  hasJoin,
+  isStaticQuery,
   stripAliases,
 } from './query-router-shared.mjs';
 import { QUERIES } from './queries.mjs';
@@ -98,19 +98,20 @@ const main = async () => {
 
   const results = [];
   for (const q of QUERIES) {
-    const joinish = hasJoin(q.sql);
-    // The query builder routes JOIN queries to static; everyone else
-    // to live. So we test each query the way the builder would.
-    const r = joinish
+    const staticish = isStaticQuery(q.sql);
+    // The query builder routes JOIN and derived-table queries to
+    // static; everyone else to live. Test each the way the builder
+    // would, so a PASS here means the demo grid actually shows rows.
+    const r = staticish
       ? await runStatic(client, q)
       : await runLive(client, q);
-    results.push({ q, mode: joinish ? 'static' : 'live', r });
+    results.push({ q, mode: staticish ? 'static' : 'live', r });
 
     const tag = r.ok ? `${COLORS.green}PASS${COLORS.reset}` : `${COLORS.red}FAIL${COLORS.reset}`;
     const detail = r.ok
       ? `${COLORS.dim}${r.rows} rows${COLORS.reset}`
       : `${COLORS.yellow}${truncate(r.err, 80)}${COLORS.reset}`;
-    console.log(`  [${tag}] ${q.id.padEnd(6)} ${q.feature.padEnd(7)} ${(joinish ? 'static' : 'live').padEnd(6)} ${q.title.padEnd(40)} ${detail}`);
+    console.log(`  [${tag}] ${q.id.padEnd(6)} ${q.feature.padEnd(7)} ${(staticish ? 'static' : 'live').padEnd(6)} ${q.title.padEnd(40)} ${detail}`);
   }
 
   console.log('\n══════════════════════════════════════════════════════════════════════');

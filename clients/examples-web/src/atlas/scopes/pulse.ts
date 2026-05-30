@@ -52,7 +52,7 @@ export const PULSE_KPIS: readonly PulseKpiDef[] = [
 /** Column subset shown in the Pulse positions table. The full /positions
  *  topic has 206 columns; we show the eight that matter for a live read. */
 export const PULSE_COL_DEFS: ColDef[] = [
-  { field: 'position_id', headerName: 'position_id', width: 110, cellStyle: { color: '#f4a52b' } },
+  { field: 'position_id', headerName: 'position_id', width: 110, cellStyle: { color: 'var(--atlas-amber)' } },
   { field: 'book_name', headerName: 'book', width: 110 },
   { field: 'symbol', headerName: 'symbol', width: 80 },
   { field: 'issuer_sector', headerName: 'sector', width: 120 },
@@ -75,7 +75,7 @@ export const PULSE_COL_DEFS: ColDef[] = [
       typeof p.value === 'number' && p.value < 0
         ? { color: '#ff6062' }
         : typeof p.value === 'number'
-          ? { color: '#f4a52b' }
+          ? { color: 'var(--atlas-amber)' }
           : null,
   },
   {
@@ -85,7 +85,7 @@ export const PULSE_COL_DEFS: ColDef[] = [
     cellStyle: (p) =>
       p.value === 'BREACH'
         ? { color: '#ff6062', letterSpacing: '.1em' }
-        : { color: '#f4a52b', letterSpacing: '.1em' },
+        : { color: 'var(--atlas-amber)', letterSpacing: '.1em' },
   },
 ];
 

@@ -28,7 +28,10 @@ pub enum DeltaType {
 /// A single delta event to be delivered to a subscriber.
 #[derive(Debug, Clone)]
 pub struct Delta {
-    pub subscription_id: String,
+    /// `Arc<str>` so the per-delta clone on the evaluator hot path is a
+    /// refcount bump rather than a heap allocation (the same id is cloned
+    /// for every delta a subscription emits).
+    pub subscription_id: std::sync::Arc<str>,
     pub delta_type: DeltaType,
     /// Row index in the source `ColumnStore`. Used as the coalescing key
     /// when conflation is enabled — two deltas with the same `row` refer
@@ -151,7 +154,10 @@ pub struct TopNState {
 
 /// A registered subscription with its query and active set.
 pub struct Subscription {
-    pub id: String,
+    /// `Arc<str>` so cloning the id into each emitted `Delta` is a refcount
+    /// bump, not an allocation. Cold paths that need an owned `String`
+    /// (registry keys) convert at the boundary.
+    pub id: std::sync::Arc<str>,
     pub query: ParsedQuery,
     pub active_set: RoaringBitmap,
     /// When `true`, Update deltas carry only fields whose value changed
@@ -205,6 +211,22 @@ pub struct AggregateSubState {
     /// Last-emitted row per group. Canonical key (see
     /// `group_key_canonical`) → JSON map of the group's row.
     pub last_emitted: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    /// S19-incremental — per-group set of source row indices that
+    /// currently match the predicate. Lets a single mutation recompute
+    /// only the group(s) it touches instead of rescanning every row.
+    /// Lazily built on the first incremental evaluation (see
+    /// `incremental_ready`); empty for full-recompute shapes (JOIN,
+    /// PIVOT, LIMIT, implicit single-group), which never read it.
+    group_rows: HashMap<String, RoaringBitmap>,
+    /// S19-incremental — reverse map: source row index → the canonical
+    /// group key it currently belongs to. Used to move a mutated row
+    /// between groups (and to detect when it leaves the result set).
+    row_group: HashMap<u32, String>,
+    /// S19-incremental — false until the membership maps above have
+    /// been seeded from a full scan. The first evaluation on a
+    /// supported shape does that seed (and a full diff); subsequent
+    /// evaluations take the incremental path.
+    incremental_ready: bool,
 }
 
 /// Canonicalize a group-by row's identity for diffing. Picks only
@@ -236,7 +258,7 @@ impl Subscription {
             _ => None,
         };
         Subscription {
-            id,
+            id: std::sync::Arc::from(id),
             query,
             active_set: RoaringBitmap::new(),
             sparse: false,
@@ -410,35 +432,222 @@ fn key_only_payload(
     out
 }
 
-/// S19: continuous-aggregate evaluation. Re-runs the aggregate
-/// executor against the current store, diffs the result against
-/// `sub.aggregate.last_emitted`, and emits one delta per affected
+/// Continuous-aggregate evaluation. Diffs the recomputed group result
+/// against `sub.aggregate.last_emitted` and emits one delta per affected
 /// group:
 ///
 /// - **Add** — group key not in `last_emitted` (new group).
 /// - **Update** — group key present but its aggregate values changed.
 /// - **Remove** — group key in `last_emitted` but no longer present
-///   in the current result (last row of that group was removed).
+///   (last row of that group was removed).
 ///
-/// The aggregate executor is invoked with NO secondary index — group
-/// state needs every row, and the existing aggregate path doesn't
-/// honor index hints anyway.
-///
-/// This is the "lazy" implementation: O(rows) per event. The truly
-/// incremental form (track per-row contribution, subtract on remove,
-/// add on insert) is a follow-up for SUM/COUNT/AVG; MIN/MAX
-/// fundamentally need a scan on remove so lazy is the right shape
-/// for those.
+/// Dispatcher: supported single-topic `GROUP BY` shapes take the
+/// incremental path (recompute only the group(s) a mutation touches);
+/// everything else (JOIN, PIVOT, LIMIT/OFFSET, window fns, implicit
+/// single-group) falls back to the O(rows) full recompute, which is
+/// always correct.
 fn evaluate_aggregating(
+    sub: &mut Subscription,
+    row: u32,
+    sequence: u64,
+    kind: crate::topic::MutationKind,
+    store: &ColumnStore,
+    deltas: &mut Vec<Delta>,
+) {
+    // Supported shapes are seeded at subscribe time
+    // (`seed_aggregate_membership`) and flagged ready. If a shape needs
+    // full recompute, or membership wasn't seeded for any reason, take
+    // the always-correct O(rows) path.
+    let ready = sub
+        .aggregate
+        .as_ref()
+        .map(|a| a.incremental_ready)
+        .unwrap_or(false);
+    if !ready || aggregate_needs_full_recompute(&sub.query) {
+        evaluate_aggregating_full(sub, sequence, store, deltas);
+        return;
+    }
+    evaluate_aggregating_incremental(sub, row, sequence, kind, store, deltas);
+}
+
+/// Seed the incremental aggregate membership maps from the current
+/// store, filtered to live (non-tombstoned) rows. No-op for query
+/// shapes the incremental evaluator can't maintain (`join`, `pivot`,
+/// `limit`, …) — those keep using the full-recompute path. Call once
+/// at subscribe, after `last_emitted` is seeded from the same filtered
+/// snapshot so the two agree.
+pub fn seed_aggregate_membership(
+    sub: &mut Subscription,
+    store: &ColumnStore,
+    live_rows: &RoaringBitmap,
+) {
+    if aggregate_needs_full_recompute(&sub.query) {
+        return;
+    }
+    let (group_rows, row_group) =
+        crate::query::build_group_membership(&sub.query, store, Some(live_rows));
+    if let Some(agg) = sub.aggregate.as_mut() {
+        agg.group_rows = group_rows;
+        agg.row_group = row_group;
+        agg.incremental_ready = true;
+    }
+}
+
+/// Shapes the incremental evaluator can't maintain by single-row
+/// group membership. A subscription's query is fixed, so this is a
+/// stable per-sub classification: a sub is either always-incremental
+/// or always-full.
+fn aggregate_needs_full_recompute(query: &crate::query::ParsedQuery) -> bool {
+    query.join.is_some()
+        || query.pivot.is_some()
+        || query.unpivot.is_some()
+        // LIMIT/OFFSET select a subset of groups by sort/insertion
+        // order — a single group's change can shift the visible
+        // window, which incremental per-group diff can't track.
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || !query.windows.is_empty()
+        // Implicit single-group (e.g. COUNT(*) with no GROUP BY) has
+        // the "empty input still emits one row" rule; cheap anyway.
+        || query.group_by.is_empty()
+}
+
+/// Incremental path: a single mutation can only change the group the
+/// row left and/or the group it joined. Recompute just those, diff
+/// each against `last_emitted`, emit per-group Add/Update/Remove.
+fn evaluate_aggregating_incremental(
+    sub: &mut Subscription,
+    row: u32,
+    sequence: u64,
+    kind: crate::topic::MutationKind,
+    store: &ColumnStore,
+    deltas: &mut Vec<Delta>,
+) {
+    let group_cols = sub.query.group_by.clone();
+    // A delete nulls the row in place — it leaves the result set even
+    // under a `True` predicate, mirroring the row-oriented path.
+    let matches = if kind == crate::topic::MutationKind::Delete {
+        false
+    } else {
+        sub.query.predicate.matches(store, row)
+    };
+    let new_key = if matches {
+        Some(crate::query::group_key_canonical_from_store(store, row, &group_cols))
+    } else {
+        None
+    };
+
+    // Phase 1 — update membership bitmaps; collect the dirty groups.
+    let Some(agg) = sub.aggregate.as_mut() else {
+        // Structurally guaranteed by the dispatcher (only called when
+        // aggregate.is_some()). Degrade to a no-op instead of panicking
+        // the evaluator thread if that invariant is ever violated.
+        tracing::error!(
+            sub = %sub.id,
+            "evaluate_aggregating_incremental called without aggregate state"
+        );
+        return;
+    };
+    let old_key = agg.row_group.get(&row).cloned();
+    if old_key.is_none() && new_key.is_none() {
+        // Row isn't a member and still isn't — nothing this sub cares
+        // about changed.
+        return;
+    }
+    let mut dirty: Vec<String> = Vec::with_capacity(2);
+    match (&old_key, &new_key) {
+        (Some(ok), Some(nk)) if ok == nk => dirty.push(nk.clone()),
+        _ => {
+            if let Some(ok) = &old_key {
+                if let Some(bm) = agg.group_rows.get_mut(ok) {
+                    bm.remove(row);
+                    if bm.is_empty() {
+                        agg.group_rows.remove(ok);
+                    }
+                }
+                dirty.push(ok.clone());
+            }
+            if let Some(nk) = &new_key {
+                agg.group_rows.entry(nk.clone()).or_default().insert(row);
+                dirty.push(nk.clone());
+            }
+        }
+    }
+    match &new_key {
+        Some(nk) => {
+            agg.row_group.insert(row, nk.clone());
+        }
+        None => {
+            agg.row_group.remove(&row);
+        }
+    }
+
+    // Phase 2 — recompute each dirty group and diff against the last
+    // emitted output for that group.
+    let sub_id = sub.id.clone();
+    for key in &dirty {
+        let recomputed = match sub.aggregate.as_ref().unwrap().group_rows.get(key) {
+            Some(bm) if !bm.is_empty() => {
+                crate::query::aggregate_one_group(&sub.query, store, bm)
+            }
+            // Group is empty (last member left) or failed HAVING.
+            _ => None,
+        };
+        let agg = sub.aggregate.as_mut().unwrap();
+        match recomputed {
+            Some(new_row) => match agg.last_emitted.get(key) {
+                None => {
+                    deltas.push(Delta {
+                        subscription_id: sub_id.clone(),
+                        delta_type: DeltaType::Add,
+                        row: 0,
+                        sequence,
+                        row_data: std::sync::Arc::new(new_row.clone()),
+                        encoded_body_json: None,
+                    });
+                    agg.last_emitted.insert(key.clone(), new_row);
+                }
+                Some(prev) if *prev != new_row => {
+                    deltas.push(Delta {
+                        subscription_id: sub_id.clone(),
+                        delta_type: DeltaType::Update,
+                        row: 0,
+                        sequence,
+                        row_data: std::sync::Arc::new(new_row.clone()),
+                        encoded_body_json: None,
+                    });
+                    agg.last_emitted.insert(key.clone(), new_row);
+                }
+                _ => {}
+            },
+            None => {
+                if let Some(prev) = agg.last_emitted.remove(key) {
+                    deltas.push(Delta {
+                        subscription_id: sub_id.clone(),
+                        delta_type: DeltaType::Remove,
+                        row: 0,
+                        sequence,
+                        row_data: std::sync::Arc::new(prev),
+                        encoded_body_json: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Full O(rows) recompute. Correct for every shape; used as the
+/// fallback for query shapes the incremental path doesn't maintain.
+fn evaluate_aggregating_full(
     sub: &mut Subscription,
     sequence: u64,
     store: &ColumnStore,
     deltas: &mut Vec<Delta>,
 ) {
-    let agg_state = sub
-        .aggregate
-        .as_mut()
-        .expect("evaluate_aggregating called without aggregate state");
+    let Some(agg_state) = sub.aggregate.as_mut() else {
+        tracing::error!(sub = %sub.id, "evaluate_aggregating_full called without aggregate state");
+        return;
+    };
     // Re-run the aggregate executor. This is the heavy part.
     let result = crate::query::execute_query_with_index(&sub.query, store, None);
 
@@ -518,7 +727,10 @@ fn evaluate_topn(
     let matches = sub.query.predicate.matches(store, row);
 
     // 1. Update `ranked` for the mutated row.
-    let topn = sub.topn.as_mut().expect("evaluate_topn requires topn state");
+    let Some(topn) = sub.topn.as_mut() else {
+        tracing::error!(sub = %sub.id, "evaluate_topn called without topn state");
+        return;
+    };
     if let Some(old_key) = topn.row_to_key.remove(&row) {
         topn.ranked.remove(&(old_key, row));
     }
@@ -618,7 +830,8 @@ impl SubscriptionEngine {
     /// The caller should separately compute and deliver the initial snapshot.
     pub fn add(&mut self, sub: Subscription) {
         self.predicate_index.add(&sub.id, &sub.query.predicate);
-        self.subscriptions.insert(sub.id.clone(), sub);
+        // Registry stays String-keyed (cold path); convert at the boundary.
+        self.subscriptions.insert(sub.id.to_string(), sub);
     }
 
     /// Remove a subscription by ID.
@@ -818,7 +1031,7 @@ impl SubscriptionEngine {
             // row-oriented logic below doesn't apply — group state
             // changes don't map to a single source row.
             if sub.aggregate.is_some() {
-                evaluate_aggregating(sub, sequence, store, &mut deltas);
+                evaluate_aggregating(sub, row, sequence, kind, store, &mut deltas);
                 continue;
             }
             if sub.topn.is_some() {

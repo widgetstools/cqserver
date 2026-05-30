@@ -28,7 +28,14 @@ c_blue=$'\033[34m'; c_dim=$'\033[2m'; c_green=$'\033[32m'
 c_red=$'\033[31m';  c_yellow=$'\033[33m'; c_reset=$'\033[0m'
 
 # Kill helper: signal a PID + its direct children, escalate to SIGKILL
-# after ~0.9s if it doesn't exit.
+# after the grace window if it doesn't exit. The window is generous
+# (~12s) because cqserver's graceful shutdown fsyncs every persistent
+# topic AND writes a SOW snapshot (the AMPS-style fast-restart
+# checkpoint) before exiting — for a multi-GB topic that's seconds of
+# work, and a premature SIGKILL would skip the snapshot and force the
+# next start back into a full txlog replay. Fast processes (UI, publisher)
+# exit on the first SIGTERM and break the loop immediately, so the longer
+# window only ever delays a server that's genuinely mid-checkpoint.
 kill_pid() {
   local pid="$1" desc="$2"
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -39,9 +46,12 @@ kill_pid() {
   # we can kill npx → node wrappers without touching unrelated processes.
   pkill -P "$pid" 2>/dev/null || true
   kill "$pid" 2>/dev/null || true
-  for _ in 1 2 3; do
+  # Cap (~130s) sits just above cqserver's own 120s shutdown budget so a
+  # legitimate large-topic snapshot is never cut short; a fast process
+  # (UI/publisher) exits on the first SIGTERM and breaks out immediately.
+  for _ in $(seq 1 260); do
     kill -0 "$pid" 2>/dev/null || break
-    sleep 0.3
+    sleep 0.5
   done
   if kill -0 "$pid" 2>/dev/null; then
     pkill -9 -P "$pid" 2>/dev/null || true

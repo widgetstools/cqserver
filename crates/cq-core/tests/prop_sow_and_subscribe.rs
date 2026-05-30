@@ -92,7 +92,7 @@ macro_rules! drain_into {
         while let Ok(ev) = $rx.try_recv() {
             let deltas = $topic.evaluate_row_kind(ev.row, ev.sequence, ev.kind);
             for d in deltas {
-                if d.subscription_id == $sub_id {
+                if d.subscription_id.as_ref() == $sub_id {
                     let k = d
                         .row_data
                         .get("k")

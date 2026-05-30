@@ -21,6 +21,11 @@
 
 export type QueryFeature = 'join' | 'filter' | 'agg' | 'pivot' | 'view' | 'window';
 
+export interface PivotDisplayConfig {
+  /** Row dimensions for the AG Grid pivot view of wide AMPS output. */
+  rowGroupFields: string[];
+}
+
 export interface QueryEntry {
   id: string;
   title: string;
@@ -29,6 +34,8 @@ export interface QueryEntry {
   sql: string;
   /** Estimated explain summary line shown next to the editor. */
   explain?: string;
+  /** When set, Chapter 08 renders pivot results in AG Grid pivot mode. */
+  pivotDisplay?: PivotDisplayConfig;
 }
 
 const ONE_DAY_US = 86_400_000_000;
@@ -118,11 +125,11 @@ ORDER BY market_value_usd DESC;`,
     id: 'fl-2',
     title: 'IN + BETWEEN range filter',
     feature: 'filter',
-    synopsis: 'Range on a date column + enum membership.',
+    synopsis: 'Range on a date column + enum membership. BETWEEN bounds must be literals (the predicate parser rejects expressions like NOW() - N there), so this uses a fixed window that brackets the demo seed timeframe.',
     sql: `SELECT trade_id, trade_ts, symbol, side, notional_usd
 FROM trades
 WHERE execution_venue IN ('NYSE','NASDAQ','BATS')
-  AND trade_ts BETWEEN '2026-05-01' AND '2026-05-22'
+  AND trade_ts BETWEEN '2026-05-01' AND '2026-12-31'
   AND ABS(slippage_arrival_bps) > 5;`,
   },
   {
@@ -235,6 +242,7 @@ HAVING SUM(quantity_filled) > 0;`,
     title: 'Pivot: asset class × currency (static IN list)',
     feature: 'pivot',
     synopsis: 'AMPS PIVOT as a FROM-clause modifier with an explicit IN-list.',
+    pivotDisplay: { rowGroupFields: ['asset_class'] },
     sql: `SELECT *
 FROM positions
 PIVOT (SUM(market_value_usd) FOR currency IN ('USD', 'EUR', 'GBP', 'JPY')) AS p;`,
@@ -244,6 +252,7 @@ PIVOT (SUM(market_value_usd) FOR currency IN ('USD', 'EUR', 'GBP', 'JPY')) AS p;
     title: 'Pivot: sector × region (dynamic IN ANY)',
     feature: 'pivot',
     synopsis: 'Dynamic AMPS PIVOT — the executor discovers region values from the data.',
+    pivotDisplay: { rowGroupFields: ['issuer_sector'] },
     sql: `SELECT *
 FROM positions
 PIVOT (SUM(market_value_usd) FOR issuer_region IN ANY) AS p
@@ -254,6 +263,7 @@ WHERE asset_class = 'EQUITY';`,
     title: 'Multi-measure pivot',
     feature: 'pivot',
     synopsis: 'Two measures pivoted in one shot — AMPS supports comma-separated aggregate list.',
+    pivotDisplay: { rowGroupFields: ['book_name'] },
     sql: `SELECT *
 FROM positions
 PIVOT (SUM(market_value_usd), SUM(var_1d_95) FOR asset_class IN ('EQUITY','RATES','CREDIT','FX')) AS p;`,

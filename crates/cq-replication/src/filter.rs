@@ -21,7 +21,7 @@
 //! standby's SOW from the primary's.
 
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Single equality predicate. `column = value` is matched against the
 /// JSON payload's named field. Numeric values are compared after
@@ -98,9 +98,10 @@ pub fn apply_transform(
         if !stripped {
             return payload;
         }
-        // Preserve insertion order of remaining fields.
-        let new_map: Map<String, Value> = map.clone();
-        serde_json::to_vec(&Value::Object(new_map)).unwrap_or(payload)
+        // `map` already IS the stripped object (a mutable borrow of
+        // `parsed`); serialize it directly instead of cloning the whole
+        // map first. Field order is unchanged.
+        serde_json::to_vec(&*map).unwrap_or(payload)
     } else {
         payload
     }

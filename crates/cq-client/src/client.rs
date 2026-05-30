@@ -77,7 +77,17 @@ struct ClientInner {
     /// populated before any subsequent SOW frame is processed.
     pending_subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>>,
     next_cid: AtomicU64,
-    codec: Codec,
+    /// S30 — wire codec this connection currently speaks. Starts at
+    /// `Json` so the Logon frame is always JSON (the codec the server
+    /// decodes Logons with); a successful negotiation switches it via
+    /// [`Client::capture_negotiated`] for all post-ack frames. Shared
+    /// with the driver loop, which reads it each iteration.
+    codec_slot: Arc<std::sync::atomic::AtomicU8>,
+    /// S30 — the codec this client was configured to prefer (from
+    /// `ClientConfig`). Drives the advertised preference list at Logon
+    /// (see [`codec_preference`]); the actually-negotiated codec lives
+    /// in `codec_slot`.
+    configured_codec: Codec,
     ack_timeout: Option<Duration>,
 }
 
@@ -171,6 +181,13 @@ impl Client {
             Arc::new(DashMap::new());
 
         let compression = Arc::new(std::sync::atomic::AtomicU8::new(0)); // None
+        // S30 — start at JSON regardless of the configured codec, so the
+        // Logon frame is sent as JSON (the server decodes Logons with its
+        // default JSON codec). Negotiation switches this for post-ack
+        // frames; see `capture_negotiated`.
+        let codec_slot = Arc::new(std::sync::atomic::AtomicU8::new(codec_to_u8(
+            Codec::Json,
+        )));
         let inner = Arc::new(ClientInner {
             out_tx,
             pending: pending.clone(),
@@ -185,7 +202,8 @@ impl Client {
             bookmark_store: parking_lot::RwLock::new(None),
             publish_store: parking_lot::RwLock::new(None),
             next_cid: AtomicU64::new(1),
-            codec: cfg.codec,
+            codec_slot: codec_slot.clone(),
+            configured_codec: cfg.codec,
             ack_timeout: cfg.ack_timeout,
         });
 
@@ -197,7 +215,7 @@ impl Client {
             snapshot_completions,
             snapshot_buffers,
             pending_subs,
-            cfg.codec,
+            codec_slot,
             compression,
         ));
         Client { inner }
@@ -270,6 +288,7 @@ impl Client {
         m.data = Some(Value::Object(creds));
         m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
         m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        m.codecs = Some(codec_preference(self.inner.configured_codec));
         m.client_name = client_name;
         m.trace_id = trace_id;
         let resp = self.rpc(m).await?;
@@ -288,6 +307,7 @@ impl Client {
         m.data = Some(Value::Object(creds));
         m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
         m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        m.codecs = Some(codec_preference(self.inner.configured_codec));
         let resp = self.rpc(m).await?;
         self.capture_negotiated(&resp);
         Ok(())
@@ -301,6 +321,7 @@ impl Client {
         let mut m = CqMessage::new(Command::Logon);
         m.protocol_versions = Some(cq_protocol::version::SUPPORTED_VERSIONS.to_vec());
         m.compressions = Some(cq_protocol::compression::SUPPORTED_COMPRESSIONS.to_vec());
+        m.codecs = Some(codec_preference(self.inner.configured_codec));
         let resp = self.rpc(m).await?;
         self.capture_negotiated(&resp);
         Ok(self.protocol_version())
@@ -390,6 +411,16 @@ impl Client {
                     .store(compression_to_u8(c), std::sync::atomic::Ordering::Release);
             }
         }
+        // S30 — switch to the negotiated wire codec for post-ack frames.
+        // The ack itself arrived in JSON (the pre-switch codec), so the
+        // store here only affects frames the driver loop handles next.
+        if let Some(codecs) = resp.codecs.as_ref() {
+            if let Some(&c) = codecs.first() {
+                self.inner
+                    .codec_slot
+                    .store(codec_to_u8(c), std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     /// Publish a JSON record. Returns the assigned monotonic sequence.
@@ -454,6 +485,50 @@ impl Client {
         Ok(resp.sequence.unwrap_or(0))
     }
 
+    /// Publish to a queue topic with delivery options. `priority`
+    /// (higher delivered first; default 0) and `group` (all messages
+    /// sharing a group pin to one consumer, preserving their order)
+    /// only affect queue topics — they're ignored on SOW topics.
+    /// Returns the assigned sequence.
+    pub async fn publish_with_opts(
+        &self,
+        topic: &str,
+        data: Value,
+        priority: i64,
+        group: Option<&str>,
+    ) -> ClientResult<u64> {
+        let mut m = CqMessage::new(Command::Publish);
+        m.topic = Some(topic.into());
+        m.data = Some(data);
+        if priority != 0 {
+            m.priority = Some(priority);
+        }
+        m.group = group.map(|s| s.to_string());
+        let resp = self.rpc(m).await?;
+        Ok(resp.sequence.unwrap_or(0))
+    }
+
+    /// Extend the lease on an in-flight queue message by `extra_ms`
+    /// (from now), keeping it from being redelivered while a slow
+    /// consumer finishes. Fire-and-forget, like [`queue_ack`].
+    ///
+    /// [`queue_ack`]: Self::queue_ack
+    pub async fn queue_extend_lease(
+        &self,
+        queue: &str,
+        delivery_id: u64,
+        extra_ms: u64,
+    ) -> ClientResult<()> {
+        let mut m = CqMessage::new(Command::Ack);
+        m.topic = Some(queue.into());
+        m.delivery_id = Some(delivery_id);
+        m.lease_extend_ms = Some(extra_ms);
+        if self.inner.out_tx.send(m).is_err() {
+            return Err(ClientError::ConnectionClosed);
+        }
+        Ok(())
+    }
+
     /// One-shot SOW query. Returns the snapshot rows.
     pub async fn sow(
         &self,
@@ -486,6 +561,46 @@ impl Client {
             m.command_id = Some(cid.to_string());
             m.topic = Some(topic.into());
             m.sql = Some(sql.into());
+        })
+        .await
+    }
+
+    /// Historical SOW "as-of sequence": return the topic's state as it
+    /// existed immediately after txlog `sequence` was applied, with an
+    /// optional `filter`. Requires a persistent topic server-side.
+    pub async fn sow_as_of_sequence(
+        &self,
+        topic: &str,
+        sequence: u64,
+        filter: Option<&str>,
+    ) -> ClientResult<Vec<Map<String, Value>>> {
+        self.sow_msg(|cid, m| {
+            m.command_id = Some(cid.to_string());
+            m.topic = Some(topic.into());
+            m.as_of_sequence = Some(sequence);
+            if let Some(f) = filter {
+                m.filter = Some(f.into());
+            }
+        })
+        .await
+    }
+
+    /// Historical SOW "as-of timestamp" (epoch millis): return the
+    /// topic's state as of the highest write at or before `timestamp_ms`,
+    /// with an optional `filter`. Requires a persistent topic.
+    pub async fn sow_as_of_timestamp(
+        &self,
+        topic: &str,
+        timestamp_ms: u64,
+        filter: Option<&str>,
+    ) -> ClientResult<Vec<Map<String, Value>>> {
+        self.sow_msg(|cid, m| {
+            m.command_id = Some(cid.to_string());
+            m.topic = Some(topic.into());
+            m.as_of_timestamp_ms = Some(timestamp_ms);
+            if let Some(f) = filter {
+                m.filter = Some(f.into());
+            }
         })
         .await
     }
@@ -859,7 +974,11 @@ impl Client {
     }
 
     pub fn codec(&self) -> Codec {
-        self.inner.codec
+        codec_from_u8(
+            self.inner
+                .codec_slot
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 }
 
@@ -879,6 +998,40 @@ fn compression_from_u8(b: u8) -> cq_protocol::compression::Compression {
     }
 }
 
+/// S30 — convert the in-memory `Codec` to the atomic-byte
+/// representation the driver loop reads each iteration so a Logon-time
+/// negotiation can switch the wire codec for post-ack frames.
+fn codec_to_u8(c: Codec) -> u8 {
+    match c {
+        Codec::Json => 0,
+        Codec::MessagePack => 1,
+        Codec::Bson => 2,
+        Codec::Fix => 3,
+    }
+}
+
+fn codec_from_u8(b: u8) -> Codec {
+    match b {
+        1 => Codec::MessagePack,
+        2 => Codec::Bson,
+        3 => Codec::Fix,
+        _ => Codec::Json,
+    }
+}
+
+/// S30 — the codec preference list this client advertises at Logon, in
+/// most-preferred-first order. The configured codec leads; JSON is
+/// always appended as the universal fallback so negotiation never fails
+/// against a JSON-only peer. A JSON-configured client advertises just
+/// `[Json]`, leaving the default JSON-on-TCP behavior unchanged.
+fn codec_preference(configured: Codec) -> Vec<Codec> {
+    if configured == Codec::Json {
+        vec![Codec::Json]
+    } else {
+        vec![configured, Codec::Json]
+    }
+}
+
 async fn driver_loop(
     mut transport: Transport,
     mut out_rx: mpsc::UnboundedReceiver<CqMessage>,
@@ -887,15 +1040,33 @@ async fn driver_loop(
     snapshot_completions: Arc<DashMap<String, oneshot::Sender<Option<String>>>>,
     snapshot_buffers: Arc<DashMap<String, Mutex<Vec<Map<String, Value>>>>>,
     pending_subs: Arc<DashMap<String, mpsc::UnboundedSender<Delta>>>,
-    codec: Codec,
+    codec_slot: Arc<std::sync::atomic::AtomicU8>,
     compression_slot: Arc<std::sync::atomic::AtomicU8>,
 ) {
     loop {
+        // S30 — the codec used to decode the next inbound frame. Read
+        // per-iteration so the Logon-time switch takes effect: the
+        // server pushes nothing between the Logon ack and the client's
+        // first post-ack request, so by the time any new-codec inbound
+        // frame can arrive a fresh iteration has latched the updated
+        // codec.
+        let recv_codec =
+            codec_from_u8(codec_slot.load(std::sync::atomic::Ordering::Acquire));
         tokio::select! {
             biased;
             outgoing = out_rx.recv() => {
                 let Some(msg) = outgoing else { return; };
-                let bytes = match codec.encode(&msg) {
+                // Re-read the codec right before encoding: the send may
+                // fire long after this iteration began (the select was
+                // parked waiting for an outbound message), and the
+                // negotiated codec may have changed in the meantime. The
+                // server switches its decode codec the instant it sends
+                // the Logon ack, so an outbound frame must use the
+                // current codec, not a stale per-iteration snapshot.
+                let send_codec = codec_from_u8(
+                    codec_slot.load(std::sync::atomic::Ordering::Acquire),
+                );
+                let bytes = match send_codec.encode(&msg) {
                     Ok(b) => b,
                     Err(e) => {
                         tracing::warn!(error = %e, "encode failed");
@@ -905,12 +1076,12 @@ async fn driver_loop(
                 let compression = compression_from_u8(
                     compression_slot.load(std::sync::atomic::Ordering::Acquire),
                 );
-                if let Err(e) = transport.send(codec, &bytes, compression).await {
+                if let Err(e) = transport.send(send_codec, &bytes, compression).await {
                     tracing::warn!(error = %e, "send failed; closing");
                     return;
                 }
             }
-            incoming = transport.recv(codec) => {
+            incoming = transport.recv(recv_codec) => {
                 match incoming {
                     Ok((wire_codec, bytes)) => {
                         let msg = match wire_codec.decode(&bytes) {

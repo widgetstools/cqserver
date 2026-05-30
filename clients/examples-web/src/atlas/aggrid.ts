@@ -1,16 +1,29 @@
 /**
- * AG-Grid theme for the Atlas redesign — Modernist Mono · Amber.
- *
- * Built on the v33+ Theming API (`themeQuartz.withParams(...)`). Returns
- * a singleton theme object; safe to use as the value of `theme={...}`
- * on `<AgGridReact>`.
+ * AG-Grid themes — fiery orange-red accent per mode.
  */
 import { themeQuartz, iconSetQuartzBold, type Theme } from 'ag-grid-community';
+import type { AtlasThemeMode } from './theme/ThemeContext';
 
-const ATLAS_THEME: Theme = themeQuartz
+const sharedParams = {
+  fontFamily: { googleFont: 'JetBrains Mono' } as unknown as string,
+  headerFontFamily: { googleFont: 'JetBrains Mono' } as unknown as string,
+  fontSize: 11,
+  headerFontSize: 9,
+  headerFontWeight: 500,
+  rowHeight: 26,
+  headerHeight: 28,
+  spacing: 6,
+  cellHorizontalPadding: 12,
+  accentColor: '#ff5722',
+  invalidColor: '#ff6062',
+  columnBorder: false,
+};
+
+const ATLAS_THEME_DARK: Theme = themeQuartz
   .withPart(iconSetQuartzBold)
   .withParams({
-    // ── chrome ─────────────────────────────────────────────────
+    ...sharedParams,
+    browserColorScheme: 'dark',
     backgroundColor: '#0e0e10',
     foregroundColor: '#e6e6e6',
     chromeBackgroundColor: '#0e0e10',
@@ -19,37 +32,42 @@ const ATLAS_THEME: Theme = themeQuartz
     headerBackgroundColor: '#0e0e10',
     headerTextColor: 'rgba(230, 230, 230, 0.55)',
     headerColumnBorder: { style: 'solid', color: 'transparent' },
-    // ── selection & range ──────────────────────────────────────
-    rowHoverColor: 'rgba(244, 165, 43, 0.06)',
-    selectedRowBackgroundColor: 'rgba(244, 165, 43, 0.10)',
-    rangeSelectionBackgroundColor: 'rgba(244, 165, 43, 0.12)',
-    rangeSelectionBorderColor: '#f4a52b',
-    // ── flash on value change (signature motion; duration default) ─
-    // v35 renames the theme-level cell-flash color; the duration knob
-    // isn't exposed in the theming API and stays at the grid default.
-    valueChangeValueHighlightBackgroundColor: 'rgba(244, 165, 43, 0.42)',
-    // ── typography ─────────────────────────────────────────────
-    fontFamily: { googleFont: 'JetBrains Mono' } as unknown as string,
-    headerFontFamily: { googleFont: 'JetBrains Mono' } as unknown as string,
-    fontSize: 11,
-    headerFontSize: 9,
-    headerFontWeight: 500,
-    // ── density ────────────────────────────────────────────────
-    rowHeight: 26,
-    headerHeight: 28,
-    spacing: 6,
-    cellHorizontalPadding: 12,
-    // ── visual flourishes ──────────────────────────────────────
-    accentColor: '#f4a52b',
-    invalidColor: '#ff6062',
-    columnBorder: false,
+    rowHoverColor: 'rgba(255, 87, 34, 0.08)',
+    selectedRowBackgroundColor: 'rgba(255, 87, 34, 0.12)',
+    rangeSelectionBackgroundColor: 'rgba(255, 87, 34, 0.14)',
+    rangeSelectionBorderColor: '#ff5722',
+    valueChangeValueHighlightBackgroundColor: 'rgba(255, 87, 34, 0.45)',
     wrapperBorder: { style: 'solid', color: 'rgba(255, 255, 255, 0.08)', width: 1 },
   });
 
-/**
- * Get the singleton Atlas grid theme. Stable identity across renders —
- * safe to use directly as `<AgGridReact theme={getAtlasGridTheme()} />`.
- */
-export function getAtlasGridTheme(): Theme {
-  return ATLAS_THEME;
+const ATLAS_THEME_LIGHT: Theme = themeQuartz
+  .withPart(iconSetQuartzBold)
+  .withParams({
+    ...sharedParams,
+    accentColor: '#ea580c',
+    invalidColor: '#ff4757',
+    browserColorScheme: 'light',
+    backgroundColor: '#faf8f4',
+    foregroundColor: '#2a2722',
+    chromeBackgroundColor: '#f7f5f0',
+    borderColor: 'rgba(42, 38, 32, 0.14)',
+    rowBorder: { style: 'dashed', color: 'rgba(42, 38, 32, 0.09)', width: 1 },
+    headerBackgroundColor: '#f7f5f0',
+    headerTextColor: 'rgba(42, 39, 34, 0.82)',
+    headerColumnBorder: { style: 'solid', color: 'rgba(42, 38, 32, 0.08)' },
+    rowHoverColor: 'rgba(234, 88, 12, 0.16)',
+    selectedRowBackgroundColor: 'rgba(234, 88, 12, 0.22)',
+    rangeSelectionBackgroundColor: 'rgba(234, 88, 12, 0.24)',
+    rangeSelectionBorderColor: '#ea580c',
+    valueChangeValueHighlightBackgroundColor: 'rgba(234, 88, 12, 0.52)',
+    wrapperBorder: { style: 'solid', color: 'rgba(42, 38, 32, 0.14)', width: 1 },
+  });
+
+const THEMES: Record<AtlasThemeMode, Theme> = {
+  dark: ATLAS_THEME_DARK,
+  light: ATLAS_THEME_LIGHT,
+};
+
+export function getAtlasGridTheme(mode: AtlasThemeMode): Theme {
+  return THEMES[mode];
 }

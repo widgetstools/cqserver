@@ -1,283 +1,426 @@
-"""Async TCP client for cqserver.
-
-Wire protocol: length-prefixed (u32 big-endian) JSON frames matching
-the `CqMessage` shape used by the Rust server. Schemes supported:
-- ``tcp://host:port``
-- ``ws://host:port/path``  (requires the ``websockets`` package)
-"""
+"""CQServer client over TCP (length-prefixed JSON frames)."""
 
 from __future__ import annotations
 
-import asyncio
-import dataclasses
-import itertools
 import json
+import queue
+import socket
 import struct
-import urllib.parse
-from typing import Any, AsyncIterator, Dict, List, Optional
+import threading
+import itertools
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+# Top bit of the u32 length prefix flags a zstd-compressed body. This SDK
+# advertises no compression, so the server never sets it; an inbound frame
+# with the flag set is therefore a protocol error.
+_COMPRESSED_FLAG = 0x80000000
+_MAX_FRAME = 16 * 1024 * 1024
+
+# Wire protocol versions this SDK understands (mirrors
+# cq_protocol::version::SUPPORTED_VERSIONS — kept conservative).
+SUPPORTED_VERSIONS = [1]
 
 
-class ClientError(Exception):
-    """Raised when the server returns an error ack or the connection drops."""
+class CqError(Exception):
+    """Raised for server-reported errors and protocol violations."""
 
 
-class DeltaKind:
-    ADD = "add"
-    UPDATE = "update"
-    REMOVE = "remove"
-    OOF = "oof"
-
-
-@dataclasses.dataclass
+@dataclass
 class Delta:
-    delta_type: str
+    """A single subscription update (snapshot row or live change)."""
+
+    delta_type: str  # "sow" (snapshot), "add", "update", "remove", ...
     sub_id: str
-    sequence: Optional[int]
     data: Dict[str, Any]
+    sequence: Optional[int] = None
+
+
+@dataclass
+class _Pending:
+    event: threading.Event = field(default_factory=threading.Event)
+    response: Optional[Dict[str, Any]] = None
 
 
 class Subscription:
-    """Iterable handle that yields deltas as they arrive."""
+    """Delivers snapshot rows then live deltas via a thread-safe queue."""
 
-    def __init__(self, sub_id: str, queue: "asyncio.Queue[Optional[Delta]]"):
+    def __init__(self, sub_id: str, cid: str):
         self.sub_id = sub_id
-        self._queue = queue
-        self._last_seq = 0
+        self.cid = cid
+        self._q: "queue.Queue[Delta]" = queue.Queue()
 
-    async def next_delta(self) -> Optional[Delta]:
-        d = await self._queue.get()
-        if d is None:
+    def _push(self, delta: Delta) -> None:
+        self._q.put(delta)
+
+    def next_delta(self, timeout: Optional[float] = None) -> Optional[Delta]:
+        """Block for the next delta. Returns None on timeout."""
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
             return None
-        if d.sequence is not None and d.sequence > self._last_seq:
-            self._last_seq = d.sequence
-        return d
 
-    def last_sequence(self) -> int:
-        return self._last_seq
-
-    def __aiter__(self) -> AsyncIterator[Delta]:
-        return self
-
-    async def __anext__(self) -> Delta:
-        d = await self.next_delta()
-        if d is None:
-            raise StopAsyncIteration
-        return d
+    def __iter__(self):
+        while True:
+            yield self._q.get()
 
 
 class Client:
-    """Async cqserver client.
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self._send_lock = threading.Lock()
+        self._cids = itertools.count(1)
+        self._protocol_version = 1
 
-    Use ``Client.connect(url)`` (an awaitable factory) instead of the
-    constructor directly.
-    """
-
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self._reader = reader
-        self._writer = writer
-        self._cid = itertools.count(1)
-        self._pending: Dict[str, asyncio.Future] = {}
-        self._subs: Dict[str, asyncio.Queue] = {}
+        # cid -> _Pending (RPC waiters: publish, logon, sow setup)
+        self._pending: Dict[str, _Pending] = {}
+        # cid -> Subscription, before the server assigns a sid (promoted on ack)
+        self._pending_subs: Dict[str, Subscription] = {}
+        # sid -> Subscription (live routing)
+        self._subs: Dict[str, Subscription] = {}
+        # cid -> list of snapshot rows (one-shot sow)
         self._snapshot_buffers: Dict[str, List[Dict[str, Any]]] = {}
-        self._snapshot_completions: Dict[str, asyncio.Future] = {}
+        # cid -> _Pending whose .response carries an optional error string
+        self._snapshot_done: Dict[str, _Pending] = {}
+        self._lock = threading.Lock()
+
         self._closed = False
-        self._reader_task = asyncio.create_task(self._read_loop())
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    # ---- connection -------------------------------------------------
+
     @classmethod
-    async def connect(cls, url: str) -> "Client":
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme == "tcp":
-            reader, writer = await asyncio.open_connection(
-                parsed.hostname, parsed.port
-            )
-            return cls(reader, writer)
-        if parsed.scheme in ("ws", "wss"):
-            raise NotImplementedError(
-                "WebSocket transport requires the optional 'websockets' "
-                "package; use tcp:// for now"
-            )
-        raise ClientError(f"unsupported scheme: {parsed.scheme!r}")
+    def connect(cls, host: str, port: int, timeout: float = 5.0) -> "Client":
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(None)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return cls(sock)
 
-    async def close(self) -> None:
+    @classmethod
+    def connect_url(cls, url: str, timeout: float = 5.0) -> "Client":
+        """Accepts `tcp://host:port`."""
+        if not url.startswith("tcp://"):
+            raise CqError(f"unsupported url (tcp:// only): {url}")
+        hostport = url[len("tcp://"):]
+        host, _, port = hostport.rpartition(":")
+        return cls.connect(host, int(port), timeout)
+
+    def close(self) -> None:
         self._closed = True
-        self._writer.close()
         try:
-            await self._writer.wait_closed()
-        except Exception:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
             pass
-        self._reader_task.cancel()
-        # Wake every pending future.
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(ClientError("connection closed"))
-        for q in list(self._subs.values()):
-            try:
-                q.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+        self._sock.close()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    async def logon(self, user: str, password: str) -> None:
-        await self._rpc(
-            {"c": "logon", "d": {"user": user, "password": password}}
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # ---- framing ----------------------------------------------------
+
+    def _send(self, msg: Dict[str, Any]) -> None:
+        body = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+        if len(body) > _MAX_FRAME:
+            raise CqError(f"frame too large: {len(body)} bytes")
+        header = struct.pack(">I", len(body))
+        with self._send_lock:
+            self._sock.sendall(header + body)
+
+    def _recv_exact(self, n: int) -> Optional[bytes]:
+        chunks = []
+        got = 0
+        while got < n:
+            b = self._sock.recv(n - got)
+            if not b:
+                return None
+            chunks.append(b)
+            got += len(b)
+        return b"".join(chunks)
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                header = self._recv_exact(4)
+                if header is None:
+                    break
+                raw = struct.unpack(">I", header)[0]
+                if raw & _COMPRESSED_FLAG:
+                    raise CqError("received compressed frame but no codec negotiated")
+                length = raw & ~_COMPRESSED_FLAG
+                if length > _MAX_FRAME:
+                    raise CqError(f"frame too large: {length}")
+                payload = self._recv_exact(length)
+                if payload is None:
+                    break
+                msg = json.loads(payload.decode("utf-8"))
+                self._dispatch(msg)
+        except (OSError, CqError):
+            pass
+        finally:
+            # Wake any blocked waiters so they don't hang forever.
+            self._fail_all_waiters()
+
+    def _fail_all_waiters(self) -> None:
+        with self._lock:
+            for p in self._pending.values():
+                p.event.set()
+            for p in self._snapshot_done.values():
+                p.response = "connection closed"
+                p.event.set()
+
+    # ---- dispatch ---------------------------------------------------
+
+    def _dispatch(self, msg: Dict[str, Any]) -> None:
+        cmd = msg.get("c")
+        if cmd == "ack":
+            self._on_ack(msg)
+        elif cmd == "sow":
+            self._on_sow_row(msg)
+        elif cmd == "sow_batch":
+            self._on_sow_batch(msg)
+        elif cmd == "group_end":
+            self._on_group_end(msg)
+        elif cmd == "publish":
+            self._on_delta(msg)
+        # group_begin / heartbeat / schema_change: nothing to do here.
+
+    def _on_ack(self, msg: Dict[str, Any]) -> None:
+        cid = msg.get("cid")
+        sid = msg.get("sid")
+        # Promote a pre-registered subscription into the live routing map.
+        if cid is not None and sid is not None:
+            with self._lock:
+                sub = self._pending_subs.pop(cid, None)
+                if sub is not None:
+                    sub.sub_id = sid
+                    self._subs[sid] = sub
+        if cid is not None:
+            # Error ack for an in-flight SOW: no group_end will arrive.
+            if msg.get("s") == "error":
+                with self._lock:
+                    p = self._snapshot_done.pop(cid, None)
+                if p is not None:
+                    p.response = msg.get("r") or "server error"
+                    p.event.set()
+            with self._lock:
+                p = self._pending.pop(cid, None)
+            if p is not None:
+                p.response = msg
+                p.event.set()
+
+    def _on_sow_row(self, msg: Dict[str, Any]) -> None:
+        sid = msg.get("sid")
+        data = msg.get("d")
+        if sid is None or not isinstance(data, dict):
+            return
+        with self._lock:
+            buf = self._snapshot_buffers.get(sid)
+            sub = self._subs.get(sid)
+        if buf is not None:
+            buf.append(data)
+        if sub is not None:
+            sub._push(Delta("sow", sid, data, msg.get("seq")))
+
+    def _on_sow_batch(self, msg: Dict[str, Any]) -> None:
+        sid = msg.get("sid")
+        rows = msg.get("d")
+        if sid is None or not isinstance(rows, list):
+            return
+        with self._lock:
+            buf = self._snapshot_buffers.get(sid)
+            sub = self._subs.get(sid)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if buf is not None:
+                buf.append(row)
+            if sub is not None:
+                sub._push(Delta("sow", sid, row, None))
+
+    def _on_group_end(self, msg: Dict[str, Any]) -> None:
+        sid = msg.get("sid")
+        if sid is None:
+            return
+        with self._lock:
+            p = self._snapshot_done.pop(sid, None)
+        if p is not None:
+            p.response = None  # success
+            p.event.set()
+
+    def _on_delta(self, msg: Dict[str, Any]) -> None:
+        sid = msg.get("sid")
+        if sid is None:
+            return
+        with self._lock:
+            sub = self._subs.get(sid)
+        if sub is None:
+            return
+        data = msg.get("d")
+        sub._push(
+            Delta(
+                delta_type=msg.get("dt") or "update",
+                sub_id=sid,
+                data=data if isinstance(data, dict) else {},
+                sequence=msg.get("seq"),
+            )
         )
 
-    async def publish(self, topic: str, data: Dict[str, Any]) -> int:
-        resp = await self._rpc({"c": "publish", "t": topic, "d": data})
-        return int(resp.get("seq", 0))
+    # ---- helpers ----------------------------------------------------
 
-    async def sow(
-        self, topic: str, filter: Optional[str] = None
+    def _next_cid(self) -> str:
+        return str(next(self._cids))
+
+    def _rpc(self, msg: Dict[str, Any], timeout: float = 5.0) -> Dict[str, Any]:
+        cid = msg.get("cid") or self._next_cid()
+        msg["cid"] = cid
+        p = _Pending()
+        with self._lock:
+            self._pending[cid] = p
+        self._send(msg)
+        if not p.event.wait(timeout):
+            with self._lock:
+                self._pending.pop(cid, None)
+            raise CqError("timed out waiting for ack")
+        resp = p.response
+        if resp is None:
+            raise CqError("connection closed")
+        if resp.get("s") == "error":
+            raise CqError(resp.get("r") or "server error")
+        return resp
+
+    # ---- API --------------------------------------------------------
+
+    @property
+    def protocol_version(self) -> int:
+        return self._protocol_version
+
+    def logon(
+        self,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        token: Optional[str] = None,
+        client_name: Optional[str] = None,
+    ) -> int:
+        """Authenticate and negotiate the protocol version.
+
+        With no credentials this is an anonymous handshake (works when the
+        server has auth disabled). Returns the negotiated protocol version.
+        """
+        msg: Dict[str, Any] = {"c": "logon", "pv": SUPPORTED_VERSIONS}
+        creds: Dict[str, Any] = {}
+        if token is not None:
+            creds["token"] = token
+        elif user is not None:
+            creds["user"] = user
+            creds["password"] = password or ""
+        if creds:
+            msg["d"] = creds
+        if client_name is not None:
+            msg["client"] = client_name
+        resp = self._rpc(msg)
+        pv = resp.get("pv")
+        if isinstance(pv, list) and pv:
+            self._protocol_version = pv[0]
+        return self._protocol_version
+
+    def publish(self, topic: str, data: Dict[str, Any], timeout: float = 5.0) -> int:
+        """Publish/upsert a record. Returns the assigned sequence."""
+        resp = self._rpc({"c": "publish", "t": topic, "d": data}, timeout)
+        return int(resp.get("seq") or 0)
+
+    def delta_publish(self, topic: str, data: Dict[str, Any], timeout: float = 5.0) -> int:
+        """Sparse update: merge `data` (key + changed fields) into the row."""
+        resp = self._rpc({"c": "delta_publish", "t": topic, "d": data}, timeout)
+        return int(resp.get("seq") or 0)
+
+    def sow(
+        self,
+        topic: str,
+        filter: Optional[str] = None,
+        timeout: float = 10.0,
     ) -> List[Dict[str, Any]]:
+        """One-shot SOW query. Returns the snapshot rows."""
         cid = self._next_cid()
-        self._snapshot_buffers[cid] = []
-        loop = asyncio.get_running_loop()
-        done = loop.create_future()
-        self._snapshot_completions[cid] = done
-
-        msg = {"c": "sow", "cid": cid, "t": topic}
+        done = _Pending()
+        with self._lock:
+            self._snapshot_buffers[cid] = []
+            self._snapshot_done[cid] = done
+        msg: Dict[str, Any] = {"c": "sow", "cid": cid, "t": topic}
         if filter is not None:
             msg["f"] = filter
-        await self._send(msg)
-
-        try:
-            await done
-        finally:
+        self._send(msg)
+        if not done.event.wait(timeout):
+            with self._lock:
+                self._snapshot_buffers.pop(cid, None)
+                self._snapshot_done.pop(cid, None)
+            raise CqError("timed out waiting for SOW group_end")
+        with self._lock:
             rows = self._snapshot_buffers.pop(cid, [])
-            self._snapshot_completions.pop(cid, None)
+        if done.response is not None:
+            raise CqError(done.response)
         return rows
 
-    async def subscribe(
-        self, topic: str, filter: Optional[str] = None
-    ) -> Subscription:
-        return await self._subscribe("subscribe", topic, filter, None)
+    def sow_sql(self, topic: str, sql: str, timeout: float = 10.0) -> List[Dict[str, Any]]:
+        """Run an arbitrary SOW SQL query (GROUP BY / aggregates)."""
+        cid = self._next_cid()
+        done = _Pending()
+        with self._lock:
+            self._snapshot_buffers[cid] = []
+            self._snapshot_done[cid] = done
+        self._send({"c": "sow", "cid": cid, "t": topic, "sql": sql})
+        if not done.event.wait(timeout):
+            with self._lock:
+                self._snapshot_buffers.pop(cid, None)
+                self._snapshot_done.pop(cid, None)
+            raise CqError("timed out waiting for SOW group_end")
+        with self._lock:
+            rows = self._snapshot_buffers.pop(cid, [])
+        if done.response is not None:
+            raise CqError(done.response)
+        return rows
 
-    async def sow_and_subscribe(
+    def sow_and_subscribe(
         self,
         topic: str,
         filter: Optional[str] = None,
         bookmark: Optional[int] = None,
     ) -> Subscription:
-        return await self._subscribe("sow_and_subscribe", topic, filter, bookmark)
-
-    async def delta_subscribe(
-        self, topic: str, filter: Optional[str] = None
-    ) -> Subscription:
-        return await self._subscribe("delta_subscribe", topic, filter, None)
-
-    async def _subscribe(
-        self,
-        command: str,
-        topic: str,
-        filter: Optional[str],
-        bookmark: Optional[int],
-    ) -> Subscription:
-        msg: Dict[str, Any] = {"c": command, "t": topic}
+        """Snapshot + continuous deltas. Snapshot rows arrive as deltas with
+        delta_type == "sow"; live changes as "add"/"update"/"remove"."""
+        cid = self._next_cid()
+        sub = Subscription(sub_id="", cid=cid)
+        with self._lock:
+            self._pending_subs[cid] = sub
+        msg: Dict[str, Any] = {"c": "sow_and_subscribe", "cid": cid, "t": topic}
         if filter is not None:
             msg["f"] = filter
         if bookmark is not None:
             msg["bm"] = bookmark
-        resp = await self._rpc(msg)
-        sub_id = resp.get("sid")
-        if not sub_id:
-            raise ClientError("server did not assign a sub_id")
-        q: asyncio.Queue = asyncio.Queue()
-        self._subs[sub_id] = q
-        return Subscription(sub_id, q)
+        self._send(msg)
+        return sub
 
-    async def unsubscribe(self, sub_id: str) -> None:
-        await self._rpc({"c": "unsubscribe", "sid": sub_id})
-        self._subs.pop(sub_id, None)
-
-    async def sow_delete(self, topic: str, key: str) -> int:
-        resp = await self._rpc(
-            {"c": "sow_delete", "t": topic, "d": {"key": key}}
-        )
-        return int(resp.get("seq", 0))
-
-    async def heartbeat(self) -> None:
-        await self._rpc({"c": "heartbeat"})
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-    def _next_cid(self) -> str:
-        return f"c-{next(self._cid)}"
-
-    async def _rpc(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+    def subscribe(
+        self,
+        topic: str,
+        filter: Optional[str] = None,
+    ) -> Subscription:
+        """Live deltas only (no initial snapshot)."""
         cid = self._next_cid()
-        msg["cid"] = cid
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending[cid] = fut
-        await self._send(msg)
-        try:
-            resp = await fut
-        finally:
-            self._pending.pop(cid, None)
-        if resp.get("s") == "error":
-            raise ClientError(resp.get("r", "server error"))
-        return resp
+        sub = Subscription(sub_id="", cid=cid)
+        with self._lock:
+            self._pending_subs[cid] = sub
+        msg: Dict[str, Any] = {"c": "subscribe", "cid": cid, "t": topic}
+        if filter is not None:
+            msg["f"] = filter
+        self._send(msg)
+        return sub
 
-    async def _send(self, msg: Dict[str, Any]) -> None:
-        body = json.dumps(msg, separators=(",", ":")).encode("utf-8")
-        self._writer.write(struct.pack(">I", len(body)) + body)
-        await self._writer.drain()
-
-    async def _read_loop(self) -> None:
-        try:
-            while not self._closed:
-                hdr = await self._reader.readexactly(4)
-                (length,) = struct.unpack(">I", hdr)
-                body = await self._reader.readexactly(length)
-                msg = json.loads(body)
-                self._dispatch(msg)
-        except asyncio.IncompleteReadError:
-            pass
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._closed = True
-
-    def _dispatch(self, msg: Dict[str, Any]) -> None:
-        cmd = msg.get("c")
-        cid = msg.get("cid")
-        sid = msg.get("sid")
-        if cmd == "ack":
-            if cid and cid in self._pending:
-                fut = self._pending.get(cid)
-                if fut and not fut.done():
-                    fut.set_result(msg)
-            return
-        if cmd == "sow" and sid and sid in self._snapshot_buffers:
-            data = msg.get("d") or {}
-            if isinstance(data, dict):
-                self._snapshot_buffers[sid].append(data)
-            return
-        if cmd == "group_end" and sid and sid in self._snapshot_completions:
-            fut = self._snapshot_completions[sid]
-            if not fut.done():
-                fut.set_result(None)
-            return
-        if cmd == "group_begin":
-            return
-        if cmd == "publish" and sid:
-            q = self._subs.get(sid)
-            if q is not None:
-                q.put_nowait(
-                    Delta(
-                        delta_type=msg.get("dt", "update"),
-                        sub_id=sid,
-                        sequence=msg.get("seq"),
-                        data=msg.get("d") or {},
-                    )
-                )
-            return
-        if cmd == "heartbeat":
-            return
-        # Anything else is informational — silently drop.
+    def unsubscribe(self, sub: Subscription) -> None:
+        if sub.sub_id:
+            self._send({"c": "unsubscribe", "sid": sub.sub_id})
+            with self._lock:
+                self._subs.pop(sub.sub_id, None)

@@ -44,7 +44,7 @@ function KeyBadge({ children }: { children: string }) {
   return (
     <span
       style={{
-        background: 'rgba(255,255,255,.06)',
+        background: 'var(--atlas-key-badge-bg)',
         padding: '1px 6px',
         borderRadius: 4,
         letterSpacing: '.04em',
