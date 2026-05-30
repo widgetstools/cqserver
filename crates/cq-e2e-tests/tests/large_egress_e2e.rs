@@ -56,7 +56,28 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// Connect with a few retries — at thousands of simultaneous subscribers a
+/// burst of SYNs can exceed the OS listen backlog and get refused; a short
+/// backoff lets the accept loop drain.
+async fn connect_retry(url: &str) -> Client {
+    let mut last = None;
+    for attempt in 0..6u32 {
+        match Client::connect(url).await {
+            Ok(c) => return c,
+            Err(e) => {
+                last = Some(format!("{e:?}"));
+                tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt + 1))).await;
+            }
+        }
+    }
+    panic!("connect failed after retries: {last:?}");
+}
+
+// Scales to thousands of subscribers (each connects in parallel below). At
+// high connection counts shrink the per-connection payload, e.g.:
+//   CQ_EGRESS_SUBS=5000 CQ_EGRESS_ROWS=200 cargo test --release \
+//     -p cq-e2e-tests --test large_egress_e2e -- --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_sow_egress_to_many_subscribers_is_complete() {
     let rows_n = env_usize("CQ_EGRESS_ROWS", 50_000);
     let subs_n = env_usize("CQ_EGRESS_SUBS", 10);
@@ -97,7 +118,7 @@ async fn large_sow_egress_to_many_subscribers_is_complete() {
     for s in 0..subs_n {
         let url = url.clone();
         handles.push(tokio::spawn(async move {
-            let c = Client::connect(&url).await.expect("connect subscriber");
+            let c = connect_retry(&url).await;
             let t = Instant::now();
             let rows = c.sow("/egress", None).await.expect("sow");
             (s, rows.len(), t.elapsed())

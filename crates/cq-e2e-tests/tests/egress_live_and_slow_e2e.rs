@@ -57,6 +57,53 @@ async fn flood(c: &Client, topic: &str, n: usize, batch: usize) -> Duration {
     t.elapsed()
 }
 
+/// Connect with a few retries — at thousands of subscribers a burst of
+/// simultaneous SYNs can exceed the OS listen backlog and get refused/reset;
+/// a short backoff lets the accept loop drain.
+async fn connect_retry(url: &str) -> Client {
+    let mut last = None;
+    for attempt in 0..6u32 {
+        match Client::connect(url).await {
+            Ok(c) => return c,
+            Err(e) => {
+                last = Some(format!("{e:?}"));
+                tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt + 1))).await;
+            }
+        }
+    }
+    panic!("connect failed after retries: {last:?}");
+}
+
+/// Connect + `subscribe` (live-only) `n` subscribers, established in paced
+/// parallel waves so thousands of connections set up in a few seconds without
+/// overflowing the accept backlog (the existing 10k stress test paces the
+/// same way).
+async fn establish_subscribers(url: &str, topic: &str, n: usize) -> Vec<(Client, Subscription)> {
+    const WAVE: usize = 200;
+    let mut out = Vec::with_capacity(n);
+    let mut done = 0usize;
+    while done < n {
+        let this = (n - done).min(WAVE);
+        let mut handles = Vec::with_capacity(this);
+        for _ in 0..this {
+            let url = url.to_string();
+            let topic = topic.to_string();
+            handles.push(tokio::spawn(async move {
+                let c = connect_retry(&url).await;
+                let sub = c.subscribe(&topic, None).await.expect("subscribe");
+                (c, sub)
+            }));
+        }
+        for h in handles {
+            out.push(h.await.expect("establish"));
+        }
+        done += this;
+        // Let the server's accept loop breathe between waves.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    out
+}
+
 /// Drain live (non-snapshot) deltas until `target` are seen or `quiet`
 /// elapses without one. Returns how many live deltas arrived.
 async fn drain_live(sub: &mut Subscription, target: usize, quiet: Duration) -> usize {
@@ -77,7 +124,12 @@ async fn drain_live(sub: &mut Subscription, target: usize, quiet: Duration) -> u
 
 // ───────────────────────── 1. live delta egress ─────────────────────────
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// 8 worker threads + parallel connection setup so this scales to thousands
+// of subscribers. To run at high connection counts, shrink the per-connection
+// payload and run release, e.g.:
+//   CQ_DELTA_SUBS=5000 CQ_DELTA_N=200 cargo test --release -p cq-e2e-tests \
+//     --test egress_live_and_slow_e2e high_rate -- --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn high_rate_live_delta_egress_reaches_every_subscriber() {
     let deltas_n = env_usize("CQ_DELTA_N", 20_000);
     let subs_n = env_usize("CQ_DELTA_SUBS", 8);
@@ -93,11 +145,11 @@ async fn high_rate_live_delta_egress_reaches_every_subscriber() {
     .await;
     let url = server.tcp_url();
 
-    // N live-only subscribers, each draining in its own task.
+    // Establish all subscribers in parallel (sequential connect+subscribe
+    // RPCs don't scale to thousands), then hand each off to a drain task.
+    let established = establish_subscribers(&url, "/stream", subs_n).await;
     let mut tasks = Vec::with_capacity(subs_n);
-    for sidx in 0..subs_n {
-        let c = Client::connect(&url).await.expect("connect sub");
-        let mut sub = c.subscribe("/stream", None).await.expect("subscribe");
+    for (sidx, (c, mut sub)) in established.into_iter().enumerate() {
         tasks.push(tokio::spawn(async move {
             let _hold = c; // keep the connection alive for the task's life
             let got = drain_live(&mut sub, deltas_n, Duration::from_secs(5)).await;
@@ -184,7 +236,7 @@ async fn topic_sub_count(server: &ServerHandle, topic: &str) -> usize {
         .count()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn slow_consumer_disconnects_under_flood_while_fast_subs_keep_up() {
     let flood_n = env_usize("CQ_FLOOD_N", 40_000);
     let fast_n = env_usize("CQ_FAST_SUBS", 3);
@@ -204,11 +256,13 @@ async fn slow_consumer_disconnects_under_flood_while_fast_subs_keep_up() {
     .await;
     let url = server.tcp_url();
 
-    // Fast subscribers (live-only), draining in tasks.
+    // Fast subscribers (live-only), established in parallel, draining in tasks.
     let mut fast = Vec::with_capacity(fast_n);
-    for sidx in 0..fast_n {
-        let c = Client::connect(&url).await.expect("connect fast");
-        let mut sub = c.subscribe("/flood", None).await.expect("subscribe");
+    for (sidx, (c, mut sub)) in establish_subscribers(&url, "/flood", fast_n)
+        .await
+        .into_iter()
+        .enumerate()
+    {
         fast.push(tokio::spawn(async move {
             let _hold = c;
             (sidx, drain_live(&mut sub, flood_n, Duration::from_secs(6)).await)
