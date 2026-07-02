@@ -1035,20 +1035,35 @@ the demo audit even though the server had already failed in <50ms.
 | **After R13 (SDK error routing + JOIN demo fixups)** | **28/28** | **100%** |
 
 ### Known engine limitations (not blocking the demo)
-The library is now AMPS-compliant end-to-end, but there are still
-engine shapes the demo had to work around rather than triggering:
-- `HAVING <agg>` where `<agg>` is not also in `SELECT` — works in AMPS,
-  fails in cqserver with "HAVING references an aggregate not in
-  SELECT". Demo uses the trivial workaround of putting the aggregate
-  in SELECT.
-- Scalar functions in `ORDER BY` (`ORDER BY ABS(col) DESC`) — not
-  accepted; demo orders by the underlying column or by a SELECT alias.
+The library is now AMPS-compliant end-to-end. Status of the shapes the
+demo originally had to work around (updated by production-readiness
+task 1.4):
+- **Scalar-over-aggregate projection** (`NULLIF(SUM(qty),0)`,
+  `SUM(x)/NULLIF(SUM(y),0) AS vwap`) — **IMPLEMENTED** (task 1.4). A
+  post-aggregate projection layer (`PostAggExpr` / `post_agg` on
+  `ParsedQuery`) evaluates scalar functions + arithmetic over the
+  finalised aggregate output row. Nested aggregate calls are registered
+  as hidden aggregates (`__postagg_*`, stripped before emit) and
+  referenced by alias. Covered by
+  `r4_coalesce_nullif.rs::nullif_after_aggregate` (un-ignored) +
+  `vwap_over_aggregates_nonzero_denominator` and query.rs unit tests.
 - Scalar functions in `SELECT` projection (`SELECT ABS(col) AS x`) —
-  not accepted yet; demo computes derived values client-side or via
-  the existing aggregate paths.
+  **IMPLEMENTED** (task 1.4). `ABS/ROUND/FLOOR/CEIL` are now
+  first-class in the SELECT scalar path alongside `COALESCE/NULLIF`.
+  Probe: `r_series_scalar_gaps.rs::scalar_fn_in_select_projection`.
+- `HAVING <agg>` where `<agg>` is not also in `SELECT` — **CLEAN-REJECT**
+  (unchanged; decision recorded task 1.4). Errors with "HAVING
+  references an aggregate not in SELECT"; the workaround is to put the
+  aggregate in SELECT (which also enables the post-agg layer above).
+  Probe: `r_series_scalar_gaps.rs::having_on_aggregate_not_in_select_errors_cleanly`.
+- Scalar functions in `ORDER BY` (`ORDER BY ABS(col) DESC`) —
+  **CLEAN-REJECT** (decision recorded task 1.4). Rejected with an
+  unknown-column parse error; the workaround is to `ORDER BY` a SELECT
+  alias. Probe: `r_series_scalar_gaps.rs::scalar_fn_in_order_by`.
 
-These three are good follow-up R-series candidates if the user wants
-to keep climbing toward 99% AMPS.
+The two clean-reject shapes are safe (no hang, no wrong answer) and are
+good follow-up candidates if the user wants to keep climbing toward 99%
+AMPS.
 
 ### Validation
 - Workspace: **707 passed, 0 failed, 7 ignored** (was 661 before
