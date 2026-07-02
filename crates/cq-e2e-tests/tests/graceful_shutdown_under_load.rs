@@ -85,6 +85,14 @@ const ROWS_PER_PUBLISHER: usize = 2_000;
 /// racing to stop as soon as a handful of early acks land.
 const SIGTERM_DELAY: Duration = Duration::from_millis(400);
 
+// Timing-sensitive stress test: spawns 128 publisher connections + 150
+// fan-out subscriptions and races a SIGTERM against in-flight publishes.
+// On a heavily-loaded machine the ramp/ack timing can flake, so it runs
+// in the gated nightly lane (scripts/nightly-tests.sh) rather than the
+// per-PR default lane. The durability property it proves is unchanged;
+// only its scheduling moved. Run locally with:
+//   cargo test -p cq-e2e-tests --test graceful_shutdown_under_load -- --ignored
+#[ignore = "stress/timing-sensitive; gated in the nightly lane"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn graceful_shutdown_under_load_loses_no_acked_rows() {
     let topic = TopicSpec::new("/load", "k")

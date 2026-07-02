@@ -107,6 +107,7 @@ TESTS=(
     "bench_wide_ingest_c|cq-e2e-tests|bench_wide_ingest|bench_c_wide_no_views_4conn"
     "loadgen_scenario_h|cq-e2e-tests|loadgen_scenarios|scenario_h_publish_batch_vs_sequential_smoke"
     "loadgen_scenario_i|cq-e2e-tests|loadgen_scenarios|scenario_i_schema_evolution_under_load_smoke"
+    "graceful_shutdown_under_load|cq-e2e-tests|graceful_shutdown_under_load|graceful_shutdown_under_load_loses_no_acked_rows"
 )
 if [ "$NIGHTLY_SOAK" = "1" ]; then
     TESTS+=("active_set_bounds_soak|cq-core|active_set_bounds|soak_active_set_stays_bounded_under_1h_churn")
