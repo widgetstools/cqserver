@@ -121,6 +121,11 @@ pub enum CodecError {
     FixEncode(String),
     #[error("fix decode: {0}")]
     FixDecode(String),
+    /// Wire-layer DoS guard (A8/E12): the raw payload's `{`/`[`
+    /// nesting depth exceeds `crate::depth_guard::MAX_WIRE_JSON_DEPTH`
+    /// before we even attempt to parse it. See `crate::depth_guard`.
+    #[error("nesting depth exceeds {0}")]
+    NestingTooDeep(usize),
 }
 
 impl Codec {
@@ -146,7 +151,19 @@ impl Codec {
 
     pub fn decode(self, bytes: &[u8]) -> Result<CqMessage, CodecError> {
         match self {
-            Codec::Json => Ok(serde_json::from_slice(bytes)?),
+            Codec::Json => {
+                // A8/E12 — bound JSON nesting BEFORE handing bytes to
+                // serde_json. This is a cheap linear byte scan (no
+                // parsing, no allocation) so a deeply-nested payload
+                // never reaches decoder recursion. See
+                // `crate::depth_guard`.
+                if crate::depth_guard::json_depth_exceeds_default(bytes) {
+                    return Err(CodecError::NestingTooDeep(
+                        crate::depth_guard::MAX_WIRE_JSON_DEPTH,
+                    ));
+                }
+                Ok(serde_json::from_slice(bytes)?)
+            }
             Codec::MessagePack => Ok(rmp_serde::from_slice(bytes)?),
             Codec::Bson => {
                 let doc = bson::Document::from_reader(&mut std::io::Cursor::new(bytes))
@@ -245,7 +262,12 @@ fn decode_fix_envelope(bytes: &[u8]) -> Result<CqMessage, String> {
         out.status = serde_json::from_value::<Status>(v).ok();
     }
     if let Some(s) = map.get("5002").and_then(|v| v.as_str()) {
-        out.data = serde_json::from_str(s).ok();
+        // A8/E12 — same wire-nesting guard as the JSON codec; tag
+        // 5002 carries a JSON-stringified `data` payload, so it's
+        // subject to the same decode-recursion risk.
+        if !crate::depth_guard::json_depth_exceeds_default(s.as_bytes()) {
+            out.data = serde_json::from_str(s).ok();
+        }
     }
     Ok(out)
 }

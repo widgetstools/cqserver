@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod command;
 pub mod compression;
+pub mod depth_guard;
 pub mod fix;
 pub mod message;
 pub mod nvfix;

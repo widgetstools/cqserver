@@ -576,6 +576,7 @@ dependencies = [
  "cq-client",
  "cq-loadgen",
  "cq-protocol",
+ "futures-util",
  "jsonwebtoken",
  "libc",
  "rcgen",
@@ -584,6 +585,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "urlencoding",
 ]
 

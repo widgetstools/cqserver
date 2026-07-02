@@ -29,6 +29,10 @@ bytes = "1"
 # aws-lc-rs backend to match the rustls provider the rest of the
 # workspace uses.
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
+# For tests that need a raw WebSocket connection (bypassing the SDK)
+# to exercise wire-level behaviour on the WS text-frame path.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 # For tests that need to deliver a real SIGTERM to the child server
 # (graceful shutdown). std::process::Child::kill is SIGKILL on Unix
