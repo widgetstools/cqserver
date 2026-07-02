@@ -72,7 +72,7 @@ AMPS exposes a SQL-92-flavoured **content-filtering and projection language** th
 |---|---|---|
 | `ORDER BY col ASC/DESC` | ✓ | ✓ |
 | `ORDER BY <select-alias>` matching a base column | ✓ | ✓ |
-| `ORDER BY <select-alias>` NOT matching a base column | ✓ | ✗ **hangs the SOW encoder** |
+| `ORDER BY <select-alias>` NOT matching a base column | ✓ | ✓ (R1; resolves the alias, else clean error — no longer hangs) |
 | `ORDER BY <function expression>` (e.g. `ABS(x)`) | ✓ | ✗ |
 | `LIMIT n` / `TOP n` | ✓ | ✓ |
 | `OFFSET n` | ✓ | ✗ |
