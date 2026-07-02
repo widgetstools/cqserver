@@ -20,7 +20,10 @@
 use cq_client::Client;
 use cq_e2e_tests::{restart_kept, start_server_with, stop_keeping_dir, ServerOpts, TopicSpec};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 
 fn persistent_topic(name: &str) -> TopicSpec {
     TopicSpec::new(name, "k")
@@ -34,6 +37,21 @@ fn checkpoint_opts() -> ServerOpts {
         // ~4 KiB segments: a handful of publishes seals a segment, so a
         // few thousand publishes over the run rotate through many.
         txlog_segment_size: Some(4096),
+        txlog_snapshot_reclaim: true,
+        txlog_checkpoint_interval_secs: 1,
+        ..ServerOpts::default()
+    }
+}
+
+/// Tiny segments so each publish nearly rotates the log: this widens the
+/// straddle window (a checkpoint that samples segment `A` will, during its
+/// snapshot fsync, almost certainly see the active publisher rotate `A →
+/// A+1`), which is what makes the crash test reliably catch a `u64::MAX`
+/// reclaim cutoff deleting the straddling segment.
+fn crash_checkpoint_opts() -> ServerOpts {
+    ServerOpts {
+        // ~256 B segments: one or two publishes rotate a segment.
+        txlog_segment_size: Some(256),
         txlog_snapshot_reclaim: true,
         txlog_checkpoint_interval_secs: 1,
         ..ServerOpts::default()
@@ -172,57 +190,102 @@ async fn periodic_checkpoint_bounds_txlog_while_serving() {
     let _ = server.send_sigterm_and_wait(Duration::from_secs(10));
 }
 
+/// The load-bearing crash-safety test, hardened to catch the
+/// straddling-segment data-loss race in the periodic reclaim.
+///
+/// The earlier version quiesced (a 1300ms sleep) before SIGKILL, letting a
+/// final checkpoint re-snapshot everything and MASK the bug. This version
+/// keeps a publisher ACTIVELY publishing (distinct keys → constant rotation)
+/// and SIGKILLs in the window immediately after a reclaim that ran *during*
+/// active publishing — i.e. while a segment straddling the checkpoint's
+/// `snapshot.sequence` exists on disk. Then it restarts on the same dir and
+/// asserts EVERY key the server acked is present.
+///
+/// Against the old `u64::MAX` reclaim cutoff the checkpoint prunes the
+/// straddling segment, so the sequences appended into its tail after the
+/// snapshot are lost → this test FAILS. Against the `snapshot.segment_id`
+/// cutoff the straddling segment is retained → all acked rows recover.
 #[tokio::test]
 async fn periodic_checkpoint_reclaim_is_crash_safe() {
-    let server = start_server_with(vec![persistent_topic("/ckpt-crash")], checkpoint_opts()).await;
-    let client = Client::connect(&server.tcp_url()).await.unwrap();
+    let server =
+        start_server_with(vec![persistent_topic("/ckpt-crash")], crash_checkpoint_opts()).await;
     let admin_url = server.admin_url();
+    let tcp_url = server.tcp_url();
 
-    // Publish a KNOWN, fully-distinct set so recovery is exactly
-    // checkable — every key must survive. Distinct keys also force the
-    // log to keep growing (SOW == full history) so many segments seal
-    // and get reclaimed.
-    let total_keys = 3000i64;
-    for i in 0..total_keys {
-        client
-            .publish("/ckpt-crash", json!({ "k": format!("k{i:05}"), "v": i }))
-            .await
-            .unwrap();
+    // Shared record of every key the server ACKED, keyed by the ack
+    // sequence the publish returned. Only acked keys are asserted on
+    // recovery — an ack is the server's durability promise.
+    let acked: Arc<AsyncMutex<Vec<(u64, String)>>> = Arc::new(AsyncMutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Several concurrent publishers of fully-distinct keys: SOW == full
+    // history, so the log keeps rotating (segments keep sealing) right up to
+    // the crash, and there is ALWAYS in-flight publishing during a
+    // checkpoint's snapshot fsync — guaranteeing the sampled segment
+    // straddles the snapshot's sequence.
+    let mut publishers = Vec::new();
+    for shard in 0..4u32 {
+        let pub_acked = acked.clone();
+        let pub_stop = stop.clone();
+        let pub_url = tcp_url.clone();
+        publishers.push(tokio::spawn(async move {
+            let client = Client::connect(&pub_url).await.unwrap();
+            let mut i: u64 = 0;
+            while !pub_stop.load(Ordering::Relaxed) {
+                // Disjoint keyspaces per shard so keys stay globally unique.
+                let key = format!("s{shard}-k{i:07}");
+                match client
+                    .publish("/ckpt-crash", json!({ "k": key, "v": i }))
+                    .await
+                {
+                    Ok(seq) => pub_acked.lock().await.push((seq, key)),
+                    // A publish that errors (socket died at kill time) was
+                    // NOT acked — do not record it. Stop this shard.
+                    Err(_) => break,
+                }
+                i += 1;
+            }
+        }));
     }
 
-    // Wait until at least one periodic checkpoint has reclaimed
-    // segments, so the crash happens AFTER a reclaim (the scenario under
-    // test). Interval is 1s; give it up to ~8s.
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // Wait until SEVERAL periodic checkpoints have reclaimed segments WHILE
+    // the publishers are still running — each such reclaim is a window in
+    // which a straddling segment could be (wrongly) deleted. Requiring a few
+    // cycles makes the race reliably reproduce. Interval is 1s; up to ~12s.
+    let deadline = Instant::now() + Duration::from_secs(12);
     let mut reclaimed = 0u64;
     while Instant::now() < deadline {
         reclaimed = reclaimed_total(&admin_url).await;
-        if reclaimed > 0 {
+        if reclaimed >= 5 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        reclaimed > 0,
-        "a periodic checkpoint must have reclaimed segments before the crash"
+        reclaimed >= 5,
+        "several periodic checkpoints must have reclaimed segments while \
+         publishing (got {reclaimed})"
+    );
+    let checkpoints = checkpoint_total(&admin_url).await;
+    assert!(checkpoints > 0, "a checkpoint fired (got {checkpoints})");
+
+    // CRASH NOW, mid-flight: stop the publishers, snapshot the acked set,
+    // and SIGKILL immediately with NO grace period — so no quiescent
+    // checkpoint can re-snapshot a straddling tail and mask a lost segment.
+    // Keep the post-stop work minimal (no network round-trips) so the kill
+    // lands well inside the 1s checkpoint interval.
+    stop.store(true, Ordering::Relaxed);
+    for p in publishers {
+        let _ = p.await;
+    }
+    let expected = acked.lock().await.clone();
+    assert!(
+        expected.len() >= 500,
+        "publishers acked a meaningful number of rows before the crash (got {})",
+        expected.len()
     );
 
-    // A few post-checkpoint publishes land in the surviving tail — these
-    // exercise "snapshot + tail replay", the part that must reproduce
-    // rows a reclaimed segment can no longer supply.
-    for i in total_keys..(total_keys + 200) {
-        client
-            .publish("/ckpt-crash", json!({ "k": format!("k{i:05}"), "v": i }))
-            .await
-            .unwrap();
-    }
-    let published = total_keys + 200;
-    // Let the tail fsync land, then also let one more checkpoint run so
-    // the crash can land mid/after another reclaim cycle.
-    tokio::time::sleep(Duration::from_millis(1300)).await;
-    drop(client);
-
-    // CRASH: SIGKILL (stop_keeping_dir uses child.kill()), keep the dir.
+    // SIGKILL (stop_keeping_dir uses child.kill()), keep the dir.
     let kept = stop_keeping_dir(server).await;
 
     // Restart on the SAME on-disk state: snapshot.bin + surviving tail
@@ -231,20 +294,37 @@ async fn periodic_checkpoint_reclaim_is_crash_safe() {
     let server2 = restart_kept(kept).await;
     let client2 = Client::connect(&server2.tcp_url()).await.unwrap();
     let rows = client2.sow("/ckpt-crash", None).await.unwrap();
-    assert_eq!(
-        rows.len() as i64,
-        published,
-        "ALL {published} acked rows must survive the crash after a reclaim; got {} — \
-         a lost row means a reclaimed segment was needed (safety bug)",
-        rows.len()
+
+    use std::collections::HashSet;
+    let recovered: HashSet<String> = rows
+        .iter()
+        .filter_map(|r| r.get("k").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    // Every ACKED key must be present. Report the exact missing sequences
+    // so a regression names the lost straddling-segment rows.
+    let missing: Vec<&(u64, String)> =
+        expected.iter().filter(|(_, k)| !recovered.contains(k)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {} acked rows LOST after crash following a reclaim during active \
+         publishing — a lost row means the straddling segment was reclaimed \
+         (data-loss bug). First few missing (seq,key): {:?}",
+        missing.len(),
+        expected.len(),
+        &missing[..missing.len().min(8)]
     );
 
-    // Spot-check a value that lived in an early (reclaimed) segment and a
-    // late (tail) one, to prove the snapshot actually carries early data.
-    let early = rows.iter().find(|r| r.get("k").and_then(|v| v.as_str()) == Some("k00007"));
-    let late = rows
-        .iter()
-        .find(|r| r.get("k").and_then(|v| v.as_str()) == Some(&format!("k{:05}", published - 1)));
-    assert!(early.is_some(), "early (reclaimed-segment) row recovered from snapshot");
-    assert!(late.is_some(), "late (tail) row recovered from replay");
+    // Sanity: the recovered set covers the full acked span (early keys that
+    // lived in reclaimed segments through the latest acked tail key).
+    let (min_seq, min_key) = expected.iter().min_by_key(|(s, _)| *s).unwrap();
+    let (max_seq, max_key) = expected.iter().max_by_key(|(s, _)| *s).unwrap();
+    assert!(
+        recovered.contains(min_key),
+        "earliest acked key {min_key} (seq {min_seq}, from a reclaimed segment) recovered"
+    );
+    assert!(
+        recovered.contains(max_key),
+        "latest acked key {max_key} (seq {max_seq}, from the surviving tail) recovered"
+    );
 }
