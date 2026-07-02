@@ -375,6 +375,119 @@ async fn add_column_requires_token() {
     assert!(resp.status().is_success(), "got {:?}", resp.status());
 }
 
+/// `POST /admin/explain` — query-cost-estimation route. Not
+/// individually covered by `get_routes_require_token` (POST, not GET)
+/// or any other test in this file. A malformed/missing body is
+/// acceptable for the authorized case — we only care that the token
+/// check happens before (and independent of) body handling, so 401 /
+/// 401 / not-401 is what we assert.
+#[tokio::test]
+async fn explain_requires_token() {
+    let server = server_with_token().await;
+    let rc = reqwest::Client::new();
+    let url = format!("{}/admin/explain", server.admin_url());
+    let body = json!({
+        "topic": "/admin-auth",
+        "sql": "SELECT k FROM t"
+    });
+
+    let resp = rc
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("no-token post");
+    assert_eq!(resp.status(), 401, "no-token explain should 401");
+
+    let resp = rc
+        .post(&url)
+        .header("Authorization", "Bearer wrong")
+        .json(&body)
+        .send()
+        .await
+        .expect("wrong-token post");
+    assert_eq!(resp.status(), 401, "wrong-token explain should 401");
+
+    let resp = rc
+        .post(&url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&body)
+        .send()
+        .await
+        .expect("correct-token post");
+    assert_ne!(
+        resp.status(),
+        401,
+        "correct-token explain should not 401, got {:?}",
+        resp.status()
+    );
+}
+
+/// `GET /admin/shard-for/:topic` — shard-directory lookup route. Not
+/// covered by `get_routes_require_token` since it takes a path param.
+#[tokio::test]
+async fn shard_for_requires_token() {
+    let server = server_with_token().await;
+    let rc = reqwest::Client::new();
+    let url = format!("{}/admin/shard-for/%2Fadmin-auth", server.admin_url());
+
+    let resp = rc.get(&url).send().await.expect("no-token get");
+    assert_eq!(resp.status(), 401, "no-token shard-for should 401");
+
+    let resp = rc
+        .get(&url)
+        .header("Authorization", "Bearer wrong")
+        .send()
+        .await
+        .expect("wrong-token get");
+    assert_eq!(resp.status(), 401, "wrong-token shard-for should 401");
+
+    let resp = rc
+        .get(&url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("correct-token get");
+    assert!(
+        resp.status().is_success(),
+        "correct-token shard-for should succeed, got {:?}",
+        resp.status()
+    );
+}
+
+/// `POST /admin/shrink-store/:topic` (singular) — per-topic store
+/// shrink. Distinct route from `shrink_store_all_requires_token`
+/// above (that one covers `/admin/shrink-store-all`).
+#[tokio::test]
+async fn shrink_store_single_topic_requires_token() {
+    let server = server_with_token().await;
+    let rc = reqwest::Client::new();
+    let url = format!("{}/admin/shrink-store/%2Fadmin-auth", server.admin_url());
+
+    let resp = rc.post(&url).send().await.expect("no-token post");
+    assert_eq!(resp.status(), 401, "no-token shrink-store should 401");
+
+    let resp = rc
+        .post(&url)
+        .header("Authorization", "Bearer wrong")
+        .send()
+        .await
+        .expect("wrong-token post");
+    assert_eq!(resp.status(), 401, "wrong-token shrink-store should 401");
+
+    let resp = rc
+        .post(&url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("correct-token post");
+    assert!(
+        resp.status().is_success(),
+        "correct-token shrink-store should succeed, got {:?}",
+        resp.status()
+    );
+}
+
 /// Sanity check on the flip side: with `admin_token` unset (the
 /// default), the admin API stays open — no regression for existing
 /// deployments/tests that don't configure a token.
