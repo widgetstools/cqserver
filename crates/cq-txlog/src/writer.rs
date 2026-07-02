@@ -242,13 +242,41 @@ impl TxLogWriter {
 
     /// Force a segment rotation now, regardless of current segment
     /// size. Used by the admin endpoint so operators can cut a fresh
-    /// segment on demand (e.g., before backup or to bound replay
-    /// latency on a hot topic).
+    /// segment on demand before a backup.
+    ///
+    /// Unlike the size-triggered rotation on the hot append path (which
+    /// only fsyncs the sealed segment when the writer's configured
+    /// `FsyncPolicy` calls for it), this is an explicit, infrequent
+    /// operator action whose entire purpose is durability: the caller
+    /// (typically `backup-cqserver.sh` via the admin `rotate-journal`
+    /// endpoint) is about to copy the sealed segment off disk and needs
+    /// a guarantee that what it copies is actually durable, regardless
+    /// of the topic's `FsyncPolicy`. So this unconditionally `sync_all`s
+    /// the sealed segment's *final* on-disk location (post-archive-move,
+    /// if archiving is configured) before returning — never gated on
+    /// `self.fsync`.
     pub fn force_rotate(&mut self) -> Result<(), TxLogError> {
-        self.rotate()
+        let sealed_final_path = self.rotate(true)?;
+        // Belt-and-braces: `rotate(true)` already syncs the sealed file
+        // via its own handle before any archive move, but re-open and
+        // sync the *final* resting path too so a rename/copy into an
+        // archive directory is unconditionally durable as well, not
+        // just the pre-move write.
+        let f = File::open(&sealed_final_path)?;
+        f.sync_all()?;
+        Ok(())
     }
 
-    fn rotate(&mut self) -> Result<(), TxLogError> {
+    /// Seal the active segment and open a fresh one. Returns the final
+    /// on-disk path of the just-sealed segment (in `archive_dir` if
+    /// archiving is configured, otherwise in the live `dir`).
+    ///
+    /// `force_fsync` unconditionally `sync_all`s the sealed segment
+    /// before any archive move, regardless of `self.fsync` — used by
+    /// [`Self::force_rotate`]. The size-triggered rotation on the hot
+    /// append path passes `false` and defers to the configured
+    /// `FsyncPolicy`, as before.
+    fn rotate(&mut self, force_fsync: bool) -> Result<PathBuf, TxLogError> {
         // Flush current segment so a crash leaves it consistent.
         self.current_file.flush()?;
         // Release any reserved-but-unwritten tail so the sealed segment
@@ -256,7 +284,7 @@ impl TxLogWriter {
         // zero padding that a strict reader would reject on a non-active
         // segment). Must happen before the sync/seal below.
         self.trim_prealloc_tail();
-        if self.fsync != FsyncPolicy::None {
+        if force_fsync || self.fsync != FsyncPolicy::None {
             self.current_file.sync_all()?;
         }
         // Capture the path of the segment we're about to seal before
@@ -284,7 +312,7 @@ impl TxLogWriter {
         // one is configured. We do this *after* opening the new
         // segment so a recovery scan during rotation always sees a
         // complete chain.
-        if let Some(archive) = &self.archive_dir {
+        let sealed_final_path = if let Some(archive) = &self.archive_dir {
             std::fs::create_dir_all(archive)?;
             if self.archive_compress {
                 // Stream-compress with zstd. Level 3 is a good
@@ -302,6 +330,7 @@ impl TxLogWriter {
                     to = %dest.display(),
                     "Archived + compressed sealed segment"
                 );
+                dest
             } else {
                 let dest = segment_path(archive, sealed_id);
                 if let Err(e) = std::fs::rename(&sealed_path, &dest) {
@@ -319,15 +348,18 @@ impl TxLogWriter {
                     to = %dest.display(),
                     "Archived sealed segment"
                 );
+                dest
             }
-        }
+        } else {
+            sealed_path
+        };
 
         tracing::info!(
             dir = %self.dir.display(),
             segment = next_id,
             "Rotated to new segment"
         );
-        Ok(())
+        Ok(sealed_final_path)
     }
 
     /// Append a single entry. `payload` may be empty to record a
@@ -422,7 +454,7 @@ impl TxLogWriter {
         // Allow the very first entry of a fresh segment regardless of size
         // so individual oversized-but-≤MAX_ENTRY_SIZE messages still fit.
         if self.current_bytes > 0 && self.current_bytes + frame_len > self.segment_size {
-            self.rotate()?;
+            self.rotate(false)?;
         }
 
         // Ensure the active segment's blocks are reserved. No-op unless

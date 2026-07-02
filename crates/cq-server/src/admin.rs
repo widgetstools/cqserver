@@ -634,6 +634,17 @@ async fn delete_subscription(
 /// segment to seal. The topic's writer opens a fresh segment for
 /// subsequent appends; the sealed segment moves to archive if
 /// configured. Useful before a backup or to bound replay latency.
+///
+/// Durability: the sealed segment is `fsync`'d **unconditionally**,
+/// regardless of the topic's configured `[txlog].fsync` policy
+/// (including `fsync = "none"`) — see `TxLogWriter::force_rotate`. This
+/// is deliberate: unlike the size-triggered rotation on the hot append
+/// path (which defers to `FsyncPolicy` for throughput), force-rotate is
+/// an explicit, infrequent, operator-triggered action whose entire
+/// purpose is durability — e.g. `scripts/backup-cqserver.sh` calls this
+/// before copying a topic's directory into a backup archive, and that
+/// backup is only trustworthy if the sealed segment it copies is
+/// actually on disk, not just in the OS page cache.
 async fn rotate_journal(
     State(s): State<AdminState>,
     Path(topic): Path<String>,
