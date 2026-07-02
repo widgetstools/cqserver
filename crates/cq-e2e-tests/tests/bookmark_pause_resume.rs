@@ -50,6 +50,7 @@ async fn pause_then_resume_resumes_replay_from_same_point() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

@@ -84,6 +84,7 @@ async fn snapshot_beyond_queue_capacity_completes() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -139,6 +140,7 @@ async fn many_concurrent_subscribes_no_ack_drops() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

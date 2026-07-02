@@ -34,6 +34,7 @@ async fn archived_segments_replay_on_restart() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -97,6 +98,7 @@ async fn restart_with_no_archived_segments_recovers_from_live_log() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -144,6 +146,7 @@ async fn restart_mixes_archived_and_live_segments() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

@@ -33,6 +33,7 @@ async fn tls_publish_and_sow_roundtrip() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

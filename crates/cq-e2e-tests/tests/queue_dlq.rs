@@ -34,6 +34,7 @@ async fn dlq_routes_messages_after_max_delivery_exceeded() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -121,6 +122,7 @@ async fn dlq_after_three_delivery_attempts() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -183,6 +185,7 @@ async fn dlq_does_not_route_acked_messages() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -247,6 +250,7 @@ async fn dlq_delivery_kind_is_add() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

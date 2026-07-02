@@ -54,6 +54,7 @@ async fn sow_arrives_as_chunked_batch_frames() {
         admin_tls: None,
         transport_limits: None,
         audit: None,
+        ..ServerOpts::default()
     };
     let server = start_server_with(vec![topic], opts).await;
 

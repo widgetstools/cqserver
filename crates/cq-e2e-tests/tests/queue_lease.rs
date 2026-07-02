@@ -27,6 +27,7 @@ async fn queue_lease_redelivers_to_other_consumer() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -99,6 +100,7 @@ async fn queue_ack_prevents_redelivery() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -163,6 +165,7 @@ async fn queue_distributes_across_consumers() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -213,6 +216,7 @@ async fn queue_redelivers_after_consumer_disconnects() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -261,6 +265,7 @@ async fn queue_lease_extension_defers_redelivery() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -318,6 +323,7 @@ async fn queue_grouped_messages_stick_to_one_consumer() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -374,6 +380,7 @@ async fn queue_no_message_loss_under_ack_pattern() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

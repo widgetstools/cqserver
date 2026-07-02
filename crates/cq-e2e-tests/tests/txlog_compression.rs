@@ -31,6 +31,7 @@ async fn compressed_archive_segments_replay_on_restart() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -86,6 +87,7 @@ async fn compressed_archive_recovers_last_write_per_key() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -138,6 +140,7 @@ async fn compressed_archive_empty_topic_restart() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;

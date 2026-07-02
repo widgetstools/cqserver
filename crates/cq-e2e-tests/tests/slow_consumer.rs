@@ -107,6 +107,7 @@ async fn slow_consumer_drops_are_observable() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -178,6 +179,7 @@ async fn admin_delete_subscription_disconnects_slow_consumer() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
@@ -262,6 +264,7 @@ async fn auto_disconnect_kicks_in_when_drops_exceed_threshold() {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            ..ServerOpts::default()
         },
     )
     .await;
