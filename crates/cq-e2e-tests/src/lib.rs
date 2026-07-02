@@ -1030,11 +1030,18 @@ fn build_toml(
     out
 }
 
-fn locate_server_binary() -> PathBuf {
+/// Locate the `cqserver` binary to spawn: prefers `target/release/cqserver`
+/// (faster to run) but falls back to `target/debug/cqserver` so tests work
+/// after a plain `cargo build --workspace` / `cargo test --workspace` —
+/// which is what CI runs — without requiring a separate release build.
+/// Public so other test binaries in this crate (e.g. `backup_restore_e2e`,
+/// which also shells out to a `cqserver` binary via `restore-cqserver.sh
+/// --binary`) can reuse the same fallback logic instead of hardcoding a
+/// release-only path.
+pub fn locate_server_binary() -> PathBuf {
     // CARGO_BIN_EXE_cqserver is set when this crate depends on cq-server
     // as a `dev-dependencies` binary, but we don't want that coupling so
-    // we just look in the workspace target directory. Tests must be run
-    // after `cargo build --release -p cq-server`.
+    // we just look in the workspace target directory.
     let workspace_root = workspace_root();
     let release = workspace_root.join("target/release/cqserver");
     let debug = workspace_root.join("target/debug/cqserver");
@@ -1044,7 +1051,8 @@ fn locate_server_binary() -> PathBuf {
         debug
     } else {
         panic!(
-            "cqserver binary not found; run `cargo build --release -p cq-server` first \
+            "cqserver binary not found; run `cargo build -p cq-server` \
+             (or `cargo build --release -p cq-server`) first \
              (looked at {} and {})",
             release.display(),
             debug.display()

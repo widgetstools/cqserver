@@ -50,11 +50,12 @@ What it does, in order:
    of the live data dir into a staging area. This is a **copy**, not a
    move — the live server's files are never touched or unlinked.
 4. Verifies every copied topic directory by replaying it end-to-end with
-   the real `TxLogReader` (`cargo run --release -p cq-txlog --example
-   verify_segments`) — the same reader the server itself uses for crash
-   recovery and replication. This catches truncation or corruption
-   introduced by the copy step, not just "the file exists and is
-   non-empty."
+   the real `TxLogReader` (a prebuilt `verify_segments` example binary
+   if one exists under `target/{release,debug}/examples/`, else `cargo
+   run -p cq-txlog --example verify_segments` as a fallback) — the same
+   reader the server itself uses for crash recovery and replication.
+   This catches truncation or corruption introduced by the copy step,
+   not just "the file exists and is non-empty."
 5. Writes `manifest.json` (topic → slug → segment count → total bytes →
    `hasSnapshot` → verified entry count → max sequence) into the backup,
    prints the manifest as a table, and tars everything into `--output`.
@@ -150,9 +151,15 @@ This rewrites `[txlog].directory` in a scratch copy of
 `--config-template` to point at `--data-dir`, starts the server, waits
 for `/healthz`, then diffs `GET /topics`' `rowCount` per topic against
 the manifest's verified entry count (`restoredRows <= backedUpEntries`
-— a non-strict bound because live SOW row count collapses
-duplicate-key overwrites that the raw entry count doesn't). A mismatch
-exits `4` with a printed table.
+— a non-strict, `<=` bound, not equality, by design: the raw txlog
+entry count is every publish/update/delete ever appended for that
+topic, while the live SOW `rowCount` after replay is the number of
+*distinct keys still present* — duplicate-key overwrites collapse to
+their latest value under one key, and tombstones (deletes) remove a
+key from the SOW entirely while still counting as an entry in the log.
+So `rowCount` is always `<=` the entry count; equality only happens
+when every backed-up entry was a distinct, still-live key with no
+updates or deletes). A mismatch exits `4` with a printed table.
 
 This is **not** a substitute for the operator's own application-level
 smoke test after a real restore — row *count* parity doesn't prove row

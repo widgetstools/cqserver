@@ -15,8 +15,10 @@
 #      archive_directory is configured) out of the live txlog dir into the
 #      backup output as a tar archive.
 #   4. Verify every copied segment directory by replaying it end-to-end
-#      with the real `TxLogReader` (via `cargo run --release -p cq-txlog
-#      --example verify_segments`) — this catches truncation or corruption
+#      with the real `TxLogReader` (a prebuilt `verify_segments` example
+#      binary if `target/{release,debug}/examples/verify_segments`
+#      exists, else `cargo run -p cq-txlog --example verify_segments`
+#      as a last resort) — this catches truncation or corruption
 #      introduced by the copy step, not just "file exists and is
 #      non-empty." See crates/cq-txlog/examples/verify_segments.rs.
 #   5. Print a manifest: topic -> segment count -> total bytes -> max
@@ -68,7 +70,9 @@ Usage: backup-cqserver.sh --admin-url <url> --data-dir <dir> --output <path> [--
   --output       Path to write the backup archive to (a .tar.gz)
   --token        Optional admin bearer token (or set CQ_ADMIN_TOKEN)
   --verify-bin   Optional path to a prebuilt verify_segments binary.
-                 Default: build+run via `cargo run --release -p cq-txlog --example verify_segments`
+                 Default: use target/release/examples/verify_segments or
+                 target/debug/examples/verify_segments if already built,
+                 else build+run via `cargo run -p cq-txlog --example verify_segments`
   --keep-workdir Keep the staging directory (for debugging) instead of deleting it on exit.
 EOF
 }
@@ -250,8 +254,18 @@ run_verify() {
     local dir="$1"
     if [ -n "$VERIFY_BIN" ]; then
         "$VERIFY_BIN" "$dir"
+    elif [ -x "$ROOT/target/release/examples/verify_segments" ]; then
+        # Prefer an already-built binary (release, then debug) over
+        # `cargo run`, which would otherwise force a fresh release
+        # compile on every backup — including in CI, where only a
+        # debug build exists (`cargo test --workspace` doesn't build
+        # release artifacts). This mirrors the cqserver binary lookup
+        # in crates/cq-e2e-tests/src/lib.rs (`locate_server_binary`).
+        "$ROOT/target/release/examples/verify_segments" "$dir"
+    elif [ -x "$ROOT/target/debug/examples/verify_segments" ]; then
+        "$ROOT/target/debug/examples/verify_segments" "$dir"
     else
-        ( cd "$ROOT" && cargo run --release -q -p cq-txlog --example verify_segments -- "$dir" )
+        ( cd "$ROOT" && cargo run -q -p cq-txlog --example verify_segments -- "$dir" )
     fi
 }
 

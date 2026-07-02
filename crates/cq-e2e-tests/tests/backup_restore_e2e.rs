@@ -17,7 +17,7 @@
 //! rather than being gated behind `#[ignore]` / nightly-tests.sh.
 
 use cq_client::Client;
-use cq_e2e_tests::{start_server, TopicSpec};
+use cq_e2e_tests::{locate_server_binary, start_server, TopicSpec};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,7 +25,8 @@ use std::process::Command;
 const ROWS_TO_SEED: usize = 500;
 
 /// Path to this workspace's root (parent of `crates/`), used to locate
-/// `scripts/*.sh` and the release binary the scripts shell out to.
+/// `scripts/*.sh` and (via `locate_server_binary`) the `cqserver` binary
+/// the scripts shell out to.
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -104,13 +105,11 @@ fn rewrite_ports(toml: &str, admin_port: u16) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_round_trip_preserves_row_count() {
-    let root = workspace_root();
-    let release_binary = root.join("target/release/cqserver");
-    assert!(
-        release_binary.exists(),
-        "release binary not found at {} — run `cargo build --release -p cq-server` first",
-        release_binary.display()
-    );
+    // Prefers target/release/cqserver but falls back to target/debug/cqserver
+    // — same locator `start_server` uses internally — so this test runs
+    // under a plain `cargo test --workspace` (debug-only, as CI does)
+    // without requiring a separate release build.
+    let server_binary = locate_server_binary();
 
     // --- 1. Start a server with one persistent topic and seed rows ----
     let topic = TopicSpec::new("/backuptest", "k")
@@ -230,7 +229,7 @@ async fn backup_restore_round_trip_preserves_row_count() {
             restored_data_dir.to_str().unwrap(),
             "--start-server",
             "--binary",
-            release_binary.to_str().unwrap(),
+            server_binary.to_str().unwrap(),
             "--config-template",
             port_rewritten_path.to_str().unwrap(),
             "--admin-url",
