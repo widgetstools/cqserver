@@ -15,6 +15,15 @@
 //! segment regardless of `FsyncPolicy`, since it's an explicit,
 //! infrequent, operator-triggered durability action — never on the hot
 //! append path.
+//!
+//! Scope caveat: these tests exercise the completeness/archiving/
+//! compression behavior of the `force_rotate` path (a torn or missing
+//! sealed segment fails them), but a black-box reader cannot observe
+//! whether `sync_all` was actually *called* — reverting `force_rotate`
+//! to policy-gated fsync leaves these tests green. The unconditional-
+//! fsync guarantee itself is enforced by the code (`rotate(true)`) and
+//! its single admin-only caller, verified by review; a true regression
+//! guard on the syscall would need fault injection / syscall spying.
 
 use cq_txlog::reader::TxLogReader;
 use cq_txlog::segment::{list_segments, segment_path, segment_zstd_path};
