@@ -616,7 +616,7 @@ fn compile_having(
                 }
             }
             Err(QueryError::ParseError(format!(
-                "HAVING references an aggregate not in SELECT: {expr}"
+                "HAVING references an aggregate not in SELECT: {expr}; add the aggregate to the SELECT list"
             )))
         }
         Expr::Value(ValueWithSpan { value, .. }) => match value {
@@ -3065,6 +3065,16 @@ fn parse_order_by(
                 alias_result.push(Some(id.value.clone()));
                 continue;
             }
+        }
+        // Task 1.4 (Finding 1) — a scalar function call as a sort key
+        // (`ORDER BY ABS(v) DESC`) is not supported. Detect this shape
+        // specifically and name the workaround, rather than letting it
+        // fall through to the generic "unknown column" / "unsupported
+        // expression in SELECT" error from `resolve_select_column`.
+        if let Expr::Function(_) = &item.expr {
+            return Err(QueryError::ParseError(
+                "scalar functions in ORDER BY are not supported; ORDER BY a SELECT alias of the expression instead".into(),
+            ));
         }
         // Surface the original "unknown column" error.
         return Err(by_col.unwrap_err());

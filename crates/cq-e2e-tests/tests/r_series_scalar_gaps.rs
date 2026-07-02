@@ -43,6 +43,10 @@ async fn having_on_aggregate_not_in_select_errors_cleanly() {
         msg.contains("HAVING references an aggregate not in SELECT"),
         "error must name the shape; got: {msg}"
     );
+    assert!(
+        msg.contains("add the aggregate to the SELECT list"),
+        "error must name the workaround; got: {msg}"
+    );
 }
 
 /// Sanity: HAVING on an aggregate that IS in SELECT still works —
@@ -107,9 +111,18 @@ async fn scalar_fn_in_order_by() {
         .sow_sql("/rgap-orderby", "SELECT k, v FROM t ORDER BY ABS(v) DESC")
         .await;
     // The workaround: order by a SELECT alias instead. Clean-reject is
-    // the contract; assert we got an error, not a hang or wrong answer.
+    // the contract; assert we got an error, not a hang or wrong answer,
+    // and that the message names the workaround.
     let err = res.expect_err("ORDER BY ABS(v) must clean-reject, not hang");
-    assert!(!format!("{err}").is_empty(), "reject must carry a message");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("scalar functions in ORDER BY are not supported"),
+        "error must name the shape; got: {msg}"
+    );
+    assert!(
+        msg.contains("ORDER BY a SELECT alias"),
+        "error must name the workaround; got: {msg}"
+    );
 }
 
 /// Gap #3 — `SELECT ABS(col) AS x`: scalar function in SELECT
