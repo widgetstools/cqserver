@@ -69,6 +69,8 @@ pub enum TopicError {
     TxLog(#[from] cq_txlog::TxLogError),
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("delta publish missing key field(s) for topic {topic}")]
+    MissingKeyFields { topic: String },
 }
 
 /// What caused this mutation event. Lets the evaluator distinguish a
@@ -1437,7 +1439,22 @@ impl Topic {
 
         self.maybe_discover_schema(flat);
 
-        let key = self.compute_key_from_map(flat).unwrap_or_default();
+        // `compute_key_from_map` returns `None` both for genuinely keyless
+        // topics (no `key_fields` configured) and for keyed topics whose
+        // configured key field(s) are absent from this payload. Keyless
+        // topics must keep working (fall back to key `""`, a single shared
+        // row is the intended semantics there); keyed topics must reject
+        // the publish instead of silently merging every keyless delta into
+        // one phantom `""`-keyed row — AMPS rejects these outright.
+        let key = match self.compute_key_from_map(flat) {
+            Some(k) => k,
+            None if self.config.key_fields.is_empty() => String::new(),
+            None => {
+                return Err(TopicError::MissingKeyFields {
+                    topic: self.config.name.clone(),
+                });
+            }
+        };
 
         // Build the fully-merged row + the per-column value vec under
         // one read pass. For columns the publisher supplied: use the
@@ -1637,7 +1654,25 @@ impl Topic {
             map
         };
         self.maybe_discover_schema(map);
-        let key = self.compute_key_from_map(map).unwrap_or_default();
+        // Same all-or-nothing semantics as the live `delta_upsert_map`
+        // path: a keyed topic whose configured key field(s) are absent
+        // from this entry must not be merged into a phantom `""`-keyed
+        // row. Recovery must stay lenient (never abort a replay over one
+        // bad entry) — skip it with a warning instead of panicking or
+        // erroring out.
+        let key = match self.compute_key_from_map(map) {
+            Some(k) => k,
+            None if self.config.key_fields.is_empty() => String::new(),
+            None => {
+                tracing::warn!(
+                    topic = %self.config.name,
+                    origin = %origin,
+                    sequence,
+                    "skipping delta replay entry missing configured key field(s)"
+                );
+                return;
+            }
+        };
         let values: Vec<Value> = {
             let state = self.state.read();
             let existing_row = state.key_to_row.get(&key).copied();
@@ -3883,6 +3918,35 @@ mod view_tap_tests {
         topic.replay_delta_map_origin("", 1, &delta2);
         let res = topic.query("SELECT * FROM t WHERE symbol = 'TSLA'").unwrap();
         assert_eq!(res.rows[0].get("price").unwrap(), 800.0, "duplicate seq ignored");
+    }
+
+    /// `delta_upsert_map` must reject a delta that omits the topic's
+    /// configured key field(s) instead of silently falling back to key
+    /// `""` and merging every keyless delta into one phantom row — AMPS
+    /// rejects these outright.
+    #[test]
+    fn delta_upsert_without_key_fields_is_rejected() {
+        let topic = make_topic(); // keyed on "symbol"
+        let mut delta = serde_json::Map::new();
+        delta.insert("price".into(), 42.0.into()); // no "symbol"
+        let err = topic
+            .delta_upsert_map(&delta)
+            .expect_err("keyless delta must be rejected");
+        assert!(matches!(err, TopicError::MissingKeyFields { .. }));
+        assert_eq!(topic.row_count(), 0, "no phantom row created");
+    }
+
+    /// Replaying a delta that's missing the configured key field(s) must
+    /// not panic and must not create a phantom `""`-keyed row. Recovery
+    /// is lenient by design (never abort a replay over one bad entry) —
+    /// the bad entry is skipped with a warning instead.
+    #[test]
+    fn sparse_delta_replay_without_key_fields_is_skipped_not_phantom() {
+        let topic = make_topic(); // keyed on "symbol"
+        let mut delta = serde_json::Map::new();
+        delta.insert("price".into(), 42.0.into()); // no "symbol"
+        topic.replay_delta_map_origin("", 1, &delta);
+        assert_eq!(topic.row_count(), 0, "no phantom row created on replay");
     }
 
     /// The `snapshot_reclaim` contract: after a durable snapshot, sealed
