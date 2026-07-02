@@ -57,6 +57,7 @@ async fn row_filter_restricts_alice_to_rates_desk() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -158,6 +159,7 @@ async fn row_filter_intersects_with_client_filter() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -223,6 +225,7 @@ async fn row_filter_matching_no_rows_is_empty() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -284,6 +287,7 @@ async fn per_action_entitlements_are_independent() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -344,6 +348,7 @@ async fn bad_password_rejects_logon() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;

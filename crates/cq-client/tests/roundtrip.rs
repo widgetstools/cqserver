@@ -58,6 +58,7 @@ async fn spawn_test_server() -> (String, Arc<DashMap<String, SharedTopic>>) {
         read_only: false,
         query_limits: cq_core::query::QueryLimits::default(),
         sync_replication: cq_transport::router::SyncReplication::default(),
+        connection_limits: None,
     };
     tokio::spawn(async move {
         loop {

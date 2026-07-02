@@ -12,6 +12,7 @@
 
 use crate::auth::SharedAuth;
 use crate::heartbeat::{self, HeartbeatConfig};
+use crate::limits::{record_rejection, ConnectionLimits};
 use crate::queue::QueueRegistry;
 use crate::router::{cleanup_session, dispatch, RouterContext};
 use crate::session::{
@@ -102,6 +103,14 @@ pub struct TcpConfig {
     /// S11 synchronous-replication policy for `AckType::Replicated`
     /// publishes. See [`crate::router::SyncReplication`].
     pub sync_replication: crate::router::SyncReplication,
+    /// D3/P0.3 — shared connection/rate limits. Constructed once in
+    /// main.rs and passed into BOTH `TcpConfig` and `WsConfig` so the
+    /// two transports draw from the same `max_connections` /
+    /// `max_connections_per_ip` / `accept_rate_per_sec` budget. `None`
+    /// disables all accept-time enforcement (matches pre-D3 behavior);
+    /// `RouterContext.connection_limits` carries the same `Arc` through
+    /// to `handle_logon` for the `max_sessions_per_user` check.
+    pub connection_limits: Option<std::sync::Arc<ConnectionLimits>>,
 }
 
 impl Default for TcpConfig {
@@ -116,6 +125,7 @@ impl Default for TcpConfig {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         }
     }
 }
@@ -142,6 +152,27 @@ pub async fn start_tcp_server(
 
     loop {
         let (stream, addr) = listener.accept().await?;
+
+        // D3/P0.3 — connection/rate limits enforced BEFORE any
+        // per-connection setup (no ctx, no spawn, no TLS handshake).
+        // On rejection we log + count + drop the socket immediately.
+        let conn_guard = match &config.connection_limits {
+            Some(limits) => match limits.try_accept(addr.ip()) {
+                Ok(guard) => Some(guard),
+                Err(reason) => {
+                    record_rejection(reason);
+                    warn!(
+                        addr = %addr,
+                        reason = reason.as_str(),
+                        "TCP connection rejected — limit exceeded"
+                    );
+                    drop(stream);
+                    continue;
+                }
+            },
+            None => None,
+        };
+
         let ctx = RouterContext {
             topics: topics.clone(),
             sessions: registry.clone(),
@@ -153,11 +184,17 @@ pub async fn start_tcp_server(
             read_only: config.read_only,
             query_limits: config.query_limits,
             sync_replication: config.sync_replication,
+            connection_limits: config.connection_limits.clone(),
         };
         let queue_capacity = config.outbound_queue_capacity;
         let tls_acceptor = config.tls_acceptor.clone();
 
         tokio::spawn(async move {
+            // Held for the lifetime of this task so the max_connections
+            // permit + per-IP counter release on every exit path
+            // (normal close, read error, or a panic unwind through the
+            // task boundary).
+            let _conn_guard = conn_guard;
             info!(addr = %addr, "TCP client connected");
             metrics::gauge!("cq_connections_active").increment(1.0);
             match tls_acceptor {
@@ -356,6 +393,7 @@ mod tests {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -498,6 +536,7 @@ mod tests {
             read_only: true,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -648,6 +687,7 @@ mod tests {
             read_only: false,
             query_limits: limits,
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -769,6 +809,7 @@ mod tests {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -879,6 +920,7 @@ mod tests {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             loop {
@@ -1075,6 +1117,7 @@ mod tests {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
@@ -1224,6 +1267,7 @@ mod tests {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         };
         let server = tokio::spawn(async move {
             loop {

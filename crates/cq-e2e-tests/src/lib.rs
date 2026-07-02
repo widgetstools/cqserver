@@ -227,6 +227,11 @@ pub struct ServerOpts {
     /// default) serves the admin API over plain HTTP, matching every
     /// existing test.
     pub admin_tls: Option<TlsOpts>,
+    /// D3/P0.3 — when `Some(_)`, the harness writes a
+    /// `[transport.limits]` section with these knobs. `None` leaves
+    /// the server on its config defaults (max_connections = 10000,
+    /// everything else off).
+    pub transport_limits: Option<TransportLimitsOpts>,
 }
 
 /// Replication config for the e2e harness. Mirrors
@@ -301,6 +306,18 @@ impl Default for SpilloverOpts {
             max_bytes_per_sub: 16 * 1024 * 1024,
         }
     }
+}
+
+/// D3/P0.3 — connection & rate limit knobs for the e2e harness. Mirrors
+/// `cq_server::config::TransportLimitsConfig`. `0` means "disabled" for
+/// every field except `max_connections`, matching the server's own
+/// convention.
+#[derive(Clone, Copy, Default)]
+pub struct TransportLimitsOpts {
+    pub max_connections: Option<usize>,
+    pub max_connections_per_ip: Option<usize>,
+    pub accept_rate_per_sec: Option<u32>,
+    pub max_sessions_per_user: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -489,6 +506,7 @@ impl Default for ServerOpts {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         }
     }
 }
@@ -780,6 +798,21 @@ fn build_toml(
             key_path.display().to_string().replace('\\', "/")
         )
         .unwrap();
+    }
+    if let Some(tl) = &opts.transport_limits {
+        writeln!(out, "[transport.limits]").unwrap();
+        if let Some(v) = tl.max_connections {
+            writeln!(out, "max_connections = {v}").unwrap();
+        }
+        if let Some(v) = tl.max_connections_per_ip {
+            writeln!(out, "max_connections_per_ip = {v}").unwrap();
+        }
+        if let Some(v) = tl.accept_rate_per_sec {
+            writeln!(out, "accept_rate_per_sec = {v}").unwrap();
+        }
+        if let Some(v) = tl.max_sessions_per_user {
+            writeln!(out, "max_sessions_per_user = {v}").unwrap();
+        }
     }
     writeln!(out).unwrap();
     writeln!(out, "[txlog]").unwrap();

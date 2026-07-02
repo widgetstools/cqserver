@@ -79,6 +79,7 @@ async fn adaptive_conflation_widens_under_pressure() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;

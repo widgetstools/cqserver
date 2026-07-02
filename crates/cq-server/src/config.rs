@@ -242,6 +242,14 @@ pub struct TransportConfig {
     /// `None` keeps the legacy "drop on full" behaviour.
     #[serde(default)]
     pub spillover: Option<SpilloverConfig>,
+
+    /// D3/P0.3 — connection & rate limits, enforced in the TCP/WebSocket
+    /// accept loops (and, for `max_sessions_per_user`, at Logon time).
+    /// Omitting `[transport.limits]` entirely uses the defaults, which
+    /// preserve current behavior except for `max_connections` (capped
+    /// at 10000 instead of unbounded).
+    #[serde(default)]
+    pub limits: TransportLimitsConfig,
 }
 
 /// S21 spillover configuration.
@@ -254,6 +262,51 @@ pub struct SpilloverConfig {
     /// this are dropped (and counted via `cq_deltas_dropped_total{reason="spillover_over_cap"}`).
     #[serde(default = "default_spillover_max_bytes")]
     pub max_bytes_per_sub: u64,
+}
+
+/// D3/P0.3 — `[transport.limits]`. All fields default to "off" except
+/// `max_connections`, which defaults to `10000` — still generous, but a
+/// real ceiling instead of the previous unbounded accept loop. Every
+/// other knob's `0` means disabled, matching pre-D3 behavior when the
+/// whole `[transport.limits]` table is omitted from config.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct TransportLimitsConfig {
+    /// Global cap on live connections (summed across TCP + WebSocket).
+    /// Enforced at accept time via a shared semaphore.
+    pub max_connections: usize,
+    /// Cap on live connections from a single peer IP. `0` disables the
+    /// check (unlimited connections per IP).
+    pub max_connections_per_ip: usize,
+    /// Cap on new accepted connections per rolling one-second window
+    /// (summed across TCP + WebSocket). `0` disables the check.
+    pub accept_rate_per_sec: u32,
+    /// Cap on concurrently logged-on sessions for one authenticated
+    /// username. Enforced at Logon time (identity isn't known at
+    /// accept time). `0` disables the check.
+    pub max_sessions_per_user: usize,
+}
+
+impl Default for TransportLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: cq_transport::limits::DEFAULT_MAX_CONNECTIONS,
+            max_connections_per_ip: 0,
+            accept_rate_per_sec: 0,
+            max_sessions_per_user: 0,
+        }
+    }
+}
+
+impl TransportLimitsConfig {
+    pub fn to_transport(self) -> cq_transport::limits::LimitsConfig {
+        cq_transport::limits::LimitsConfig {
+            max_connections: self.max_connections,
+            max_connections_per_ip: self.max_connections_per_ip,
+            accept_rate_per_sec: self.accept_rate_per_sec,
+            max_sessions_per_user: self.max_sessions_per_user,
+        }
+    }
 }
 
 fn default_spillover_max_bytes() -> u64 {
@@ -342,6 +395,7 @@ impl Default for TransportConfig {
             slow_consumer: SlowConsumerConfig::default(),
             tls: None,
             spillover: None,
+            limits: TransportLimitsConfig::default(),
         }
     }
 }

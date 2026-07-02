@@ -2,6 +2,7 @@
 
 use crate::auth::SharedAuth;
 use crate::heartbeat::{self, HeartbeatConfig};
+use crate::limits::{record_rejection, ConnectionLimits};
 use crate::queue::QueueRegistry;
 use crate::router::{cleanup_session, dispatch, RouterContext};
 use crate::session::{
@@ -44,6 +45,11 @@ pub struct WsConfig {
     /// S11 synchronous-replication policy for `AckType::Replicated`
     /// publishes. See [`crate::router::SyncReplication`].
     pub sync_replication: crate::router::SyncReplication,
+    /// D3/P0.3 — shared connection/rate limits. See
+    /// `TcpConfig::connection_limits` — the SAME `Arc<ConnectionLimits>`
+    /// must be passed to both transports so `max_connections` etc. are
+    /// enforced against one shared budget, not per-transport.
+    pub connection_limits: Option<std::sync::Arc<ConnectionLimits>>,
 }
 
 impl Default for WsConfig {
@@ -59,6 +65,7 @@ impl Default for WsConfig {
             query_limits: cq_core::query::QueryLimits::default(),
             max_message_bytes: cq_protocol::codec::MAX_FRAME_SIZE,
             sync_replication: crate::router::SyncReplication::default(),
+            connection_limits: None,
         }
     }
 }
@@ -81,6 +88,28 @@ pub async fn start_ws_server(
 
     loop {
         let (stream, addr) = listener.accept().await?;
+
+        // D3/P0.3 — same enforcement as the TCP accept loop, and against
+        // the SAME shared `ConnectionLimits` instance (see
+        // `WsConfig::connection_limits`), so a client can't dodge
+        // `max_connections` by switching transport.
+        let conn_guard = match &config.connection_limits {
+            Some(limits) => match limits.try_accept(addr.ip()) {
+                Ok(guard) => Some(guard),
+                Err(reason) => {
+                    record_rejection(reason);
+                    warn!(
+                        addr = %addr,
+                        reason = reason.as_str(),
+                        "WebSocket connection rejected — limit exceeded"
+                    );
+                    drop(stream);
+                    continue;
+                }
+            },
+            None => None,
+        };
+
         let ctx = RouterContext {
             topics: topics.clone(),
             sessions: registry.clone(),
@@ -92,11 +121,15 @@ pub async fn start_ws_server(
             read_only: config.read_only,
             query_limits: config.query_limits,
             sync_replication: config.sync_replication,
+            connection_limits: config.connection_limits.clone(),
         };
         let queue_capacity = config.outbound_queue_capacity;
         let max_message_bytes = config.max_message_bytes;
 
         tokio::spawn(async move {
+            // Held for the connection task's lifetime; released on any
+            // exit path (handshake failure, clean close, read error).
+            let _conn_guard = conn_guard;
             let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
                 max_message_size: Some(max_message_bytes),
                 max_frame_size: Some(max_message_bytes),

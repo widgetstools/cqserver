@@ -5,6 +5,7 @@
 //! semantics stay in one place.
 
 use crate::auth::{Op, SharedAuth};
+use crate::limits::ConnectionLimits;
 use crate::queue::QueueRegistry;
 use crate::session::{DeliveryRoute, Session, SessionRegistry};
 use cq_core::query::peek_join;
@@ -879,6 +880,13 @@ pub struct RouterContext {
     /// which case a `Replicated`-ack request is rejected with a clear
     /// error rather than silently acked before replication.
     pub sync_replication: SyncReplication,
+    /// D3/P0.3 — shared connection/rate limits. `max_connections`,
+    /// `max_connections_per_ip`, and `accept_rate_per_sec` are enforced
+    /// in the accept loop (before this `RouterContext` is even built);
+    /// `max_sessions_per_user` is enforced here, in `handle_logon`,
+    /// because user identity isn't known until a successful logon.
+    /// `None` disables all four (matches the pre-D3 behavior).
+    pub connection_limits: Option<std::sync::Arc<ConnectionLimits>>,
 }
 
 /// S11 — controls how a publish that requests `AckType::Replicated` is
@@ -1137,7 +1145,7 @@ pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) 
     }
 
     match msg.command {
-        Command::Logon => handle_logon(session, msg, &ctx.auth),
+        Command::Logon => handle_logon(session, msg, ctx),
         Command::Publish => handle_publish(session, msg, ctx),
         Command::PublishBatch => handle_publish_batch(session, msg, ctx),
         Command::DeltaPublish => handle_delta_publish(session, msg, ctx),
@@ -1230,7 +1238,37 @@ fn check_entitlement(
     false
 }
 
-fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
+/// D3/P0.3 — enforce `max_sessions_per_user` at Logon time (user
+/// identity isn't known until now, unlike the accept-time checks in
+/// `ConnectionLimits::try_accept`). On success, stashes the RAII guard
+/// on the session so it releases (decrementing the per-user count) on
+/// disconnect via `Session`'s own `Drop`-less-but-field-owned lifetime —
+/// the guard lives exactly as long as the `Session` struct does. Drops
+/// any pre-existing guard first so a session that re-logs-on (e.g. to
+/// switch users) doesn't leak its previous slot.
+fn enforce_max_sessions_per_user(
+    session: &mut Session,
+    username: &str,
+    ctx: &RouterContext,
+) -> Result<(), crate::limits::RejectReason> {
+    session.user_session_guard = None; // release any prior logon's slot first
+    let Some(limits) = ctx.connection_limits.as_ref() else {
+        return Ok(());
+    };
+    match limits.try_register_user_session(username) {
+        Ok(guard) => {
+            session.user_session_guard = Some(guard);
+            Ok(())
+        }
+        Err(reason) => {
+            crate::limits::record_rejection(reason);
+            Err(reason)
+        }
+    }
+}
+
+fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
+    let auth = &ctx.auth;
     // S28 — version negotiation runs FIRST, regardless of auth. A
     // client whose supported set is disjoint from ours has nothing
     // to gain from authenticating, so we fail before even reading
@@ -1356,6 +1394,31 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
         if auth.has_jwt() {
             match auth.verify_jwt(t) {
                 Some(matched) => {
+                    if let Err(reason) =
+                        enforce_max_sessions_per_user(session, &matched.username, ctx)
+                    {
+                        let _ = session.send_message(&CqMessage::error(
+                            msg.command_id,
+                            &format!(
+                                "Logon rejected: too many concurrent sessions for user '{}'",
+                                matched.username
+                            ),
+                        ));
+                        tracing::warn!(
+                            target: "cq_audit",
+                            session = %session.id,
+                            user = %matched.username,
+                            reason = reason.as_str(),
+                            event = "logon_fail_session_limit",
+                            "Logon rejected: max_sessions_per_user exceeded"
+                        );
+                        metrics::counter!(
+                            "cq_logon_total",
+                            "result" => "fail_session_limit"
+                        )
+                        .increment(1);
+                        return;
+                    }
                     session.username = Some(matched.username.clone());
                     session.entitlements = matched.entitlements.clone();
                     tracing::info!(
@@ -1439,6 +1502,29 @@ fn handle_logon(session: &mut Session, msg: CqMessage, auth: &SharedAuth) {
 
     match auth.verify(user, pass) {
         Some(matched) => {
+            if let Err(reason) = enforce_max_sessions_per_user(session, &matched.username, ctx) {
+                let _ = session.send_message(&CqMessage::error(
+                    msg.command_id,
+                    &format!(
+                        "Logon rejected: too many concurrent sessions for user '{}'",
+                        matched.username
+                    ),
+                ));
+                tracing::warn!(
+                    target: "cq_audit",
+                    session = %session.id,
+                    user = %matched.username,
+                    reason = reason.as_str(),
+                    event = "logon_fail_session_limit",
+                    "Logon rejected: max_sessions_per_user exceeded"
+                );
+                metrics::counter!(
+                    "cq_logon_total",
+                    "result" => "fail_session_limit"
+                )
+                .increment(1);
+                return;
+            }
             session.username = Some(matched.username.clone());
             session.entitlements = matched.entitlements.clone();
             // S25 audit event: explicit `target = "cq_audit"` so the
@@ -3868,6 +3954,7 @@ mod sync_repl_tests {
             read_only: false,
             query_limits: cq_core::query::QueryLimits::default(),
             sync_replication: sync,
+            connection_limits: None,
         }
     }
 
@@ -4007,5 +4094,154 @@ mod sync_repl_tests {
             .expect("frame");
         let m = decode(&frame);
         assert_eq!(m.status, Some(Status::Error));
+    }
+}
+
+/// D3/P0.3 — `max_sessions_per_user`, enforced in `handle_logon` (via
+/// `dispatch`) since user identity isn't known until a successful
+/// logon. Drives real `Logon` frames through `dispatch` against a
+/// `RouterContext` carrying a `ConnectionLimits` with a tiny cap, and
+/// checks: (a) sessions beyond the cap for the SAME user are rejected
+/// with an error ack + the `cq_logon_total{result="fail_session_limit"}`
+/// path, (b) a different user is unaffected, (c) dropping a session
+/// (simulated by dropping its `Session`, which drops its
+/// `user_session_guard`) frees the slot for a retry.
+#[cfg(test)]
+mod session_limit_tests {
+    use super::*;
+    use crate::auth::{AuthStore, User};
+    use crate::limits::{ConnectionLimits, LimitsConfig, RejectReason};
+    use crate::session::{new_registry, OutboundFrame, Session};
+    use cq_protocol::command::{Command, Status};
+    use dashmap::DashMap;
+
+    fn logon_msg(user: &str, pass: &str) -> CqMessage {
+        let mut m = CqMessage::new(Command::Logon);
+        m.command_id = Some(format!("logon-{user}"));
+        let mut creds = serde_json::Map::new();
+        creds.insert("user".into(), user.into());
+        creds.insert("password".into(), pass.into());
+        m.data = Some(serde_json::Value::Object(creds));
+        m
+    }
+
+    fn ctx_with_user_cap(cap: usize) -> RouterContext {
+        let hash = bcrypt::hash("s3cret", 4).unwrap();
+        let alice = User::from_parts("alice".into(), hash.clone(), &["*:*".into()]).unwrap();
+        let bob = User::from_parts("bob".into(), hash, &["*:*".into()]).unwrap();
+        let auth = Arc::new(AuthStore::new(true, vec![alice, bob]));
+        let limits = ConnectionLimits::new(LimitsConfig {
+            max_sessions_per_user: cap,
+            ..LimitsConfig::default()
+        });
+        RouterContext {
+            topics: Arc::new(DashMap::new()),
+            sessions: new_registry(),
+            queues: crate::queue::new_queue_registry(),
+            auth,
+            sow_batch_size: 64,
+            bookmark_store: new_bookmark_store(),
+            spillover: None,
+            read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: SyncReplication::default(),
+            connection_limits: Some(limits),
+        }
+    }
+
+    type MpscRx = tokio::sync::mpsc::Receiver<OutboundFrame>;
+
+    fn new_session() -> (Session, MpscRx) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundFrame>(16);
+        (Session::new("t".into(), tx), rx)
+    }
+
+    fn last_ack(rx: &mut MpscRx) -> CqMessage {
+        let frame = rx.try_recv().expect("expected a frame");
+        serde_json::from_slice(frame.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn second_session_for_same_user_over_cap_is_rejected() {
+        let ctx = ctx_with_user_cap(1);
+
+        let (mut s1, mut rx1) = new_session();
+        dispatch(&mut s1, logon_msg("alice", "s3cret"), &ctx);
+        let ack1 = last_ack(&mut rx1);
+        assert_eq!(ack1.status, Some(Status::Ok), "first logon should succeed");
+        assert_eq!(ctx.connection_limits.as_ref().unwrap().sessions_for_user("alice"), 1);
+
+        let (mut s2, mut rx2) = new_session();
+        dispatch(&mut s2, logon_msg("alice", "s3cret"), &ctx);
+        let ack2 = last_ack(&mut rx2);
+        assert_eq!(
+            ack2.status,
+            Some(Status::Error),
+            "second concurrent session for the same user must be rejected"
+        );
+        assert!(ack2
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("too many concurrent sessions"));
+        assert!(s2.username.is_none(), "rejected logon must not set identity");
+    }
+
+    #[tokio::test]
+    async fn different_user_is_unaffected_by_another_users_cap() {
+        let ctx = ctx_with_user_cap(1);
+
+        let (mut s1, mut rx1) = new_session();
+        dispatch(&mut s1, logon_msg("alice", "s3cret"), &ctx);
+        assert_eq!(last_ack(&mut rx1).status, Some(Status::Ok));
+
+        let (mut s2, mut rx2) = new_session();
+        dispatch(&mut s2, logon_msg("bob", "s3cret"), &ctx);
+        assert_eq!(
+            last_ack(&mut rx2).status,
+            Some(Status::Ok),
+            "bob's logon must not be blocked by alice's session count"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_frees_its_slot_for_a_retry() {
+        let ctx = ctx_with_user_cap(1);
+
+        let (mut s1, mut rx1) = new_session();
+        dispatch(&mut s1, logon_msg("alice", "s3cret"), &ctx);
+        assert_eq!(last_ack(&mut rx1).status, Some(Status::Ok));
+        assert_eq!(ctx.connection_limits.as_ref().unwrap().sessions_for_user("alice"), 1);
+
+        // Simulate disconnect: drop the Session, which drops its
+        // `user_session_guard`.
+        drop(s1);
+        assert_eq!(ctx.connection_limits.as_ref().unwrap().sessions_for_user("alice"), 0);
+
+        let (mut s2, mut rx2) = new_session();
+        dispatch(&mut s2, logon_msg("alice", "s3cret"), &ctx);
+        assert_eq!(
+            last_ack(&mut rx2).status,
+            Some(Status::Ok),
+            "retry after the first session dropped should succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_cap_disables_the_check() {
+        let ctx = ctx_with_user_cap(0);
+        for _ in 0..5 {
+            let (mut s, mut rx) = new_session();
+            dispatch(&mut s, logon_msg("alice", "s3cret"), &ctx);
+            assert_eq!(last_ack(&mut rx).status, Some(Status::Ok));
+            // Keep session alive for the duration of the loop iteration
+            // only; explicit drop makes intent clear.
+            drop(s);
+        }
+    }
+
+    #[test]
+    fn reject_reason_label_matches_metric_convention() {
+        assert_eq!(RejectReason::MaxSessionsPerUser.as_str(), "max_sessions_per_user");
     }
 }

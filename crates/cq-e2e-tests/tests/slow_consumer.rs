@@ -105,6 +105,7 @@ async fn slow_consumer_drops_are_observable() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -174,6 +175,7 @@ async fn admin_delete_subscription_disconnects_slow_consumer() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -256,6 +258,7 @@ async fn auto_disconnect_kicks_in_when_drops_exceed_threshold() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;

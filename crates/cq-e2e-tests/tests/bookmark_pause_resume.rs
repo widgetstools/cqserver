@@ -48,6 +48,7 @@ async fn pause_then_resume_resumes_replay_from_same_point() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;

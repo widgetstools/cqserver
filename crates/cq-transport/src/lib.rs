@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod delivery;
 pub mod heartbeat;
+pub mod limits;
 pub mod queue;
 pub mod router;
 pub mod session;

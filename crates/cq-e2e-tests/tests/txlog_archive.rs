@@ -32,6 +32,7 @@ async fn archived_segments_replay_on_restart() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -93,6 +94,7 @@ async fn restart_with_no_archived_segments_recovers_from_live_log() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;
@@ -138,6 +140,7 @@ async fn restart_mixes_archived_and_live_segments() {
             hard_max_sow_result_rows: None,
             admin_token: None,
             admin_tls: None,
+            transport_limits: None,
         },
     )
     .await;

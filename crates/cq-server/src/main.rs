@@ -514,6 +514,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
+    // D3/P0.3 — one `ConnectionLimits` instance for the whole process,
+    // shared (via Arc) between the TCP and WebSocket accept loops so a
+    // client can't dodge `max_connections` by switching transport.
+    let connection_limits = cq_transport::limits::ConnectionLimits::new(
+        server_config.transport.limits.to_transport(),
+    );
+    info!(
+        max_connections = server_config.transport.limits.max_connections,
+        max_connections_per_ip = server_config.transport.limits.max_connections_per_ip,
+        accept_rate_per_sec = server_config.transport.limits.accept_rate_per_sec,
+        max_sessions_per_user = server_config.transport.limits.max_sessions_per_user,
+        "Connection/rate limits configured"
+    );
+
     let ws_config = WsConfig {
         listen_addr: server_config.websocket_addr.clone(),
         path: server_config.websocket_path.clone(),
@@ -527,6 +541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ws_max_message_bytes
             .unwrap_or(cq_protocol::codec::MAX_FRAME_SIZE),
         sync_replication,
+        connection_limits: Some(connection_limits.clone()),
     };
     let tcp_config = TcpConfig {
         listen_addr: server_config.tcp_addr.clone(),
@@ -538,6 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         read_only,
         query_limits,
         sync_replication,
+        connection_limits: Some(connection_limits),
     };
 
     let heartbeat_cfg = HeartbeatConfig {

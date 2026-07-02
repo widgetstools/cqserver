@@ -846,6 +846,12 @@ pub struct Session {
     /// silently dropping frames). Each `DeliveryRoute` for this session
     /// is built with a clone of this.
     pub disconnect: Arc<tokio::sync::Notify>,
+    /// D3/P0.3 — held for the lifetime of a successful, limit-checked
+    /// logon. Dropping it (on disconnect, or on a later re-logon)
+    /// decrements the per-user session count in `ConnectionLimits`.
+    /// `None` until a logon that both succeeds AND passes the
+    /// `max_sessions_per_user` check.
+    pub user_session_guard: Option<crate::limits::UserSessionGuard>,
 }
 
 impl Session {
@@ -868,6 +874,7 @@ impl Session {
             )),
             client_name: None,
             disconnect: Arc::new(tokio::sync::Notify::new()),
+            user_session_guard: None,
         }
     }
 
