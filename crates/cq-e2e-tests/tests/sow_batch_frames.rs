@@ -51,6 +51,7 @@ async fn sow_arrives_as_chunked_batch_frames() {
             replication: None,
             hard_max_sow_result_rows: None,
         admin_token: None,
+        admin_tls: None,
     };
     let server = start_server_with(vec![topic], opts).await;
 

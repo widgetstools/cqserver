@@ -24,6 +24,9 @@ pub struct ServerHandle {
     pub ws_port: u16,
     pub admin_port: u16,
     pub config_dir: PathBuf,
+    /// Set when the server was started with `ServerOpts.admin_tls`.
+    /// Changes `admin_url()`'s scheme from `http://` to `https://`.
+    pub admin_tls: bool,
     // Optional so `stop_keeping_dir` can move them out and into a
     // `KeptDir` for a later restart on the same on-disk state.
     child: Option<Child>,
@@ -32,7 +35,8 @@ pub struct ServerHandle {
 
 impl ServerHandle {
     pub fn admin_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.admin_port)
+        let scheme = if self.admin_tls { "https" } else { "http" };
+        format!("{scheme}://127.0.0.1:{}", self.admin_port)
     }
     pub fn tcp_url(&self) -> String {
         format!("tcp://127.0.0.1:{}", self.tcp_port)
@@ -215,6 +219,14 @@ pub struct ServerOpts {
     /// leaves the admin API unauthenticated (default, matches
     /// `ServerConfig::admin_token`'s own default).
     pub admin_token: Option<String>,
+    /// When `Some`, the admin HTTP server is served over TLS
+    /// (`[admin_tls]`). Reuses the same `TlsOpts` shape as
+    /// `ServerOpts.tls` (transport TLS); the harness generates an
+    /// independent self-signed cert+key for this one so tests can mix
+    /// transport TLS and admin TLS independently. `None` (the
+    /// default) serves the admin API over plain HTTP, matching every
+    /// existing test.
+    pub admin_tls: Option<TlsOpts>,
 }
 
 /// Replication config for the e2e harness. Mirrors
@@ -476,6 +488,7 @@ impl Default for ServerOpts {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         }
     }
 }
@@ -506,20 +519,14 @@ pub async fn start_server_with(
     // If TLS is requested, generate a self-signed cert+key for the SAN
     // and stash the paths in the config dir so `build_toml` can embed
     // them under [transport.tls].
-    let tls_paths = opts.tls.as_ref().map(|t| {
-        let cert = config_dir.join("test-tls.crt");
-        let key = config_dir.join("test-tls.key");
-        let mut params = rcgen::CertificateParams::new(vec![t.san.clone()]).expect("rcgen params");
-        params.distinguished_name.push(
-            rcgen::DnType::CommonName,
-            t.san.clone(),
-        );
-        let key_pair = rcgen::KeyPair::generate().expect("keypair");
-        let cert_obj = params.self_signed(&key_pair).expect("self-signed cert");
-        std::fs::write(&cert, cert_obj.pem()).expect("write cert");
-        std::fs::write(&key, key_pair.serialize_pem()).expect("write key");
-        (cert, key)
-    });
+    let tls_paths = opts.tls.as_ref().map(|t| generate_self_signed(&config_dir, "test-tls", t));
+
+    // Independent cert for admin TLS — separate file names so a test
+    // that enables both transport TLS and admin TLS doesn't collide.
+    let admin_tls_paths = opts
+        .admin_tls
+        .as_ref()
+        .map(|t| generate_self_signed(&config_dir, "test-admin-tls", t));
 
     let toml = build_toml(
         tcp_port,
@@ -530,11 +537,39 @@ pub async fn start_server_with(
         &schemas_dir,
         &opts,
         tls_paths.as_ref(),
+        admin_tls_paths.as_ref(),
     );
     let toml_path = config_dir.join("cqserver.toml");
     std::fs::write(&toml_path, toml).expect("write toml");
 
-    spawn_server(root, config_dir, tempdir, tcp_port, ws_port, admin_port).await
+    spawn_server(
+        root,
+        config_dir,
+        tempdir,
+        tcp_port,
+        ws_port,
+        admin_port,
+        opts.admin_tls.is_some(),
+    )
+    .await
+}
+
+/// Generate a self-signed cert+key for `opts.san` under `dir`, named
+/// `{prefix}.crt` / `{prefix}.key`. Shared by both transport TLS and
+/// admin TLS harness paths so the two don't duplicate rcgen setup.
+fn generate_self_signed(dir: &Path, prefix: &str, opts: &TlsOpts) -> (PathBuf, PathBuf) {
+    let cert = dir.join(format!("{prefix}.crt"));
+    let key = dir.join(format!("{prefix}.key"));
+    let mut params =
+        rcgen::CertificateParams::new(vec![opts.san.clone()]).expect("rcgen params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, opts.san.clone());
+    let key_pair = rcgen::KeyPair::generate().expect("keypair");
+    let cert_obj = params.self_signed(&key_pair).expect("self-signed cert");
+    std::fs::write(&cert, cert_obj.pem()).expect("write cert");
+    std::fs::write(&key, key_pair.serialize_pem()).expect("write key");
+    (cert, key)
 }
 
 /// Stop the server but keep its config dir and txlog. Useful for
@@ -553,16 +588,17 @@ pub async fn stop_keeping_dir(mut handle: ServerHandle) -> KeptDir {
         tcp_port: handle.tcp_port,
         ws_port: handle.ws_port,
         admin_port: handle.admin_port,
+        admin_tls: handle.admin_tls,
     }
 }
 
 /// Restart a server against a previously-kept config / txlog. Returns
 /// a fresh ServerHandle on the same ports.
 pub async fn restart_kept(kept: KeptDir) -> ServerHandle {
-    let KeptDir { tempdir, config_dir, root, tcp_port, ws_port, admin_port } = kept;
+    let KeptDir { tempdir, config_dir, root, tcp_port, ws_port, admin_port, admin_tls } = kept;
     // Give the OS a beat to free the listening socket.
     tokio::time::sleep(Duration::from_millis(120)).await;
-    spawn_server(root, config_dir, tempdir, tcp_port, ws_port, admin_port).await
+    spawn_server(root, config_dir, tempdir, tcp_port, ws_port, admin_port, admin_tls).await
 }
 
 async fn spawn_server(
@@ -572,6 +608,7 @@ async fn spawn_server(
     tcp_port: u16,
     ws_port: u16,
     admin_port: u16,
+    admin_tls: bool,
 ) -> ServerHandle {
     let binary = locate_server_binary();
     let mut cmd = Command::new(&binary);
@@ -592,6 +629,7 @@ async fn spawn_server(
         ws_port,
         admin_port,
         config_dir,
+        admin_tls,
         child: Some(child),
         tempdir: Some(tempdir),
     };
@@ -610,6 +648,7 @@ pub struct KeptDir {
     tcp_port: u16,
     ws_port: u16,
     admin_port: u16,
+    admin_tls: bool,
 }
 
 impl KeptDir {
@@ -640,6 +679,7 @@ fn build_toml(
     schemas_dir: &Path,
     opts: &ServerOpts,
     tls_paths: Option<&(PathBuf, PathBuf)>,
+    admin_tls_paths: Option<&(PathBuf, PathBuf)>,
 ) -> String {
     let mut out = String::new();
     use std::fmt::Write as _;
@@ -653,6 +693,27 @@ fn build_toml(
     writeln!(out, "heartbeat_interval_s = 60").unwrap();
     writeln!(out, "heartbeat_idle_timeout_s = 600").unwrap();
     writeln!(out).unwrap();
+
+    // Admin TLS (D2/P0.2). Top-level `[admin_tls]` table — deliberately
+    // not nested under `[transport]` (that's the TCP transport's TLS)
+    // and not a new `[admin]` table (which would mean moving the
+    // existing top-level `admin_addr`/`admin_token` keys).
+    if let Some((cert_path, key_path)) = admin_tls_paths {
+        writeln!(out, "[admin_tls]").unwrap();
+        writeln!(
+            out,
+            r#"cert_file = "{}""#,
+            cert_path.display().to_string().replace('\\', "/")
+        )
+        .unwrap();
+        writeln!(
+            out,
+            r#"key_file = "{}""#,
+            key_path.display().to_string().replace('\\', "/")
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+    }
 
     if let Some(rows) = opts.hard_max_sow_result_rows {
         writeln!(out, "[query_limits]").unwrap();
@@ -945,7 +1006,12 @@ fn workspace_root() -> PathBuf {
 async fn wait_for_healthz(h: &ServerHandle) {
     let url = format!("{}/healthz", h.admin_url());
     let deadline = Instant::now() + Duration::from_secs(15);
-    let client = reqwest::Client::new();
+    // Self-signed test certs won't validate against a real CA store,
+    // so the readiness probe (and any other test client hitting an
+    // `admin_tls`-enabled server) needs to skip cert verification.
+    // `danger_accept_invalid_certs` is scoped to this harness's own
+    // reqwest client, never shipped in the server.
+    let client = admin_http_client();
     loop {
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
@@ -957,6 +1023,18 @@ async fn wait_for_healthz(h: &ServerHandle) {
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
+}
+
+/// A `reqwest::Client` that accepts self-signed certs, for talking to
+/// an `admin_tls`-enabled test server. Tests exercising `[admin_tls]`
+/// (e.g. `admin_tls_e2e.rs`) should use this instead of
+/// `reqwest::Client::new()` so HTTPS requests to the harness-generated
+/// cert succeed; plain-HTTP-mode tests are unaffected either way.
+pub fn admin_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("build reqwest client")
 }
 
 /// Helper: read `/topics` admin endpoint and locate a topic's stats.

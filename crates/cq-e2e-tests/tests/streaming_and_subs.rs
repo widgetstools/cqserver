@@ -81,6 +81,7 @@ async fn snapshot_beyond_queue_capacity_completes() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -133,6 +134,7 @@ async fn many_concurrent_subscribes_no_ack_drops() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;

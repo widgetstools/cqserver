@@ -24,6 +24,15 @@ pub struct ServerConfig {
     /// before exposing the admin port beyond localhost.
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Optional TLS for the admin HTTP server. Mirrors
+    /// `[transport.tls]`'s shape exactly (same `TlsConfig`, same
+    /// PEM-file expectations). A separate top-level `[admin_tls]`
+    /// table (rather than nesting under a new `[admin]` table) keeps
+    /// the existing `admin_addr`/`admin_token` top-level keys
+    /// untouched. `None` (the default) serves the admin API over
+    /// plain HTTP, matching all existing deployments/tests.
+    #[serde(default)]
+    pub admin_tls: Option<TlsConfig>,
     #[serde(default = "default_heartbeat_interval_s")]
     pub heartbeat_interval_s: u64,
     #[serde(default = "default_heartbeat_idle_timeout_s")]
@@ -860,6 +869,7 @@ impl Default for ServerConfig {
             ws_max_message_bytes: None,
             admin_addr: default_admin_addr(),
             admin_token: None,
+            admin_tls: None,
             heartbeat_interval_s: default_heartbeat_interval_s(),
             heartbeat_idle_timeout_s: default_heartbeat_idle_timeout_s(),
             topics: vec![

@@ -503,3 +503,32 @@ async fn no_token_configured_leaves_api_open() {
         resp.status()
     );
 }
+
+/// Task 2.2 regression: with `[admin_tls]` absent (the default), the
+/// admin server keeps speaking plain HTTP — introducing the TLS
+/// branch in `start_admin_server_with_tls` must not change behavior
+/// for the (vastly more common) no-TLS deployments. `admin_url()`
+/// resolves to `http://` here since `ServerOpts::default()` leaves
+/// `admin_tls` unset, so a plain `reqwest::get` must succeed exactly
+/// as it always has.
+#[tokio::test]
+async fn plain_http_still_works_when_admin_tls_absent() {
+    let server = server_with_token().await;
+    assert!(
+        server.admin_url().starts_with("http://"),
+        "admin_url should be plain http:// when admin_tls is unset, got {}",
+        server.admin_url()
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/stats", server.admin_url()))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("plain http request");
+    assert!(
+        resp.status().is_success(),
+        "plain HTTP admin request should still succeed with admin_tls absent, got {:?}",
+        resp.status()
+    );
+}

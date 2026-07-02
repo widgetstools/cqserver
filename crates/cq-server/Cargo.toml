@@ -31,6 +31,22 @@ axum.workspace = true
 # CORS layers loaded since we don't need them here.
 tower-http = { version = "0.6", features = ["fs"] }
 memory-stats = "1.2"
+# Admin TLS (D2/P0.2): axum 0.7's `axum::serve` only accepts a plain
+# `tokio::net::TcpListener`, so terminating TLS in front of the axum
+# `Router` means driving the hyper server loop manually — accept a
+# `TcpStream`, hand it to `cq_transport::tls`'s `TlsAcceptor`, then
+# serve the axum service over the resulting stream with hyper-util's
+# auto (h1/h2) connection builder. This is axum's own documented
+# low-level-rustls pattern; pinned to the same hyper/hyper-util
+# versions axum 0.7.9 already pulls in transitively, so this adds no
+# new major dependency, just makes an existing transitive one direct.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+tower = "0.5"
+# Only used by name for the `tokio_rustls::TlsAcceptor` type returned by
+# `cq_transport::tls::build_tls_acceptor` (reused as-is, no new rustls
+# config code here). Workspace-pinned to match cq-transport's version.
+tokio-rustls.workspace = true
 
 # Custom allocator: jemalloc returns freed pages to the OS more
 # aggressively than the system malloc and reduces fragmentation on
@@ -42,6 +58,5 @@ memory-stats = "1.2"
 tikv-jemallocator = { version = "0.6", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
-tower = "0.5"
 http-body-util = "0.1"
 tempfile.workspace = true

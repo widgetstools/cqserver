@@ -24,6 +24,7 @@ async fn queue_lease_redelivers_to_other_consumer() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -93,6 +94,7 @@ async fn queue_ack_prevents_redelivery() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -154,6 +156,7 @@ async fn queue_distributes_across_consumers() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -201,6 +204,7 @@ async fn queue_redelivers_after_consumer_disconnects() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -246,6 +250,7 @@ async fn queue_lease_extension_defers_redelivery() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -300,6 +305,7 @@ async fn queue_grouped_messages_stick_to_one_consumer() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -353,6 +359,7 @@ async fn queue_no_message_loss_under_ack_pattern() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;

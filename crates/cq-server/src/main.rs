@@ -28,7 +28,7 @@ mod config;
 mod logging;
 mod watch;
 
-use admin::{start_admin_server, AdminState};
+use admin::AdminState;
 use config::{ColumnTypeSpec, ReplicationRole, TopicEntry, TxLogFsyncConfig, ViewEntry};
 use cq_core::schema::{ColumnType, Schema};
 use cq_core::topic::{SharedTopic, Topic, TopicConfig};
@@ -421,6 +421,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let admin_addr = server_config.admin_addr.clone();
 
+    // Admin TLS (D2/P0.2). Built up front (like the transport TLS
+    // acceptor below) so a misconfigured cert/key fails the process at
+    // startup rather than surfacing as a mysterious per-connection
+    // error later, on the dedicated admin thread where it'd be easy to
+    // miss.
+    let admin_tls_acceptor = match &server_config.admin_tls {
+        Some(tls) => {
+            let acceptor = cq_transport::tls::build_tls_acceptor(&tls.cert_file, &tls.key_file)
+                .map_err(|e| format!("admin TLS config: {}", e))?;
+            info!(
+                cert = %tls.cert_file,
+                key = %tls.key_file,
+                "TLS enabled on admin HTTP server"
+            );
+            Some(acceptor)
+        }
+        None => None,
+    };
+
     let outbound_capacity = server_config.transport.outbound_queue_capacity;
     let sow_batch_size = server_config.transport.sow_batch_size;
 
@@ -668,6 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let admin_addr = admin_addr.clone();
         let admin_state = admin_state.clone();
+        let admin_tls_acceptor = admin_tls_acceptor.clone();
         std::thread::Builder::new()
             .name("cq-admin-rt".into())
             .spawn(move || {
@@ -683,7 +703,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                 };
-                if let Err(e) = rt.block_on(start_admin_server(admin_addr, admin_state)) {
+                if let Err(e) = rt.block_on(admin::start_admin_server_with_tls(
+                    admin_addr,
+                    admin_state,
+                    admin_tls_acceptor,
+                )) {
                     tracing::error!(error = %e, "Admin server exited with error");
                 }
             })

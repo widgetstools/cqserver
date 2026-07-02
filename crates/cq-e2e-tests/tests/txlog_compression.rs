@@ -28,6 +28,7 @@ async fn compressed_archive_segments_replay_on_restart() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -80,6 +81,7 @@ async fn compressed_archive_recovers_last_write_per_key() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;
@@ -129,6 +131,7 @@ async fn compressed_archive_empty_topic_restart() {
             replication: None,
             hard_max_sow_result_rows: None,
             admin_token: None,
+            admin_tls: None,
         },
     )
     .await;

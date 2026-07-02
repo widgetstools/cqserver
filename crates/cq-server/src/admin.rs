@@ -88,9 +88,27 @@ pub struct ReplicationView {
     pub listen: Option<String>,
 }
 
+#[allow(dead_code)] // plain-HTTP convenience wrapper; kept as documented public API alongside start_admin_server_with_tls
 pub async fn start_admin_server(
     addr: String,
     state: AdminState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    start_admin_server_with_tls(addr, state, None).await
+}
+
+/// Same as [`start_admin_server`], but with an optional TLS acceptor
+/// (D2/P0.2, `[admin_tls]`). When `tls_acceptor` is `Some`, every
+/// accepted connection performs a TLS handshake before any HTTP
+/// traffic is read — plain `http://` requests get a connection the
+/// peer will see as immediately reset (no TLS ClientHello ever
+/// arrives, so the handshake fails and the socket closes), never a
+/// plaintext response. `None` preserves the historical plain-HTTP
+/// behavior via `axum::serve` byte-for-byte (no behavior change for
+/// the vastly more common no-TLS deployments).
+pub async fn start_admin_server_with_tls(
+    addr: String,
+    state: AdminState,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Everything except the liveness probe sits behind the optional
     // bearer-token guard. `/healthz` stays open so orchestrators can
@@ -169,9 +187,71 @@ pub async fn start_admin_server(
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(addr = %addr, "Admin HTTP server listening");
-    axum::serve(listener, app).await?;
+
+    match tls_acceptor {
+        None => {
+            info!(addr = %addr, "Admin HTTP server listening");
+            axum::serve(listener, app).await?;
+        }
+        Some(acceptor) => {
+            info!(addr = %addr, "Admin HTTPS server listening");
+            serve_with_tls(listener, acceptor, app).await;
+        }
+    }
     Ok(())
+}
+
+/// Manual accept loop terminating TLS in front of the axum `Router`.
+///
+/// `axum::serve` (axum 0.7) only accepts a plain `tokio::net::TcpListener`
+/// — there's no hook to wrap each accepted stream in a TLS handshake
+/// first. So this mirrors axum's own documented low-level-rustls
+/// example: accept a `TcpStream`, hand it to the `TlsAcceptor` built
+/// from `[admin_tls]` (via `cq_transport::tls::build_tls_acceptor`,
+/// the same helper `[transport.tls]` uses), then drive the
+/// already-built `Router` over the resulting `TlsStream` with
+/// hyper-util's auto (h1/h2) connection builder. One task per
+/// connection, same shape as `cq_transport::tcp::start_tcp_server`'s
+/// TLS branch.
+async fn serve_with_tls(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+) {
+    loop {
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "admin TLS listener: accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let tower_service = app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(addr = %peer_addr, error = %e, "admin TLS handshake failed");
+                    return;
+                }
+            };
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            let hyper_service = hyper_util::service::TowerToHyperService::new(tower_service);
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection_with_upgrades(io, hyper_service)
+            .await
+            {
+                // Client disconnects/resets show up here too (routine);
+                // logged at debug so a bounded burst of them doesn't
+                // page anyone.
+                tracing::debug!(addr = %peer_addr, error = %e, "admin HTTPS connection closed with error");
+            }
+        });
+    }
 }
 
 async fn admin_ui() -> impl IntoResponse {
