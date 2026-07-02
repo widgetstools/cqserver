@@ -8,8 +8,13 @@ websocket_path = "/cq/json"
 # schema mutation) and, without a token, unauthenticated config
 # disclosure. Expose beyond loopback only with `admin_token` set
 # below and, ideally, a `[admin.tls]` block in front of it.
+# `admin_token` is itself a secret field: it accepts a plain value or
+# the same `env://VARNAME` / `file:///abs/path` indirection documented
+# in the `[auth]` section below (D7/P0.7), so the token doesn't have
+# to live in plaintext here either.
 admin_addr = "127.0.0.1:8085"
 # admin_token = "change-me"
+# admin_token = "env://CQ_ADMIN_TOKEN"          # or "file:///run/secrets/admin_token"
 
 # Per-session outbound queue depth (frames). SOW uses backpressure (await
 # on send) and won't drop even when this is exceeded — sizing this is
@@ -326,3 +331,16 @@ hard_max_sow_result_bytes = 2147483648
 #   [[auth.users]]
 #   username = "svc-ingest"
 #   password_hash = "file:///run/secrets/svc_ingest_bcrypt_hash"
+
+# ── [replication] — shared secret also supports env://file:// ──────
+# No [replication] section here (this demo config is standalone), but
+# when peering nodes, `[replication].auth_token` is a secret field
+# too: it accepts a plain value or the same `env://VARNAME` /
+# `file:///abs/path` indirection documented above for `[auth]`
+# (D7/P0.7).
+#
+# Example:
+#   [replication]
+#   role = "primary"
+#   peers = ["10.0.0.2:9107"]
+#   auth_token = "env://CQ_REPLICATION_TOKEN"   # or "file:///run/secrets/replication_token"

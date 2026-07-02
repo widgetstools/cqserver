@@ -1135,12 +1135,19 @@ pub fn load_config_from_with_raw(
     let content = substitute_env_vars(&raw)?;
     let mut config: ServerConfig = toml::from_str(&content)?;
     // D7/P0.7 — resolve `env://`/`file://` indirection on secret
-    // fields (JWT secret, user password hashes) after parsing.
-    // Deliberately applied to the parsed `ServerConfig`, not the
-    // `content` string returned to the caller, so the admin UI's
-    // "expanded config" view keeps showing the operator's literal
-    // `env://`/`file://` reference rather than the resolved secret.
+    // fields (JWT secret, user password hashes, admin API token,
+    // replication shared secret) after parsing. Deliberately applied
+    // to the parsed `ServerConfig`, not the `content` string returned
+    // to the caller, so the admin UI's "expanded config" view keeps
+    // showing the operator's literal `env://`/`file://` reference
+    // rather than the resolved secret.
     config.auth.resolve_secrets()?;
+    if let Some(admin_token) = &config.admin_token {
+        config.admin_token = Some(resolve_secret(admin_token)?);
+    }
+    if let Some(auth_token) = &config.replication.auth_token {
+        config.replication.auth_token = Some(resolve_secret(auth_token)?);
+    }
     let dir = config_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -1451,6 +1458,112 @@ mod resolve_secret_tests {
 
     fn err_to_string(err: &ConfigError) -> String {
         format!("{err}")
+    }
+
+    /// D7/P0.7 follow-up — `admin_token` (top-level `ServerConfig`)
+    /// and `replication.auth_token` are two more plaintext-secret
+    /// fields; without wiring them through `resolve_secret` at
+    /// load time, `env://`/`file://` would silently do nothing for
+    /// them (the literal string would be used as the token). These
+    /// tests exercise the real load path — `load_config_from_with_raw`
+    /// against a temp TOML file — rather than calling `resolve_secret`
+    /// directly, so they catch a regression if the load-site wiring
+    /// is ever removed.
+    fn minimal_config_toml(extra: &str) -> String {
+        format!(
+            "tcp_addr = \"127.0.0.1:0\"\nwebsocket_addr = \"127.0.0.1:0\"\nwebsocket_path = \"/\"\n{extra}\n"
+        )
+    }
+
+    fn write_temp_config(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cq_test_config_{}_{}.toml",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, contents).expect("write temp config file");
+        path
+    }
+
+    #[test]
+    fn admin_token_env_scheme_resolves_at_load_time() {
+        std::env::set_var("CQ_TEST_ADMINTOK_PRESENT", "admin-secret-value");
+        let toml = minimal_config_toml("admin_token = \"env://CQ_TEST_ADMINTOK_PRESENT\"\n");
+        let path = write_temp_config("admintok_present", &toml);
+
+        let (config, _dir, _raw) =
+            super::load_config_from_with_raw(&path).expect("load config with resolved secret");
+
+        assert_eq!(config.admin_token.as_deref(), Some("admin-secret-value"));
+
+        let _ = std::fs::remove_file(&path);
+        std::env::remove_var("CQ_TEST_ADMINTOK_PRESENT");
+    }
+
+    #[test]
+    fn admin_token_env_scheme_missing_var_errors_loudly() {
+        std::env::remove_var("CQ_TEST_ADMINTOK_MISSING");
+        let toml = minimal_config_toml("admin_token = \"env://CQ_TEST_ADMINTOK_MISSING\"\n");
+        let path = write_temp_config("admintok_missing", &toml);
+
+        let err =
+            super::load_config_from_with_raw(&path).expect_err("missing env var must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CQ_TEST_ADMINTOK_MISSING"),
+            "error should name the missing var: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn admin_token_plaintext_passes_through() {
+        let toml = minimal_config_toml("admin_token = \"plain-admin-token\"\n");
+        let path = write_temp_config("admintok_plaintext", &toml);
+
+        let (config, _dir, _raw) =
+            super::load_config_from_with_raw(&path).expect("load config with plaintext token");
+
+        assert_eq!(config.admin_token.as_deref(), Some("plain-admin-token"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replication_auth_token_env_scheme_resolves_at_load_time() {
+        std::env::set_var("CQ_TEST_REPLTOK_PRESENT", "replication-secret-value");
+        let toml = minimal_config_toml(
+            "[replication]\nauth_token = \"env://CQ_TEST_REPLTOK_PRESENT\"\n",
+        );
+        let path = write_temp_config("repltok_present", &toml);
+
+        let (config, _dir, _raw) =
+            super::load_config_from_with_raw(&path).expect("load config with resolved secret");
+
+        assert_eq!(
+            config.replication.auth_token.as_deref(),
+            Some("replication-secret-value")
+        );
+
+        let _ = std::fs::remove_file(&path);
+        std::env::remove_var("CQ_TEST_REPLTOK_PRESENT");
+    }
+
+    #[test]
+    fn replication_auth_token_plaintext_passes_through() {
+        let toml = minimal_config_toml("[replication]\nauth_token = \"plain-repl-token\"\n");
+        let path = write_temp_config("repltok_plaintext", &toml);
+
+        let (config, _dir, _raw) =
+            super::load_config_from_with_raw(&path).expect("load config with plaintext token");
+
+        assert_eq!(
+            config.replication.auth_token.as_deref(),
+            Some("plain-repl-token")
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
