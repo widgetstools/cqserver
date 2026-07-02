@@ -25,7 +25,9 @@ use cq_protocol::codec::decode_frame;
 use cq_protocol::codec::encode_frame;
 use cq_protocol::message::CqMessage;
 use dashmap::DashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(test)]
@@ -33,6 +35,40 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
+
+/// Upper bound on how long a TLS handshake may take before we give up
+/// and drop the connection. The handshake happens before any
+/// authentication, so an unbounded wait here is a slowloris vector: a
+/// client that opens the socket and never sends (or trickles) a
+/// ClientHello would otherwise hold a spawned task + fd open forever.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `acceptor.accept(stream)` bounded by `timeout`. Returns `Ok` on
+/// a completed handshake, `Err(None)` on a handshake error from
+/// rustls, or `Err(Some(()))`-shaped via `Ok(Err(_))`/timeout — see
+/// call sites for how each case is logged. Factored out (with the
+/// timeout as a parameter) so tests can inject a short timeout instead
+/// of waiting out the real `TLS_HANDSHAKE_TIMEOUT`.
+async fn accept_tls_with_timeout(
+    acceptor: &TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+        Ok(Ok(tls_stream)) => Some(tls_stream),
+        Ok(Err(e)) => {
+            warn!(addr = %addr, error = %e, "TLS handshake failed");
+            metrics::counter!("cq_tls_handshake_errors_total").increment(1);
+            None
+        }
+        Err(_elapsed) => {
+            warn!(addr = %addr, timeout_ms = timeout.as_millis() as u64, "TLS handshake timed out");
+            metrics::counter!("cq_tls_handshake_errors_total").increment(1);
+            None
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TcpConfig {
@@ -125,8 +161,15 @@ pub async fn start_tcp_server(
             info!(addr = %addr, "TCP client connected");
             metrics::gauge!("cq_connections_active").increment(1.0);
             match tls_acceptor {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
+                Some(acceptor) => {
+                    if let Some(tls_stream) = accept_tls_with_timeout(
+                        &acceptor,
+                        stream,
+                        addr,
+                        TLS_HANDSHAKE_TIMEOUT,
+                    )
+                    .await
+                    {
                         handle_tcp_connection(
                             tls_stream,
                             addr.to_string(),
@@ -136,11 +179,7 @@ pub async fn start_tcp_server(
                         )
                         .await;
                     }
-                    Err(e) => {
-                        warn!(addr = %addr, error = %e, "TLS handshake failed");
-                        metrics::counter!("cq_tls_handshake_errors_total").increment(1);
-                    }
-                },
+                }
                 None => {
                     handle_tcp_connection(stream, addr.to_string(), ctx, heartbeat, queue_capacity)
                         .await;
@@ -1303,5 +1342,67 @@ mod tests {
         drop(b_r);
         drop(p_w);
         server.abort();
+    }
+
+    /// Build a throwaway self-signed `TlsAcceptor` for handshake tests.
+    fn test_tls_acceptor() -> TlsAcceptor {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+            .expect("key der");
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config");
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Slowloris guard: a client that opens the TCP connection and
+    /// never sends a ClientHello (or anything at all) must not hold
+    /// `accept_tls_with_timeout` open past the configured timeout. Uses
+    /// a short injected timeout so the test runs in well under a
+    /// second instead of waiting out the real `TLS_HANDSHAKE_TIMEOUT`.
+    #[tokio::test]
+    async fn tls_handshake_times_out_on_silent_client() {
+        let acceptor = test_tls_acceptor();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Client connects but never writes a byte — no ClientHello ever
+        // arrives, so the handshake future would hang forever without
+        // the timeout wrapper.
+        let _client = TcpStream::connect(addr).await.unwrap();
+
+        let (stream, peer) = listener.accept().await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let result = accept_tls_with_timeout(
+            &acceptor,
+            stream,
+            peer,
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "handshake with a silent client must not succeed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handshake should have been aborted by the injected 200ms timeout, took {:?}",
+            elapsed
+        );
     }
 }

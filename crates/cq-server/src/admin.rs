@@ -29,7 +29,16 @@ use cq_transport::session::SessionRegistry;
 use dashmap::DashMap;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
+
+/// Upper bound on how long the admin TLS handshake may take before we
+/// give up and drop the connection. This runs pre-auth (before the
+/// bearer-token check on any route), so an unbounded wait is a
+/// slowloris vector: a client that opens the socket and never
+/// completes (or trickles) the TLS ClientHello would otherwise hold a
+/// spawned task + fd open forever.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct AdminState {
@@ -195,7 +204,7 @@ pub async fn start_admin_server_with_tls(
         }
         Some(acceptor) => {
             info!(addr = %addr, "Admin HTTPS server listening");
-            serve_with_tls(listener, acceptor, app).await;
+            serve_with_tls(listener, acceptor, app, TLS_HANDSHAKE_TIMEOUT).await;
         }
     }
     Ok(())
@@ -213,10 +222,17 @@ pub async fn start_admin_server_with_tls(
 /// hyper-util's auto (h1/h2) connection builder. One task per
 /// connection, same shape as `cq_transport::tcp::start_tcp_server`'s
 /// TLS branch.
+///
+/// `handshake_timeout` bounds `acceptor.accept(..)`: pre-auth, a
+/// slow/stalled ClientHello would otherwise hold the spawned task +
+/// socket open indefinitely (handshake slowloris). Callers use
+/// `TLS_HANDSHAKE_TIMEOUT`; it's a parameter so tests can inject a
+/// short timeout instead of waiting out the real 10s.
 async fn serve_with_tls(
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     app: Router,
+    handshake_timeout: Duration,
 ) {
     loop {
         let (stream, peer_addr) = match listener.accept().await {
@@ -230,10 +246,23 @@ async fn serve_with_tls(
         let tower_service = app.clone();
 
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
+            let tls_stream = match tokio::time::timeout(
+                handshake_timeout,
+                acceptor.accept(stream),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     tracing::warn!(addr = %peer_addr, error = %e, "admin TLS handshake failed");
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        addr = %peer_addr,
+                        timeout_ms = handshake_timeout.as_millis() as u64,
+                        "TLS handshake timed out"
+                    );
                     return;
                 }
             };
@@ -1244,5 +1273,76 @@ mod tests {
         // We're just verifying the endpoint exists and serves text.
         let ct = res.headers().get("content-type").unwrap();
         assert!(ct.to_str().unwrap().starts_with("text/plain"));
+    }
+
+    /// Build a throwaway self-signed `TlsAcceptor` for handshake tests.
+    fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("rcgen params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let cert = params.self_signed(&key_pair).expect("self-signed cert");
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+            .expect("key der");
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Slowloris guard for the admin TLS accept loop: a client that
+    /// opens the TCP connection and never sends a ClientHello must not
+    /// hold `serve_with_tls`'s spawned task/socket open past the
+    /// configured handshake timeout. Uses a short injected timeout
+    /// (`serve_with_tls`'s `handshake_timeout` parameter) so the test
+    /// runs in well under a second instead of waiting out the real
+    /// `TLS_HANDSHAKE_TIMEOUT`.
+    #[tokio::test]
+    async fn admin_tls_handshake_times_out_on_silent_client() {
+        let acceptor = test_tls_acceptor();
+        let app = Router::new().route("/healthz", get(|| async { "ok" }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(serve_with_tls(
+            listener,
+            acceptor,
+            app,
+            std::time::Duration::from_millis(200),
+        ));
+
+        // Client connects but never writes a byte — no ClientHello ever
+        // arrives, so without the timeout wrapper the server's spawned
+        // task (and this socket) would hang forever.
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // The server should give up on the handshake and move on to
+        // accepting the next connection well within a couple of
+        // seconds. Prove liveness by connecting again and confirming
+        // the accept loop is still servicing new connections (it
+        // would still be blocked in the first `acceptor.accept` had
+        // the timeout not fired).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(client);
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await;
+        assert!(
+            second.is_ok() && second.unwrap().is_ok(),
+            "accept loop should still be accepting new connections after the first handshake timed out"
+        );
+
+        server.abort();
     }
 }

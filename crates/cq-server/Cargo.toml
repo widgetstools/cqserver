@@ -60,3 +60,10 @@ tikv-jemallocator = { version = "0.6", features = ["background_threads", "unpref
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile.workspace = true
+# Self-signed certs for the admin TLS handshake-timeout unit test.
+# Same version/features cq-e2e-tests already uses for its TLS harness.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
+# Only used by the test to build a rustls ServerConfig directly (the
+# CertificateDer/PrivateKeyDer/ServerConfig types); workspace-pinned
+# to match cq-transport's version.
+rustls.workspace = true
