@@ -56,12 +56,13 @@ Anyone on the network reaching the admin port (default `:8085`) can:
 loopback-only by default. Document the reverse-proxy pattern for
 production fronting (nginx + OAuth proxy, or AWS ALB + Cognito, etc).
 
-### P0.2 Admin port has no TLS
+### P0.2 Admin port has no TLS — DONE
 
-TCP transport supports TLS; admin HTTP doesn't. Production browsers
-won't load `http://admin.cqserver.example` without warnings; ops
-tooling shouldn't either. Add an optional `[admin.tls]` block mirroring
-`[transport.tls]`.
+RESOLVED: an optional top-level `[admin_tls]` block (`cert_file`/`key_file`)
+now enables TLS on the admin HTTP server, mirroring `[transport.tls]` and
+reusing the same acceptor. The table is `[admin_tls]` (NOT `[admin.tls]`);
+a mistyped `[admin.tls]` is silently ignored and the admin API stays
+plaintext, so copy the name exactly.
 
 ### P0.3 No connection / rate limits
 

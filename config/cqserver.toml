@@ -7,7 +7,10 @@ websocket_path = "/cq/json"
 # (unsubscribe, journal rotation, store shrink, view create/delete,
 # schema mutation) and, without a token, unauthenticated config
 # disclosure. Expose beyond loopback only with `admin_token` set
-# below and, ideally, a `[admin.tls]` block in front of it.
+# below and, ideally, a top-level `[admin_tls]` block (cert_file/key_file)
+# in front of it. NOTE the table name is `[admin_tls]`, NOT `[admin.tls]`
+# — a mistyped `[admin.tls]` is silently ignored and the admin API keeps
+# serving plaintext.
 # `admin_token` is itself a secret field: it accepts a plain value or
 # the same `env://VARNAME` / `file:///abs/path` indirection documented
 # in the `[auth]` section below (D7/P0.7), so the token doesn't have
