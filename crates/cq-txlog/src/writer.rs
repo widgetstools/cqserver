@@ -359,6 +359,30 @@ impl TxLogWriter {
         origin: &str,
         payload: &[u8],
     ) -> Result<(), TxLogError> {
+        self.append_with_origin_format(
+            sequence,
+            topic,
+            key,
+            origin,
+            payload,
+            crate::PayloadFormat::Json,
+        )
+    }
+
+    /// As [`Self::append_with_origin`], but stamps the payload encoding. A
+    /// `JsonDelta` payload (sparse `{key + changed fields}`) is written with
+    /// the `0x03` marker and always uses the V2 body layout so the marker is
+    /// present for the reader to detect.
+    pub fn append_with_origin_format(
+        &mut self,
+        sequence: u64,
+        topic: &str,
+        key: &str,
+        origin: &str,
+        payload: &[u8],
+        format: crate::PayloadFormat,
+    ) -> Result<(), TxLogError> {
+        let delta = format == crate::PayloadFormat::JsonDelta;
         if topic.len() > MAX_TOPIC_LEN {
             return Err(TxLogError::TopicTooLong {
                 len: topic.len(),
@@ -374,7 +398,9 @@ impl TxLogWriter {
         let topic_bytes = topic.as_bytes();
         let key_bytes = key.as_bytes();
         let origin_bytes = origin.as_bytes();
-        let v2 = !origin.is_empty();
+        // Delta payloads always use the V2 layout so their `0x03` marker is
+        // present for the reader.
+        let v2 = delta || !origin.is_empty();
 
         let body_len = if v2 {
             1 + 8 + 8 + 2 + topic_bytes.len() + 2 + key_bytes.len() + 2 + origin_bytes.len()
@@ -411,7 +437,11 @@ impl TxLogWriter {
         let mut frame = Vec::with_capacity(4 + 4 + body_len);
         frame.extend_from_slice(&[0u8; 8]); // header placeholder: len(4) + crc(4)
         if v2 {
-            frame.push(TXLOG_FORMAT_V2);
+            frame.push(if delta {
+                crate::TXLOG_FORMAT_V2_DELTA
+            } else {
+                TXLOG_FORMAT_V2
+            });
         }
         frame.extend_from_slice(&sequence.to_be_bytes());
         frame.extend_from_slice(&now_ms().to_be_bytes());
@@ -459,6 +489,47 @@ impl TxLogWriter {
             self.max_sequence = sequence;
         }
         Ok(())
+    }
+
+    /// Delete sealed segments whose id is strictly below `cutoff`,
+    /// clamped so the active segment is never deleted. Returns the
+    /// number of segment files removed.
+    ///
+    /// This is the reclaim primitive behind `snapshot_reclaim`: it is
+    /// only safe to call with a `cutoff` that a *crash-durable*
+    /// artifact (the `snapshot.bin` checkpoint) fully covers —
+    /// recovery must never need a pruned segment. Archived copies
+    /// (when `archive_dir` is configured) are not touched: rotation
+    /// already moved sealed segments there, and the archive is the
+    /// long-term retention tier.
+    pub fn prune_segments_below(&mut self, cutoff: u64) -> Result<u64, TxLogError> {
+        let cutoff = cutoff.min(self.current_id);
+        let mut deleted = 0u64;
+        for (id, path) in list_segments(&self.dir)? {
+            if id >= cutoff {
+                continue;
+            }
+            // Best-effort per file: a segment we can't delete (perms,
+            // stale NFS handle) is logged and retried on the next
+            // reclaim rather than aborting the remaining deletions.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    deleted += 1;
+                    tracing::info!(
+                        path = %path.display(),
+                        segment = id,
+                        cutoff,
+                        "Pruned sealed txlog segment"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to prune sealed txlog segment; will retry on next reclaim"
+                ),
+            }
+        }
+        Ok(deleted)
     }
 
     /// Flush + fsync the current segment. Useful before clean shutdown

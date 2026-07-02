@@ -760,6 +760,16 @@ pub struct TopicEntry {
     /// topics on the global default.
     #[serde(default)]
     pub evaluator_lanes: Option<usize>,
+    /// When `true`, `delta_publish` payloads are journaled sparsely
+    /// (`{key + changed fields}` as published, merge-on-replay) instead of
+    /// as the fully-merged row. Set this on wide-row persistent topics
+    /// whose publishers tick a handful of columns at a high rate — it cuts
+    /// journal write volume roughly by the row-width / changed-fields
+    /// ratio (a 16-field tick on a 200-column row journals ~12× less).
+    /// Off by default: merged-row entries are self-contained, which keeps
+    /// bookmark-replay consumers independent of prior history.
+    #[serde(default)]
+    pub sparse_delta_txlog: bool,
 }
 
 /// Column declaration in a TOML topic spec. `name` may be a dotted
@@ -864,6 +874,7 @@ impl Default for ServerConfig {
                     index_columns: Vec::new(),
                     expire_seconds: None,
                     evaluator_lanes: None,
+                    sparse_delta_txlog: false,
                 },
                 TopicEntry {
                     name: "/orders".into(),
@@ -876,6 +887,7 @@ impl Default for ServerConfig {
                     index_columns: Vec::new(),
                     expire_seconds: None,
                     evaluator_lanes: None,
+                    sparse_delta_txlog: false,
                 },
             ],
             views: Vec::new(),

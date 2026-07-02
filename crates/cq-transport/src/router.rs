@@ -1081,10 +1081,24 @@ fn reconstruct_asof_rows(
                 } else if let Ok(serde_json::Value::Object(map)) =
                     serde_json::from_slice::<serde_json::Value>(&entry.payload)
                 {
-                    if !rows.contains_key(&entry.key) {
-                        order.push(entry.key.clone());
+                    if entry.payload_format == cq_txlog::PayloadFormat::JsonDelta {
+                        // Sparse delta: merge the changed fields into the
+                        // row accumulated so far — replacing would drop
+                        // every column the delta doesn't carry.
+                        if let Some(existing) = rows.get_mut(&entry.key) {
+                            for (k, v) in map {
+                                existing.insert(k, v);
+                            }
+                        } else {
+                            order.push(entry.key.clone());
+                            rows.insert(entry.key.clone(), map);
+                        }
+                    } else {
+                        if !rows.contains_key(&entry.key) {
+                            order.push(entry.key.clone());
+                        }
+                        rows.insert(entry.key.clone(), map);
                     }
-                    rows.insert(entry.key.clone(), map);
                 }
             }
             Ok(None) => break,
@@ -2631,6 +2645,10 @@ fn handle_bookmark_subscribe(
                         }
                         replayed += 1;
                     } else {
+                        // `JsonDelta` entries also parse here and are
+                        // delivered sparse — exactly as published — which
+                        // matches AMPS bookmark-replay semantics (a
+                        // delta_publish replays as a delta).
                         let parsed: serde_json::Value =
                             match serde_json::from_slice(&entry.payload) {
                                 Ok(v) => v,

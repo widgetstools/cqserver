@@ -176,8 +176,18 @@ async fn run_session(
                 origin,
                 is_tombstone,
                 payload,
+                is_delta,
             } => {
-                apply_entry(&topics, sequence, &topic, &key, &origin, is_tombstone, &payload);
+                apply_entry(
+                    &topics,
+                    sequence,
+                    &topic,
+                    &key,
+                    &origin,
+                    is_tombstone,
+                    is_delta,
+                    &payload,
+                );
                 let ack = ReplFrame::Ack {
                     topic: topic.clone(),
                     sequence,
@@ -200,6 +210,7 @@ async fn run_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_entry(
     topics: &Arc<DashMap<String, SharedTopic>>,
     sequence: u64,
@@ -207,6 +218,7 @@ fn apply_entry(
     key: &str,
     origin: &str,
     is_tombstone: bool,
+    is_delta: bool,
     payload: &[u8],
 ) {
     let Some(t) = topics.get(topic) else {
@@ -218,7 +230,14 @@ fn apply_entry(
     } else {
         match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(serde_json::Value::Object(map)) => {
-                t.replay_upsert_map_origin(origin, sequence, &map);
+                if is_delta {
+                    // Sparse `{key + changed fields}` payload — merge into
+                    // the existing row instead of replacing it (a plain
+                    // upsert would null every absent column).
+                    t.replay_delta_map_origin(origin, sequence, &map);
+                } else {
+                    t.replay_upsert_map_origin(origin, sequence, &map);
+                }
             }
             Ok(_) => {
                 tracing::warn!(topic, "Replicated entry payload was not a JSON object");

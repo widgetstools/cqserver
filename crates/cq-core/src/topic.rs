@@ -227,6 +227,15 @@ pub struct Topic {
     /// membership reseed rather than trusting its incremental state.
     view_tap_drops: AtomicU64,
     txlog: Option<Arc<Mutex<TxLogWriter>>>,
+    /// When `true`, `delta_upsert_map` journals the sparse `{key + changed
+    /// fields}` payload as published (`JsonDelta`, merge-on-replay) instead
+    /// of the fully-merged row. Kills the write amplification on wide-row
+    /// topics with hot delta publishers (a 16-field tick on a 200-column
+    /// row journals ~16 fields, not ~200). Trade-off: journal entries are
+    /// no longer self-contained — replay/bookmark consumers merge them
+    /// onto prior state — so it is opt-in per topic. Full publishes and
+    /// deletes journal exactly as before regardless of this flag.
+    sparse_delta_txlog: bool,
     /// Monotonic sequence counter. Persistent topics seed this from the
     /// txlog's `max_sequence` on attach so that post-recovery numbering
     /// continues uninterrupted.
@@ -314,6 +323,7 @@ impl Topic {
             next_view_tap_id: std::sync::atomic::AtomicU64::new(0),
             view_tap_drops: AtomicU64::new(0),
             txlog: None,
+            sparse_delta_txlog: false,
             next_sequence: AtomicU64::new(0),
             last_applied_sequence: AtomicU64::new(0),
             last_replicated_sequence: AtomicU64::new(0),
@@ -336,6 +346,14 @@ impl Topic {
     /// This topic's originating instance id. Empty if unnamed.
     pub fn origin_id(&self) -> &str {
         &self.origin_id
+    }
+
+    /// Journal `delta_upsert_map` payloads sparsely (`JsonDelta`,
+    /// merge-on-replay) instead of as the fully-merged row. Opt-in per
+    /// topic; see the `sparse_delta_txlog` field docs for the trade-off.
+    pub fn with_sparse_delta_txlog(mut self, on: bool) -> Self {
+        self.sparse_delta_txlog = on;
+        self
     }
 
     /// Set the number of evaluator lanes for this topic. Partitions the
@@ -1012,13 +1030,14 @@ impl Topic {
         log_args: Option<(&str, &[u8])>,
         emit_event: bool,
     ) -> Result<(u32, u64), TopicError> {
+        let log_args = log_args.map(|(k, p)| (k, p, cq_txlog::PayloadFormat::Json));
         self.write_store_with_changed(values, log_args, emit_event, None)
     }
 
     fn write_store_with_changed(
         &self,
         values: Vec<Value>,
-        log_args: Option<(&str, &[u8])>,
+        log_args: Option<(&str, &[u8], cq_txlog::PayloadFormat)>,
         emit_event: bool,
         changed_cols: Option<Vec<usize>>,
     ) -> Result<(u32, u64), TopicError> {
@@ -1034,10 +1053,17 @@ impl Topic {
         // mutation for N in their snapshot. fetch_add returns the prior
         // value; we use `+ 1` so sequences are 1-based and monotonic.
         let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some((key, payload)) = log_args {
+        if let Some((key, payload, format)) = log_args {
             if let Some(log) = &self.txlog {
                 let mut log = log.lock();
-                log.append_with_origin(seq, self.name(), key, &self.origin_id, payload)?;
+                log.append_with_origin_format(
+                    seq,
+                    self.name(),
+                    key,
+                    &self.origin_id,
+                    payload,
+                    format,
+                )?;
             }
         }
         let row = Self::commit_values_locked(&mut state, values);
@@ -1390,10 +1416,13 @@ impl Topic {
     /// stored value (full publishes treat absent fields as null and
     /// overwrite — the key behavioural difference).
     ///
-    /// The txlog records the *fully-merged* row so a fresh replay
-    /// produces the same SOW state regardless of how the rows got
-    /// there (full publishes, deltas, or a mix). Saves publisher
-    /// bandwidth without sacrificing recovery determinism.
+    /// By default the txlog records the *fully-merged* row so a fresh
+    /// replay produces the same SOW state regardless of how the rows got
+    /// there (full publishes, deltas, or a mix) and every entry is
+    /// self-contained. With `sparse_delta_txlog` enabled the journal
+    /// instead records the sparse payload as published (`JsonDelta`) and
+    /// recovery merges it — same final state, a fraction of the journal
+    /// bytes on wide-row topics.
     pub fn delta_upsert_map(
         &self,
         map: &serde_json::Map<String, serde_json::Value>,
@@ -1447,11 +1476,23 @@ impl Topic {
             (values, payload, changed_cols)
         };
 
-        let payload_bytes =
-            serde_json::to_vec(&serde_json::Value::Object(merged_payload_map))?;
+        let (payload_bytes, payload_format) = if self.sparse_delta_txlog {
+            // Journal the delta AS PUBLISHED (key + changed fields). ~12×
+            // smaller than the merged row on wide topics with narrow ticks;
+            // recovery merges it via `replay_delta_map_origin`.
+            (
+                serde_json::to_vec(&serde_json::Value::Object(flat.clone()))?,
+                cq_txlog::PayloadFormat::JsonDelta,
+            )
+        } else {
+            (
+                serde_json::to_vec(&serde_json::Value::Object(merged_payload_map))?,
+                cq_txlog::PayloadFormat::Json,
+            )
+        };
         let (_row, seq) = self.write_store_with_changed(
             values,
-            Some((&key, &payload_bytes)),
+            Some((&key, &payload_bytes, payload_format)),
             true,
             Some(changed_cols),
         )?;
@@ -1561,6 +1602,58 @@ impl Topic {
                     map.get(col.name())
                         .map(|v| Value::from_json(v, col.col_type()))
                         .unwrap_or(Value::Null)
+                })
+                .collect()
+        };
+        self.write_store_replay(values, sequence);
+        self.replay_note_applied(origin, sequence);
+    }
+
+    /// Recovery/replication path for a **sparse JSON delta** payload
+    /// (`0x03` / `JsonDelta` entries): merge the `{key + changed fields}`
+    /// map into the existing row for that key — absent columns keep their
+    /// stored value (or null when the key is new). Mirrors the live
+    /// `delta_upsert_map` merge; same dedup + watermark semantics as
+    /// [`Topic::replay_upsert_map_origin`].
+    pub fn replay_delta_map_origin(
+        &self,
+        origin: &str,
+        sequence: u64,
+        map: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        if self.replay_is_duplicate(origin, sequence) {
+            metrics::counter!(
+                "cq_topic_replay_dedup_total",
+                "topic" => self.config.name.clone()
+            )
+            .increment(1);
+            return;
+        }
+        let flat_owned;
+        let map: &serde_json::Map<String, serde_json::Value> = if map_has_nesting(map) {
+            flat_owned = flatten_publish_map(map);
+            &flat_owned
+        } else {
+            map
+        };
+        self.maybe_discover_schema(map);
+        let key = self.compute_key_from_map(map).unwrap_or_default();
+        let values: Vec<Value> = {
+            let state = self.state.read();
+            let existing_row = state.key_to_row.get(&key).copied();
+            state
+                .schema
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    if let Some(v) = map.get(col.name()) {
+                        Value::from_json(v, col.col_type())
+                    } else if let Some(row) = existing_row {
+                        state.store.get(i, row)
+                    } else {
+                        Value::Null
+                    }
                 })
                 .collect()
         };
@@ -1736,32 +1829,10 @@ impl Topic {
         let Some(txlog) = self.txlog.as_ref() else {
             return Ok(0);
         };
-        let (dir, active_id) = {
-            let w = txlog.lock();
-            (w.dir().to_path_buf(), w.current_segment())
-        };
-        let segments = cq_txlog::segment::list_segments(&dir)
-            .map_err(|e| TopicError::TxLog(cq_txlog::TxLogError::Io(e)))?;
-        let mut removed = 0usize;
-        for (id, path) in segments {
-            if id < active_id {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => removed += 1,
-                    Err(e) => {
-                        // Best-effort: skip a file we can't delete — it'll
-                        // be retried on the next shutdown. Log it so a
-                        // persistent failure (perms, stale NFS handle) is
-                        // observable instead of silently leaking segments.
-                        tracing::warn!(
-                            segment = %path.display(),
-                            error = %e,
-                            "Failed to reclaim sealed txlog segment; will retry later"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(removed)
+        // `u64::MAX` clamps to the active segment inside the writer, so
+        // this deletes exactly the sealed segments (best-effort per file).
+        let removed = txlog.lock().prune_segments_below(u64::MAX)?;
+        Ok(removed as usize)
     }
 
     /// Rebuild this topic's store from a loaded snapshot, then set the
@@ -3715,6 +3786,169 @@ mod view_tap_tests {
         let topic = make_topic(); // no txlog attached
         assert!(topic.build_snapshot().is_none());
         assert!(!topic.write_snapshot().unwrap());
+    }
+
+    /// Sparse-delta journaling: with `sparse_delta_txlog` enabled, a
+    /// `delta_upsert_map` journals the `{key + changed fields}` payload as
+    /// published (JsonDelta, `0x03`) instead of the fully-merged row —
+    /// the fix for wide-row topics whose ticks touch a handful of fields
+    /// amplifying into full-row journal writes.
+    #[test]
+    fn sparse_delta_txlog_journals_delta_as_published_and_replay_merges() {
+        use cq_txlog::reader::TxLogReader;
+        use cq_txlog::writer::TxLogWriter;
+        use cq_txlog::{FsyncPolicy, PayloadFormat};
+        use parking_lot::Mutex as PlMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(PlMutex::new(
+            TxLogWriter::open(dir.path(), FsyncPolicy::None).unwrap(),
+        ));
+        let mut topic = make_topic().with_sparse_delta_txlog(true);
+        topic.attach_txlog(writer.clone());
+
+        // Full publish establishes the row; sparse delta ticks one field.
+        publish(&topic, "AAPL", 150.0); // symbol/price/quantity=100
+        let mut delta = serde_json::Map::new();
+        delta.insert("symbol".into(), "AAPL".into());
+        delta.insert("price".into(), 175.5.into());
+        topic.delta_upsert_map(&delta).expect("delta upsert");
+        writer.lock().sync().unwrap();
+
+        // The journal must hold the delta AS PUBLISHED (2 fields), not the
+        // merged 3-column row.
+        let mut r = TxLogReader::open(dir.path()).unwrap();
+        let e1 = r.read_next().unwrap().expect("full entry");
+        assert_eq!(e1.payload_format, PayloadFormat::Json);
+        let e2 = r.read_next().unwrap().expect("delta entry");
+        assert_eq!(e2.payload_format, PayloadFormat::JsonDelta);
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&e2.payload).unwrap();
+        assert_eq!(m.len(), 2, "sparse payload: key + changed field only");
+        assert_eq!(m.get("price").unwrap().as_f64().unwrap(), 175.5);
+        assert!(m.get("quantity").is_none(), "untouched column not journaled");
+
+        // Recovery: replay both entries into a fresh topic — the delta
+        // must MERGE (quantity survives from the full publish).
+        drop(topic);
+        let restarted = make_topic();
+        let mut r = TxLogReader::open(dir.path()).unwrap();
+        while let Some(e) = r.read_next().unwrap() {
+            if e.payload_format == PayloadFormat::JsonDelta {
+                if let Ok(serde_json::Value::Object(m)) =
+                    serde_json::from_slice::<serde_json::Value>(&e.payload)
+                {
+                    restarted.replay_delta_map_origin(&e.origin, e.sequence, &m);
+                }
+            } else if let Ok(serde_json::Value::Object(m)) =
+                serde_json::from_slice::<serde_json::Value>(&e.payload)
+            {
+                restarted.replay_upsert_map_origin(&e.origin, e.sequence, &m);
+            }
+        }
+        assert_eq!(restarted.row_count(), 1);
+        let res = restarted.query("SELECT * FROM t WHERE symbol = 'AAPL'").unwrap();
+        assert_eq!(res.rows[0].get("price").unwrap(), 175.5, "delta applied");
+        assert_eq!(
+            res.rows[0].get("quantity").unwrap(),
+            100,
+            "column absent from the delta keeps its pre-delta value"
+        );
+    }
+
+    /// A delta replayed for a key with no prior row creates the row,
+    /// nulling every column the delta doesn't carry (same semantics as a
+    /// live `delta_upsert_map` on an unknown key).
+    #[test]
+    fn sparse_delta_replay_for_unknown_key_creates_row_with_nulls() {
+        let topic = make_topic();
+        let mut delta = serde_json::Map::new();
+        delta.insert("symbol".into(), "TSLA".into());
+        delta.insert("price".into(), 800.0.into());
+        topic.replay_delta_map_origin("", 1, &delta);
+        assert_eq!(topic.row_count(), 1);
+        let res = topic.query("SELECT * FROM t WHERE symbol = 'TSLA'").unwrap();
+        assert_eq!(res.rows[0].get("price").unwrap(), 800.0);
+        assert!(
+            res.rows[0]
+                .get("quantity")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "column never published is null (or omitted from the result row)"
+        );
+        // Dedup gate: replaying the same sequence again is a no-op.
+        let mut delta2 = serde_json::Map::new();
+        delta2.insert("symbol".into(), "TSLA".into());
+        delta2.insert("price".into(), 999.0.into());
+        topic.replay_delta_map_origin("", 1, &delta2);
+        let res = topic.query("SELECT * FROM t WHERE symbol = 'TSLA'").unwrap();
+        assert_eq!(res.rows[0].get("price").unwrap(), 800.0, "duplicate seq ignored");
+    }
+
+    /// The `snapshot_reclaim` contract: after a durable snapshot, sealed
+    /// segments may be deleted and a crash-recovery (snapshot load + tail
+    /// replay over the *surviving* segments) still rebuilds full state.
+    #[test]
+    fn snapshot_then_reclaim_prunes_sealed_segments_and_recovery_survives() {
+        use cq_txlog::reader::TxLogReader;
+        use cq_txlog::snapshot::Snapshot;
+        use cq_txlog::writer::TxLogWriter;
+        use cq_txlog::FsyncPolicy;
+        use parking_lot::Mutex as PlMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny segments so the pre-snapshot history spans several files.
+        let writer = Arc::new(PlMutex::new(
+            TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, 512).unwrap(),
+        ));
+        let mut topic = make_topic();
+        topic.attach_txlog(writer.clone());
+
+        // Enough distinct keys to seal at least two segments.
+        for i in 0..40 {
+            publish(&topic, &format!("SYM{i:03}"), i as f64);
+        }
+        writer.lock().sync().unwrap();
+        let sealed_before = writer.lock().current_segment();
+        assert!(sealed_before > 2, "history spans several segments");
+
+        // Durable snapshot, then reclaim everything the snapshot covers.
+        assert!(topic.write_snapshot().unwrap());
+        let removed = topic.reclaim_sealed_segments().unwrap();
+        assert_eq!(removed as u64, sealed_before - 1, "all sealed segments deleted");
+
+        // Post-snapshot tail: one update + one new key.
+        publish(&topic, "SYM000", 999.0);
+        publish(&topic, "NEWKEY", 1.0);
+        writer.lock().sync().unwrap();
+        drop(topic);
+
+        // Crash recovery path: snapshot + tail replay over what's left.
+        let snap = Snapshot::load(dir.path()).unwrap().expect("snapshot");
+        let restarted = make_topic();
+        restarted.apply_snapshot(&snap);
+        assert_eq!(restarted.row_count(), 40, "snapshot restores all 40 rows");
+
+        let mut reader = TxLogReader::open(dir.path()).unwrap();
+        reader.skip_to_segment(snap.segment_id);
+        while let Some(e) = reader.read_next().unwrap() {
+            if e.is_tombstone() {
+                restarted.replay_delete_origin(&e.origin, e.sequence, &e.key);
+            } else if let Ok(serde_json::Value::Object(m)) =
+                serde_json::from_slice::<serde_json::Value>(&e.payload)
+            {
+                restarted.replay_upsert_map_origin(&e.origin, e.sequence, &m);
+            }
+        }
+        assert_eq!(restarted.row_count(), 41, "tail applied on top of snapshot");
+        let res = restarted
+            .query("SELECT * FROM t WHERE symbol = 'SYM000'")
+            .unwrap();
+        assert_eq!(
+            res.rows[0].get("price").unwrap(),
+            999.0,
+            "tail update wins over snapshot value"
+        );
     }
 
     #[test]

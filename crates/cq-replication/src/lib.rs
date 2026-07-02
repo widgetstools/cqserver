@@ -59,6 +59,15 @@ pub enum ReplFrame {
         origin: String,
         is_tombstone: bool,
         payload: Vec<u8>,
+        /// `true` when `payload` is a sparse JSON delta (`JsonDelta` txlog
+        /// entries) that must be MERGED into the receiver's existing row
+        /// rather than replacing it. `#[serde(default)]` keeps the frame
+        /// wire-compatible with pre-delta peers (absent ⇒ `false`); an
+        /// older receiver ignores the field and misses the merge
+        /// semantics, so upgrade receivers before enabling
+        /// `sparse_delta_txlog` on a replication source.
+        #[serde(default)]
+        is_delta: bool,
     },
 
     /// Periodic ack from receiver — informational, the shipper uses it

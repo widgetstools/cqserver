@@ -67,6 +67,31 @@ pub const MAX_ORIGIN_LEN: usize = 256;
 /// well under 2^56), so the marker is unambiguous on read.
 pub const TXLOG_FORMAT_V2: u8 = 0x01;
 
+// NOTE: marker byte `0x02` is RESERVED for the compact binary row payload
+// format (Tier 1a, in flight on the `ssrm` branch). Do not reuse it here —
+// keeping the byte space aligned lets logs written by either branch be read
+// by both once that work lands.
+
+/// Body-format marker for V2 entries whose payload is a **sparse JSON delta**
+/// — the `{key + changed fields}` map exactly as the publisher sent it, NOT
+/// the fully-merged row. Recovery must MERGE such an entry into the existing
+/// row for its key (absent fields keep their stored value) instead of
+/// replacing the row. Journaling deltas sparsely keeps wide-row topics with
+/// hot delta publishers from amplifying every few-field tick into a
+/// full-row journal write.
+pub const TXLOG_FORMAT_V2_DELTA: u8 = 0x03;
+
+/// Encoding of an entry's payload bytes. The txlog stores opaque bytes; this
+/// tells higher layers (recovery, replication) how to decode them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadFormat {
+    /// `serde_json::to_vec` of the full row map (legacy / default).
+    #[default]
+    Json,
+    /// Sparse JSON delta (`{key + changed fields}`), merge-on-replay.
+    JsonDelta,
+}
+
 /// Default segment size (256 MB), matching the ARCHITECTURE.md spec.
 pub const DEFAULT_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -80,6 +105,8 @@ pub struct TxEntry {
     /// legacy V1 entries and for local writes that predate instance naming.
     pub origin: String,
     pub payload: Vec<u8>,
+    /// How `payload` is encoded (`Json` for V1/`0x01`, `JsonDelta` for `0x03`).
+    pub payload_format: PayloadFormat,
 }
 
 impl TxEntry {

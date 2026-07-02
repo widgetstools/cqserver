@@ -1036,6 +1036,7 @@ fn init_topic(
         cfg.initial_capacity,
     )
     .with_eval_lanes(lanes)
+    .with_sparse_delta_txlog(cfg.sparse_delta_txlog)
     .with_origin_id(instance_name);
 
     if cfg.persist {
@@ -1410,7 +1411,13 @@ fn recover_topic_with_archive(
         } else {
             match serde_json::from_slice::<serde_json::Value>(&entry.payload) {
                 Ok(serde_json::Value::Object(map)) => {
-                    topic.replay_upsert_map_origin(&entry.origin, entry.sequence, &map);
+                    if entry.payload_format == cq_txlog::PayloadFormat::JsonDelta {
+                        // Sparse delta as published — merge into the row's
+                        // prior state instead of replacing it.
+                        topic.replay_delta_map_origin(&entry.origin, entry.sequence, &map);
+                    } else {
+                        topic.replay_upsert_map_origin(&entry.origin, entry.sequence, &map);
+                    }
                 }
                 Ok(_) => {
                     warn!("Skipping non-object payload during recovery");

@@ -319,11 +319,20 @@ fn parse_body(body: &[u8], offset: u64) -> Result<TxEntry, TxLogError> {
 
     // Detect V2 (origin-tagged) bodies by the leading marker byte. Legacy V1
     // bodies begin with the high byte of `sequence` (0x00 in practice), so the
-    // 0x01 marker is unambiguous.
-    let v2 = body.first() == Some(&TXLOG_FORMAT_V2);
+    // markers are unambiguous. `0x01` = V2 + full JSON payload, `0x03` = V2 +
+    // sparse JSON delta (merge-on-replay); both share the V2 layout. (`0x02`
+    // is reserved for the ssrm-branch binary payload format.)
+    let marker = body.first().copied();
+    let delta = marker == Some(crate::TXLOG_FORMAT_V2_DELTA);
+    let v2 = delta || marker == Some(TXLOG_FORMAT_V2);
     if v2 {
         cur += 1;
     }
+    let payload_format = if delta {
+        crate::PayloadFormat::JsonDelta
+    } else {
+        crate::PayloadFormat::Json
+    };
 
     let seq_bytes = take(&mut cur, 8)?;
     let sequence = u64::from_be_bytes([
@@ -371,6 +380,7 @@ fn parse_body(body: &[u8], offset: u64) -> Result<TxEntry, TxLogError> {
         key,
         origin,
         payload,
+        payload_format,
     })
 }
 

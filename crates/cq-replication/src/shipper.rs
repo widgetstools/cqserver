@@ -284,6 +284,7 @@ impl TopicShipper {
             // tombstones.
             let payload = apply_transform(entry.payload, self.transform.as_ref());
             let is_tombstone = payload.is_empty();
+            let is_delta = entry.payload_format == cq_txlog::PayloadFormat::JsonDelta;
             let origin = entry.origin.clone();
             let sequence = entry.sequence;
             let frame = ReplFrame::Entry {
@@ -293,6 +294,7 @@ impl TopicShipper {
                 origin: entry.origin,
                 is_tombstone,
                 payload,
+                is_delta,
             };
             write_frame_half(conn, &frame).await?;
             self.last_shipped.insert(origin, sequence);
