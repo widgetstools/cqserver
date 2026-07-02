@@ -992,15 +992,15 @@ async fn shutdown(
             if !snapshot_on_shutdown {
                 return;
             }
-            let wrote = match topic.write_snapshot() {
-                Ok(true) => {
-                    tracing::info!(topic = %name, "SOW snapshot written");
-                    true
+            let covered_segment = match topic.write_snapshot_returning_segment() {
+                Ok(Some(seg)) => {
+                    tracing::info!(topic = %name, segment_id = seg, "SOW snapshot written");
+                    Some(seg)
                 }
-                Ok(false) => false,
+                Ok(None) => None,
                 Err(e) => {
                     tracing::warn!(topic = %name, error = %e, "snapshot write failed");
-                    false
+                    None
                 }
             };
             // Reclaim sealed segments only after a durable snapshot — the
@@ -1008,14 +1008,21 @@ async fn shutdown(
             // redundant for local restart. Opt-in (snapshot_reclaim) since a
             // far-behind replication standby would need those segments to
             // catch up without a base-SOW resync.
-            if wrote && snapshot_reclaim {
-                match topic.reclaim_sealed_segments() {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(topic = %name, reclaimed = n, "reclaimed sealed txlog segments")
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(topic = %name, error = %e, "segment reclaim failed")
+            //
+            // Prune strictly BELOW the snapshot's segment_id (defense in
+            // depth): shutdown is quiesced so u64::MAX would also be safe
+            // here, but scoping the cutoff to the snapshot avoids any
+            // reliance on quiescence and matches the periodic path.
+            if snapshot_reclaim {
+                if let Some(cutoff) = covered_segment {
+                    match topic.reclaim_sealed_segments_below(cutoff) {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(topic = %name, reclaimed = n, "reclaimed sealed txlog segments")
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(topic = %name, error = %e, "segment reclaim failed")
+                        }
                     }
                 }
             }

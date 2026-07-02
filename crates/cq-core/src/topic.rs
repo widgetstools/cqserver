@@ -1834,9 +1834,20 @@ impl Topic {
     /// periodic checkpointer) so the next start loads the snapshot and
     /// replays only the txlog tail instead of the whole log.
     pub fn write_snapshot(&self) -> Result<bool, TopicError> {
+        Ok(self.write_snapshot_returning_segment()?.is_some())
+    }
+
+    /// Like [`write_snapshot`](Self::write_snapshot) but returns the durable
+    /// snapshot's `segment_id` (`Some(A)`) so the caller can reclaim segments
+    /// strictly below it via
+    /// [`reclaim_sealed_segments_below`](Self::reclaim_sealed_segments_below)
+    /// — the crash-safe cutoff. Returns `Ok(None)` for a non-persistent
+    /// topic (nothing written).
+    pub fn write_snapshot_returning_segment(&self) -> Result<Option<u64>, TopicError> {
         let Some(snapshot) = self.build_snapshot() else {
-            return Ok(false);
+            return Ok(None);
         };
+        let segment_id = snapshot.segment_id;
         let dir = self
             .txlog
             .as_ref()
@@ -1847,7 +1858,7 @@ impl Topic {
         snapshot
             .write_atomic(&dir)
             .map_err(|e| TopicError::TxLog(cq_txlog::TxLogError::Io(e)))?;
-        Ok(true)
+        Ok(Some(segment_id))
     }
 
     /// Reclaim disk by deleting every sealed segment older than the active
@@ -1860,13 +1871,52 @@ impl Topic {
     /// written, and only when the segments are not still required by a
     /// replication standby (a far-behind standby would need a base SOW
     /// resync instead of log shipping). No-op for a non-persistent topic.
+    ///
+    /// # SAFETY — `u64::MAX` cutoff is only safe under quiescence
+    ///
+    /// `prune_segments_below(u64::MAX)` clamps to the *live* active segment
+    /// and deletes everything below it. That is only crash-safe when no
+    /// publish can occur between the snapshot build and this prune: the
+    /// snapshot samples `(sequence S, segment_id A)` under a read lock, then
+    /// releases it. If a publisher appends sequences `> S` into segment `A`'s
+    /// tail and rotates `A → A+1 → … → A+k` before this prune runs, the
+    /// clamped cutoff (`A+k`) deletes segment `A` — which *straddles* `S`
+    /// (holds entries `≤ S` captured by the snapshot AND entries `> S` that
+    /// are NOT). On crash+restart those `> S` sequences are lost. This is
+    /// safe ONLY at graceful shutdown, where the server is quiesced. For the
+    /// concurrently-serving periodic path use
+    /// [`Topic::reclaim_sealed_segments_below`] with the snapshot's
+    /// `segment_id` as the cutoff.
     pub fn reclaim_sealed_segments(&self) -> Result<usize, TopicError> {
+        self.reclaim_sealed_segments_below(u64::MAX)
+    }
+
+    /// Reclaim disk by deleting sealed segments whose id is **strictly
+    /// below** `cutoff`, clamped so the active segment is never deleted.
+    /// Returns the number of segments removed.
+    ///
+    /// The crash-safe cutoff for a concurrently-serving checkpoint is the
+    /// just-written snapshot's `segment_id` (call it `A`): every segment with
+    /// id `< A` was sealed before `A` opened, so all of its entries have
+    /// sequence `≤ snapshot.sequence` and are fully covered by the durable
+    /// snapshot — safe to delete. Segment `A` itself is RETAINED because it
+    /// straddles `snapshot.sequence`: it may hold entries `>` the snapshot
+    /// (appended between the snapshot's read-lock release and this prune)
+    /// that only a FUTURE snapshot whose `segment_id > A` will prove durably
+    /// captured. Passing `A` (not `u64::MAX`, which clamps to the racing live
+    /// active segment) is what closes the data-loss window on the periodic
+    /// path.
+    ///
+    /// No-op for a non-persistent topic.
+    pub fn reclaim_sealed_segments_below(&self, cutoff: u64) -> Result<usize, TopicError> {
         let Some(txlog) = self.txlog.as_ref() else {
             return Ok(0);
         };
-        // `u64::MAX` clamps to the active segment inside the writer, so
-        // this deletes exactly the sealed segments (best-effort per file).
-        let removed = txlog.lock().prune_segments_below(u64::MAX)?;
+        // prune_segments_below deletes id < cutoff (and clamps cutoff to the
+        // live active id). With cutoff == snapshot.segment_id, that segment
+        // and everything ≥ it is retained; only fully-covered older segments
+        // are deleted (best-effort per file).
+        let removed = txlog.lock().prune_segments_below(cutoff)?;
         Ok(removed as usize)
     }
 
@@ -1940,9 +1990,15 @@ impl Topic {
             .map_err(|e| TopicError::TxLog(cq_txlog::TxLogError::Io(e)))?;
 
         // 3. Now — and only now — reclaim the segments the durable snapshot
-        //    covers. Deletes strictly sealed segments (active is retained).
+        //    covers. Prune strictly BELOW the snapshot's segment_id (not the
+        //    racing live active id): segment `covered_segment` straddles
+        //    `covered_sequence` and MUST be retained, because concurrent
+        //    publishers may have appended sequences past the snapshot into
+        //    its tail (and rotated onward) after the snapshot's read lock was
+        //    released. Using `u64::MAX` here would delete that straddling
+        //    segment and lose those acked sequences on crash+restart.
         let reclaimed = if reclaim {
-            self.reclaim_sealed_segments()?
+            self.reclaim_sealed_segments_below(covered_segment)?
         } else {
             0
         };
@@ -4200,6 +4256,111 @@ mod view_tap_tests {
             res.rows[0].get("price").unwrap(),
             999.0,
             "post-checkpoint tail update wins after recovery"
+        );
+    }
+
+    /// Regression: a straddling segment must NOT be reclaimed.
+    ///
+    /// Reproduces the periodic-checkpoint data-loss race deterministically.
+    /// A snapshot samples `(sequence S, segment_id A)` and is made durable.
+    /// THEN — simulating concurrent publishers that ran after the snapshot's
+    /// read lock was released — more sequences are appended into segment `A`
+    /// and rotation carries the log forward `A → A+1 → …`. Reclaiming with
+    /// the snapshot's `segment_id` as the cutoff must keep segment `A` (it
+    /// holds entries `> S` not in the snapshot); reclaiming with the live
+    /// active id (`u64::MAX`) would delete `A` and lose those acked rows on
+    /// crash recovery. We assert both: `A` survives the correct prune, and a
+    /// snapshot-load + tail-replay reproduces EVERY published row.
+    #[test]
+    fn reclaim_below_snapshot_segment_keeps_straddling_segment() {
+        use cq_txlog::reader::TxLogReader;
+        use cq_txlog::snapshot::Snapshot;
+        use cq_txlog::segment::list_segments;
+        use cq_txlog::writer::TxLogWriter;
+        use cq_txlog::FsyncPolicy;
+        use parking_lot::Mutex as PlMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny segments so a handful of publishes rotates.
+        let writer = Arc::new(PlMutex::new(
+            TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, 512).unwrap(),
+        ));
+        let mut topic = make_topic();
+        topic.attach_txlog(writer.clone());
+
+        // Pre-snapshot history spanning several segments.
+        for i in 0..40 {
+            publish(&topic, &format!("SYM{i:03}"), i as f64);
+        }
+        writer.lock().sync().unwrap();
+
+        // Build + durably write the snapshot, capturing segment_id = A. This
+        // is exactly what checkpoint() samples under the read lock.
+        let snap_seg = topic
+            .write_snapshot_returning_segment()
+            .unwrap()
+            .expect("persistent");
+        let straddling = snap_seg; // segment A
+        assert!(straddling > 2, "snapshot's active segment straddles; history spans segments");
+
+        // RACE WINDOW: publishers append sequences past the snapshot INTO
+        // segment A's tail, and keep going so the log rotates A → A+1 → …
+        // These rows are acked but NOT in the snapshot.
+        for i in 40..80 {
+            publish(&topic, &format!("SYM{i:03}"), i as f64);
+        }
+        writer.lock().sync().unwrap();
+        let live_active = writer.lock().current_segment();
+        assert!(
+            live_active > straddling,
+            "rotation carried the log past the straddling segment (A={straddling}, live={live_active})"
+        );
+
+        // The FIX: reclaim strictly below the snapshot's segment_id. Segment
+        // A (and everything after) is retained.
+        let removed = topic.reclaim_sealed_segments_below(straddling).unwrap();
+        // Segment ids start at 1, so ids in `1..A` are pruned: that is
+        // `A - 1` segments.
+        assert_eq!(
+            removed as u64,
+            straddling - 1,
+            "exactly segments below A pruned (A retained)"
+        );
+        let ids: Vec<u64> = list_segments(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            ids.contains(&straddling),
+            "straddling segment A={straddling} MUST survive; got {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|&id| id >= straddling),
+            "no segment below A survives; got {ids:?}"
+        );
+
+        // Crash recovery: snapshot + tail replay over the SURVIVING segments
+        // must reproduce all 80 rows — the straddling-tail rows included.
+        drop(topic);
+        let snap = Snapshot::load(dir.path()).unwrap().expect("snapshot");
+        let restarted = make_topic();
+        restarted.apply_snapshot(&snap);
+        let mut reader = TxLogReader::open(dir.path()).unwrap();
+        reader.skip_to_segment(snap.segment_id);
+        while let Some(e) = reader.read_next().unwrap() {
+            if e.is_tombstone() {
+                restarted.replay_delete_origin(&e.origin, e.sequence, &e.key);
+            } else if let Ok(serde_json::Value::Object(m)) =
+                serde_json::from_slice::<serde_json::Value>(&e.payload)
+            {
+                restarted.replay_upsert_map_origin(&e.origin, e.sequence, &m);
+            }
+        }
+        assert_eq!(
+            restarted.row_count(),
+            80,
+            "ALL 80 rows recovered — snapshot (≤S) + straddling-segment tail (>S)"
         );
     }
 
