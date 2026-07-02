@@ -174,6 +174,18 @@ impl View {
             };
             types.push(ty);
         }
+        // Scalar-over-aggregate projections (`post_agg`), e.g.
+        // `SUM(x) / NULLIF(SUM(y), 0) AS ratio`. `PostAggExpr::eval`
+        // performs f64 arithmetic (or soft-nulls on div-by-zero /
+        // missing refs / type errors), so the output column is always
+        // Double — matching how AVG/STDDEV/PERCENTILE aggregate aliases
+        // are typed above. Without this, the view topic's schema lacks
+        // these columns and `upsert_map` silently drops them from every
+        // stored row (full-refresh AND incremental).
+        for pa in &query.post_agg {
+            names.push(pa.alias.clone());
+            types.push(ColumnType::Double);
+        }
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         Schema::from_strs(&name_refs, &types)
     }
