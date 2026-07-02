@@ -102,6 +102,62 @@ async fn expired_jwt_logon_rejected() {
     assert!(err.is_err(), "expected expired JWT logon to fail; got Ok");
 }
 
+/// D7/P0.7 — the JWT secret can be indirected through `env://VAR`
+/// instead of living in plaintext TOML. Configure `[auth.jwt].secret
+/// = "env://..."`, set the env var in *this* test process (the
+/// server subprocess inherits it — `std::process::Command` doesn't
+/// clear the parent environment by default), and confirm a token
+/// signed with the env-var value authenticates end-to-end. This
+/// proves the resolver actually runs at config-load time in the real
+/// server binary, not just in the `cq-server` unit tests.
+#[tokio::test]
+async fn jwt_secret_resolved_from_env_var_authenticates() {
+    let topic = TopicSpec::new("/jwt-env-e2e", "k").with_inline_columns([
+        ("k", "string"),
+        ("v", "long"),
+    ]);
+    let env_var = format!("CQ_E2E_JWT_SECRET_{}", std::process::id());
+    let secret = "env-indirected-secret-value";
+    std::env::set_var(&env_var, secret);
+
+    let server = start_server_with(
+        vec![topic],
+        ServerOpts {
+            auth: Some(AuthOpts {
+                users: Vec::new(),
+                jwt: Some(JwtAuthOpts {
+                    secret: format!("env://{env_var}"),
+                    ..JwtAuthOpts::default()
+                }),
+            }),
+            ..ServerOpts::default()
+        },
+    )
+    .await;
+
+    let token = issue_token(
+        secret,
+        json!({
+            "sub": "alice",
+            "entitlements": ["*:*"],
+            "exp": (unix_now() + 3600) as i64,
+        }),
+    );
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    client
+        .logon_jwt(&token)
+        .await
+        .expect("jwt logon with env-resolved secret");
+
+    let seq = client
+        .publish("/jwt-env-e2e", json!({ "k": "row1", "v": 42 }))
+        .await
+        .expect("publish");
+    assert!(seq > 0);
+
+    std::env::remove_var(&env_var);
+}
+
 #[tokio::test]
 async fn jwt_signed_with_wrong_secret_rejected() {
     let topic = TopicSpec::new("/jwt-wrong-sig", "k").with_inline_columns([("k", "string")]);

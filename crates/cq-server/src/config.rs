@@ -569,6 +569,97 @@ pub struct AuthConfig {
     pub jwt: Option<JwtConfig>,
 }
 
+impl AuthConfig {
+    /// D7/P0.7 — resolve `env://`/`file://` indirection on every
+    /// secret field this config carries: each user's `password_hash`
+    /// and the JWT validator's `secret`. Called once at config-load
+    /// time so the rest of the server only ever sees the final,
+    /// resolved plaintext value; callers never need to know whether
+    /// an operator kept the secret in TOML, an env var, or a file.
+    pub fn resolve_secrets(&mut self) -> Result<(), ConfigError> {
+        for user in &mut self.users {
+            user.password_hash = resolve_secret(&user.password_hash)?;
+        }
+        if let Some(jwt) = &mut self.jwt {
+            if let Some(secret) = &jwt.secret {
+                jwt.secret = Some(resolve_secret(secret)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Error resolving a secret-indirection reference (`env://` /
+/// `file://`) found in a config secret field.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// An `env://VARNAME` reference pointed at an unset (or empty)
+    /// environment variable.
+    EnvVarNotSet(String),
+    /// A `file://` reference pointed at a file that couldn't be read.
+    FileNotReadable {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::EnvVarNotSet(var) => {
+                write!(f, "env var {var} not set")
+            }
+            ConfigError::FileNotReadable { path, source } => {
+                write!(f, "secret file {path} not readable: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::EnvVarNotSet(_) => None,
+            ConfigError::FileNotReadable { source, .. } => Some(source),
+        }
+    }
+}
+
+/// D7/P0.7 — resolve a config secret field's raw TOML value into its
+/// final plaintext form. Supports two indirection schemes so secrets
+/// (JWT signing keys, bcrypt password hashes) don't have to live in
+/// plaintext TOML:
+///
+///   - `env://VARNAME` — read the named environment variable. Errors
+///     (naming the var) if it's unset *or* set to an empty string; an
+///     empty secret is almost certainly a misconfiguration, not an
+///     intentional value.
+///   - `file:///abs/path` (or `file://relative/path`) — read the file
+///     at the given path and trim trailing whitespace/newlines (many
+///     secrets managers/`kubectl` mounts append a trailing newline).
+///     Errors (naming the path) if the file can't be read.
+///   - Anything else — returned verbatim. This keeps existing
+///     deployments with plaintext hashes/secrets in TOML working
+///     unchanged; there is no required migration.
+pub fn resolve_secret(raw: &str) -> Result<String, ConfigError> {
+    if let Some(var) = raw.strip_prefix("env://") {
+        return match std::env::var(var) {
+            Ok(val) if !val.is_empty() => Ok(val),
+            Ok(_) => Err(ConfigError::EnvVarNotSet(var.to_string())),
+            Err(_) => Err(ConfigError::EnvVarNotSet(var.to_string())),
+        };
+    }
+    if let Some(path) = raw.strip_prefix("file://") {
+        return std::fs::read_to_string(path)
+            .map(|s| s.trim_end().to_string())
+            .map_err(|source| ConfigError::FileNotReadable {
+                path: path.to_string(),
+                source,
+            });
+    }
+    Ok(raw.to_string())
+}
+
 /// JWT signing algorithm the validator should enforce. Tokens signed
 /// with any other algorithm are rejected (the `alg` header is pinned),
 /// which closes the classic "alg confusion" downgrade attack.
@@ -597,6 +688,14 @@ pub struct JwtConfig {
     pub algorithm: JwtAlgorithm,
     /// Shared secret used to validate HS256 tokens. Required when
     /// `algorithm = "HS256"`; ignored for RS256.
+    ///
+    /// D7/P0.7: keep this out of plaintext TOML in production by
+    /// writing `env://VARNAME` (read from the environment at
+    /// startup) or `file:///abs/path` (read from a file, trailing
+    /// newline trimmed) instead of the literal secret. Both forms are
+    /// resolved once by `AuthConfig::resolve_secrets` at config-load
+    /// time; a plain value is still accepted verbatim for backward
+    /// compatibility. See `resolve_secret` in this module.
     #[serde(default)]
     pub secret: Option<String>,
     /// PEM-encoded RSA public key (inline) used to validate RS256
@@ -636,6 +735,11 @@ fn default_jwt_username_claim() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserConfig {
     pub username: String,
+    /// Bcrypt password hash. D7/P0.7: accepts `env://VARNAME` or
+    /// `file:///abs/path` indirection in place of the literal hash —
+    /// see the note on `JwtConfig::secret` and `resolve_secret` in
+    /// this module for the full scheme. A plain bcrypt hash is still
+    /// accepted verbatim (backward compatible).
     pub password_hash: String,
     #[serde(default)]
     pub entitlements: Vec<String>,
@@ -1029,7 +1133,14 @@ pub fn load_config_from_with_raw(
     }
     let raw = std::fs::read_to_string(config_path)?;
     let content = substitute_env_vars(&raw)?;
-    let config: ServerConfig = toml::from_str(&content)?;
+    let mut config: ServerConfig = toml::from_str(&content)?;
+    // D7/P0.7 — resolve `env://`/`file://` indirection on secret
+    // fields (JWT secret, user password hashes) after parsing.
+    // Deliberately applied to the parsed `ServerConfig`, not the
+    // `content` string returned to the caller, so the admin UI's
+    // "expanded config" view keeps showing the operator's literal
+    // `env://`/`file://` reference rather than the resolved secret.
+    config.auth.resolve_secrets()?;
     let dir = config_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -1169,6 +1280,177 @@ websocket_path = "/cq/json"
         let cfg: super::ServerConfig = toml::from_str(&expanded).unwrap();
         assert_eq!(cfg.tcp_addr, "127.0.0.1:12345");
         assert_eq!(cfg.websocket_addr, "127.0.0.1:9008");
+    }
+}
+
+/// D7/P0.7 — `resolve_secret` (env://VAR / file:///path indirection
+/// for secret config fields) unit tests. Every env-var test uses a
+/// unique `CQ_TEST_SECRET_*` name (env is process-global and tests
+/// run in parallel within the same binary) so no test can observe
+/// another's `set_var`/`remove_var`.
+#[cfg(test)]
+mod resolve_secret_tests {
+    use super::{resolve_secret, AuthConfig, ConfigError, JwtAlgorithm, JwtConfig, UserConfig};
+
+    #[test]
+    fn plaintext_passthrough_unchanged() {
+        let out = resolve_secret("$2b$12$abcdefghijklmnopqrstuv").unwrap();
+        assert_eq!(out, "$2b$12$abcdefghijklmnopqrstuv");
+    }
+
+    #[test]
+    fn plaintext_with_no_recognized_scheme_passthrough() {
+        // Something that merely contains "://" but isn't env:// or
+        // file:// should still pass through verbatim.
+        let out = resolve_secret("s3://bucket/secret").unwrap();
+        assert_eq!(out, "s3://bucket/secret");
+    }
+
+    #[test]
+    fn env_scheme_resolves_when_var_present() {
+        std::env::set_var("CQ_TEST_SECRET_ENV_PRESENT", "super-secret-value");
+        let out = resolve_secret("env://CQ_TEST_SECRET_ENV_PRESENT").unwrap();
+        assert_eq!(out, "super-secret-value");
+        std::env::remove_var("CQ_TEST_SECRET_ENV_PRESENT");
+    }
+
+    #[test]
+    fn env_scheme_errors_with_var_name_when_missing() {
+        std::env::remove_var("CQ_TEST_SECRET_ENV_MISSING");
+        let err = resolve_secret("env://CQ_TEST_SECRET_ENV_MISSING").unwrap_err();
+        match &err {
+            ConfigError::EnvVarNotSet(var) => {
+                assert_eq!(var, "CQ_TEST_SECRET_ENV_MISSING");
+            }
+            other => panic!("expected EnvVarNotSet, got {other:?}"),
+        }
+        let msg = err_to_string(&err);
+        assert!(
+            msg.contains("CQ_TEST_SECRET_ENV_MISSING"),
+            "error message should name the missing var: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_scheme_errors_when_var_is_empty() {
+        std::env::set_var("CQ_TEST_SECRET_ENV_EMPTY", "");
+        let err = resolve_secret("env://CQ_TEST_SECRET_ENV_EMPTY").unwrap_err();
+        assert!(matches!(err, ConfigError::EnvVarNotSet(_)));
+        std::env::remove_var("CQ_TEST_SECRET_ENV_EMPTY");
+    }
+
+    #[test]
+    fn file_scheme_resolves_and_trims_trailing_newline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "cq_test_secret_{}_{}.txt",
+            std::process::id(),
+            "file_present"
+        ));
+        std::fs::write(&path, "file-secret-value\n").expect("write temp secret file");
+        let uri = format!("file://{}", path.display());
+        let out = resolve_secret(&uri).unwrap();
+        assert_eq!(out, "file-secret-value");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_scheme_trims_trailing_whitespace_too() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "cq_test_secret_{}_{}.txt",
+            std::process::id(),
+            "file_whitespace"
+        ));
+        std::fs::write(&path, "  file-secret-value  \n\n").expect("write temp secret file");
+        let uri = format!("file://{}", path.display());
+        let out = resolve_secret(&uri).unwrap();
+        // Only trailing whitespace is trimmed, not leading — matches
+        // the documented behavior (secrets managers append trailing
+        // newlines; leading whitespace in a secret would be unusual
+        // enough that silently stripping it is more surprising than
+        // helpful).
+        assert_eq!(out, "  file-secret-value");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_scheme_errors_with_path_when_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "cq_test_secret_{}_does_not_exist.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let uri = format!("file://{}", path.display());
+        let err = resolve_secret(&uri).unwrap_err();
+        match &err {
+            ConfigError::FileNotReadable { path: p, .. } => {
+                assert_eq!(p, &path.display().to_string());
+            }
+            other => panic!("expected FileNotReadable, got {other:?}"),
+        }
+        let msg = err_to_string(&err);
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error message should name the missing file path: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_config_resolve_secrets_resolves_jwt_and_password_hashes() {
+        std::env::set_var("CQ_TEST_SECRET_AUTHCFG_JWT", "jwt-signing-secret");
+        std::env::set_var("CQ_TEST_SECRET_AUTHCFG_PW", "bcrypt-hash-value");
+
+        let mut cfg = AuthConfig {
+            required: true,
+            users: vec![UserConfig {
+                username: "alice".into(),
+                password_hash: "env://CQ_TEST_SECRET_AUTHCFG_PW".into(),
+                entitlements: Vec::new(),
+                row_filter: None,
+                query_budget: None,
+            }],
+            jwt: Some(JwtConfig {
+                algorithm: JwtAlgorithm::Hs256,
+                secret: Some("env://CQ_TEST_SECRET_AUTHCFG_JWT".into()),
+                public_key: None,
+                public_key_path: None,
+                issuer: None,
+                audience: None,
+                entitlements_claim: "entitlements".into(),
+                username_claim: "sub".into(),
+            }),
+        };
+
+        cfg.resolve_secrets().expect("resolve secrets");
+
+        assert_eq!(cfg.users[0].password_hash, "bcrypt-hash-value");
+        assert_eq!(cfg.jwt.unwrap().secret.unwrap(), "jwt-signing-secret");
+
+        std::env::remove_var("CQ_TEST_SECRET_AUTHCFG_JWT");
+        std::env::remove_var("CQ_TEST_SECRET_AUTHCFG_PW");
+    }
+
+    #[test]
+    fn auth_config_resolve_secrets_surfaces_missing_var_error() {
+        std::env::remove_var("CQ_TEST_SECRET_AUTHCFG_MISSING");
+        let mut cfg = AuthConfig {
+            required: true,
+            users: vec![UserConfig {
+                username: "bob".into(),
+                password_hash: "env://CQ_TEST_SECRET_AUTHCFG_MISSING".into(),
+                entitlements: Vec::new(),
+                row_filter: None,
+                query_budget: None,
+            }],
+            jwt: None,
+        };
+        let err = cfg.resolve_secrets().unwrap_err();
+        assert!(matches!(err, ConfigError::EnvVarNotSet(_)));
+    }
+
+    fn err_to_string(err: &ConfigError) -> String {
+        format!("{err}")
     }
 }
 

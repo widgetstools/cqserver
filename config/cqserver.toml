@@ -297,3 +297,32 @@ sql = """
 [query_limits]
 max_sow_estimated_bytes = 1073741824
 hard_max_sow_result_bytes = 2147483648
+
+# ── [auth] — secrets out of plaintext TOML (D7/P0.7) ───────────────
+# Auth is disabled in this demo config (no [auth] section), but when
+# enabling it, two fields carry secrets: [[auth.users]].password_hash
+# and [auth.jwt].secret. Both accept plain values (the historical
+# behavior — still fully supported, no migration required) OR one of
+# two indirection schemes so the secret itself never has to live in
+# this file:
+#
+#   env://VARNAME        - read from the environment variable VARNAME
+#                           at server startup. Errors at load time
+#                           (naming the var) if it's unset or empty.
+#   file:///abs/path      - read the file at /abs/path (also accepts
+#   (or file://rel/path)    a relative path). Trailing whitespace/
+#                           newlines are trimmed, since secrets
+#                           managers and `kubectl`/Docker secret
+#                           mounts commonly append one. Errors at load
+#                           time (naming the path) if unreadable.
+#
+# Example:
+#   [auth]
+#   required = true
+#
+#   [auth.jwt]
+#   secret = "env://CQ_JWT_SECRET"          # or "file:///run/secrets/jwt_secret"
+#
+#   [[auth.users]]
+#   username = "svc-ingest"
+#   password_hash = "file:///run/secrets/svc_ingest_bcrypt_hash"
