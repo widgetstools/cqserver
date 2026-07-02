@@ -1231,6 +1231,21 @@ fn check_entitlement(
     if session.can(op, topic) {
         return true;
     }
+    // D5/P0.5 — audit every entitlement denial. This is the single
+    // choke point for the six `check_entitlement` call sites (publish,
+    // publish_batch, delta_publish, sow, subscribe, sow_delete), so one
+    // event here covers all of them instead of duplicating the
+    // tracing call at each site.
+    tracing::warn!(
+        target: "cq_audit",
+        event = "entitlement_denied",
+        session = %session.id,
+        user = ?session.username,
+        op = ?op,
+        topic = %topic,
+        peer_addr = %session.remote_addr,
+        "Forbidden: missing entitlement"
+    );
     let _ = session.send_message(&CqMessage::error(
         cid.clone(),
         &format!("Forbidden: missing {:?} entitlement for {}", op, topic),
@@ -1406,10 +1421,12 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
                         ));
                         tracing::warn!(
                             target: "cq_audit",
+                            event = "logon",
+                            outcome = "fail",
                             session = %session.id,
                             user = %matched.username,
+                            peer_addr = %session.remote_addr,
                             reason = reason.as_str(),
-                            event = "logon_fail_session_limit",
                             "Logon rejected: max_sessions_per_user exceeded"
                         );
                         metrics::counter!(
@@ -1423,11 +1440,13 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
                     session.entitlements = matched.entitlements.clone();
                     tracing::info!(
                         target: "cq_audit",
+                        event = "logon",
+                        outcome = "success",
                         session = %session.id,
                         user = %matched.username,
+                        peer_addr = %session.remote_addr,
                         entitlements = matched.entitlements.len(),
                         protocol_version = negotiated,
-                        event = "logon_ok_jwt",
                         "Logon ok (jwt)"
                     );
                     metrics::counter!(
@@ -1446,8 +1465,11 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
                 None => {
                     tracing::warn!(
                         target: "cq_audit",
+                        event = "logon",
+                        outcome = "fail",
                         session = %session.id,
-                        event = "logon_fail_jwt",
+                        peer_addr = %session.remote_addr,
+                        reason = "invalid_jwt",
                         "Logon rejected: invalid JWT"
                     );
                     metrics::counter!(
@@ -1512,10 +1534,12 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
                 ));
                 tracing::warn!(
                     target: "cq_audit",
+                    event = "logon",
+                    outcome = "fail",
                     session = %session.id,
                     user = %matched.username,
+                    peer_addr = %session.remote_addr,
                     reason = reason.as_str(),
-                    event = "logon_fail_session_limit",
                     "Logon rejected: max_sessions_per_user exceeded"
                 );
                 metrics::counter!(
@@ -1527,22 +1551,27 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
             }
             session.username = Some(matched.username.clone());
             session.entitlements = matched.entitlements.clone();
-            // S25 audit event: explicit `target = "cq_audit"` so the
+            // S25 / D5 audit event: explicit `target = "cq_audit"` so the
             // tracing-subscriber Registry can route it to the
             // dedicated audit sink (e.g., audit.log) while the same
             // session keeps its other events on the operational sink.
             // Q4 — client_name was already captured early in
             // handle_logon (above the credentials branch); just
-            // surface it on the audit log.
+            // surface it on the audit log. `peer_addr` (D5/P0.5) comes
+            // straight from `session.remote_addr`, populated at accept
+            // time by the TCP/WS listener before the read loop (and
+            // hence any command, including this Logon) ever runs.
             tracing::info!(
                 target: "cq_audit",
+                event = "logon",
+                outcome = "success",
                 session = %session.id,
                 user = %matched.username,
+                peer_addr = %session.remote_addr,
                 client_name = ?session.client_name,
                 entitlements = matched.entitlements.len(),
                 protocol_version = negotiated,
                 trace_id = ?msg.trace_id,
-                event = "logon_ok",
                 "Logon ok"
             );
             metrics::counter!("cq_logon_total", "result" => "ok").increment(1);
@@ -1557,9 +1586,12 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
         None => {
             tracing::warn!(
                 target: "cq_audit",
+                event = "logon",
+                outcome = "fail",
                 session = %session.id,
-                attempted_user = %user,
-                event = "logon_fail",
+                user = %user,
+                peer_addr = %session.remote_addr,
+                reason = "invalid_credentials",
                 "Logon failed"
             );
             metrics::counter!("cq_logon_total", "result" => "fail").increment(1);

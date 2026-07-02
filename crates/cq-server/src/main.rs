@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // post-install (other sinks may still have come up); failure to
     // install ANY layer falls back to a stderr default inside
     // `logging::install`.
-    let sink_errors = logging::install(&server_config.logging);
+    let sink_errors = logging::install(&server_config.logging, server_config.audit.as_ref());
     for e in &sink_errors {
         warn!(error = %e, "Logging sink failed to install");
     }

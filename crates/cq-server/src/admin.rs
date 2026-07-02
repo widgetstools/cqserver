@@ -355,6 +355,39 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+/// D5/P0.5 — audit event for an admin mutation. Every mutating admin
+/// handler (rotate-journal, shrink-store[-all], subscription delete,
+/// view create/delete, add-column) calls this once, right before
+/// returning, so the shape is consistent across routes instead of
+/// each handler hand-rolling its own `tracing::info!`.
+///
+/// `actor` identity: the admin API's only authentication is the
+/// bearer token guard (`require_admin_token`), which doesn't carry a
+/// per-caller identity — it's a single shared secret, not a user
+/// directory. So `actor` is `"admin-token"` when `admin_token` is
+/// configured (the request necessarily presented it, since
+/// `require_admin_token` runs as a `route_layer` before every handler
+/// in `protected`) and `"open"` when the admin API has no token at
+/// all (unauthenticated deployments, e.g. loopback-only). If a richer
+/// admin identity (e.g. per-operator API keys) is added later, this
+/// is the single place to plumb it through.
+fn audit_admin(state: &AdminState, route: &str, args: &str, outcome: &str) {
+    let actor = if state.admin_token.is_some() {
+        "admin-token"
+    } else {
+        "open"
+    };
+    tracing::info!(
+        target: "cq_audit",
+        event = "admin",
+        route = %route,
+        actor = %actor,
+        args = %args,
+        outcome = %outcome,
+        "Admin mutation"
+    );
+}
+
 async fn get_stats(State(s): State<AdminState>) -> impl IntoResponse {
     let total_rows: u64 = s.topics.iter().map(|e| e.value().row_count() as u64).sum();
     let total_subs: usize = s
@@ -424,9 +457,11 @@ async fn add_column_endpoint(
     Path(topic): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let route = "POST /admin/add-column/:topic";
     let name = match params.get("name") {
         Some(n) if !n.is_empty() => n.clone(),
         _ => {
+            audit_admin(&s, route, &format!("topic={topic}"), "rejected_missing_name");
             return (
                 StatusCode::BAD_REQUEST,
                 "missing required `name` query parameter",
@@ -438,6 +473,7 @@ async fn add_column_endpoint(
         Some(t) => t.to_ascii_lowercase(),
         None => "string".into(),
     };
+    let args = format!("topic={topic}, name={name}, type={type_str}");
     let col_type = match type_str.as_str() {
         "double" => cq_core::schema::ColumnType::Double,
         "long" => cq_core::schema::ColumnType::Long,
@@ -447,29 +483,39 @@ async fn add_column_endpoint(
         "timestamp" => cq_core::schema::ColumnType::Timestamp,
         "bytes" => cq_core::schema::ColumnType::Bytes,
         other => {
+            audit_admin(&s, route, &args, "rejected_unknown_type");
             return (StatusCode::BAD_REQUEST, format!("unknown type `{other}`"))
                 .into_response();
         }
     };
     let topic_arc = match s.topics.get(&topic) {
         Some(t) => t.clone(),
-        None => return (StatusCode::NOT_FOUND, "no such topic").into_response(),
+        None => {
+            audit_admin(&s, route, &args, "not_found");
+            return (StatusCode::NOT_FOUND, "no such topic").into_response();
+        }
     };
     match topic_arc.add_column(&name, col_type) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "topic": topic,
-                "added": name,
-                "type": type_str,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::CONFLICT,
-            format!("add_column failed: {e}"),
-        )
-            .into_response(),
+        Ok(()) => {
+            audit_admin(&s, route, &args, "success");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "topic": topic,
+                    "added": name,
+                    "type": type_str,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            audit_admin(&s, route, &args, "error");
+            (
+                StatusCode::CONFLICT,
+                format!("add_column failed: {e}"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -529,7 +575,15 @@ async fn delete_subscription(
 ) -> impl IntoResponse {
     let route = match s.registry.remove(&sub_id) {
         Some((_, r)) => r,
-        None => return (StatusCode::NOT_FOUND, "no such subscription").into_response(),
+        None => {
+            audit_admin(
+                &s,
+                "DELETE /subscriptions/:sub_id",
+                &format!("sub_id={sub_id}"),
+                "not_found",
+            );
+            return (StatusCode::NOT_FOUND, "no such subscription").into_response();
+        }
     };
     if let Some(topic) = s.topics.get(&route.topic) {
         topic.unsubscribe(&sub_id);
@@ -546,6 +600,14 @@ async fn delete_subscription(
         dropped = route.dropped_count(),
         age_ms = route.age_ms(),
         "Admin-triggered subscription disconnect"
+    );
+    // D5/P0.5 — subscription drop via admin is one of the explicitly
+    // called-out security-relevant events.
+    audit_admin(
+        &s,
+        "DELETE /subscriptions/:sub_id",
+        &format!("sub_id={sub_id}, topic={}, session={}", route.topic, route.session_id),
+        "success",
     );
     (
         StatusCode::OK,
@@ -567,13 +629,17 @@ async fn rotate_journal(
     State(s): State<AdminState>,
     Path(topic): Path<String>,
 ) -> impl IntoResponse {
+    let route = "POST /admin/rotate-journal/:topic";
+    let args = format!("topic={topic}");
     let topic_arc = match s.topics.get(&topic) {
         Some(t) => t.clone(),
         None => {
+            audit_admin(&s, route, &args, "not_found");
             return (StatusCode::NOT_FOUND, "no such topic").into_response();
         }
     };
     if !topic_arc.has_txlog() {
+        audit_admin(&s, route, &args, "rejected_no_txlog");
         return (
             StatusCode::BAD_REQUEST,
             "topic is not persistent (no txlog to rotate)",
@@ -585,24 +651,33 @@ async fn rotate_journal(
     // worker (and with it /healthz).
     let rotated = tokio::task::spawn_blocking(move || topic_arc.force_rotate_txlog()).await;
     match rotated {
-        Ok(Ok(())) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "topic": topic,
-                "rotated": true,
-            })),
-        )
-            .into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("rotate failed: {e}"),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("rotate task failed: {e}"),
-        )
-            .into_response(),
+        Ok(Ok(())) => {
+            audit_admin(&s, route, &args, "success");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "topic": topic,
+                    "rotated": true,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            audit_admin(&s, route, &args, "error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("rotate failed: {e}"),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            audit_admin(&s, route, &args, "error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("rotate task failed: {e}"),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -614,10 +689,14 @@ async fn shrink_store(
     State(s): State<AdminState>,
     Path(topic): Path<String>,
 ) -> impl IntoResponse {
+    let route = "POST /admin/shrink-store/:topic";
+    let args = format!("topic={topic}");
     let Some(topic_arc) = s.topics.get(&topic).map(|e| e.clone()) else {
+        audit_admin(&s, route, &args, "not_found");
         return (StatusCode::NOT_FOUND, "no such topic").into_response();
     };
     let (old, new) = topic_arc.shrink_store();
+    audit_admin(&s, route, &args, "success");
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -642,6 +721,7 @@ async fn shrink_store_all(State(s): State<AdminState>) -> impl IntoResponse {
         .iter()
         .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
+    let topic_count = snapshot.len();
     let results: Vec<serde_json::Value> = snapshot
         .into_iter()
         .map(|(name, topic)| {
@@ -654,6 +734,12 @@ async fn shrink_store_all(State(s): State<AdminState>) -> impl IntoResponse {
             })
         })
         .collect();
+    audit_admin(
+        &s,
+        "POST /admin/shrink-store-all",
+        &format!("topics={topic_count}"),
+        "success",
+    );
     Json(serde_json::Value::Array(results))
 }
 
@@ -725,12 +811,14 @@ async fn create_view(
     State(s): State<AdminState>,
     Json(req): Json<CreateViewRequest>,
 ) -> impl IntoResponse {
+    let route = "POST /admin/views";
     let _guard = s.view_create_lock.lock().await;
 
     if req.name.trim().is_empty()
         || req.source.trim().is_empty()
         || req.sql.trim().is_empty()
     {
+        audit_admin(&s, route, &format!("name={}", req.name), "rejected_missing_fields");
         return (
             StatusCode::BAD_REQUEST,
             "name, source, and sql are required",
@@ -745,6 +833,7 @@ async fn create_view(
         initial_capacity: req.initial_capacity.unwrap_or(10_000),
         tap_capacity: req.tap_capacity.unwrap_or(1024),
     };
+    let args = format!("name={}, source={}", entry.name, entry.source);
 
     match crate::init_view(&entry, &s.topics, s.registry.clone()) {
         Ok((_handle, teardown)) => {
@@ -771,8 +860,10 @@ async fn create_view(
             if let Some(msg) = persist_err {
                 // Live but not persisted — surface so the operator knows
                 // it won't survive restart.
+                audit_admin(&s, route, &args, "error_persist");
                 return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
             }
+            audit_admin(&s, route, &args, "success");
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -792,6 +883,7 @@ async fn create_view(
                 crate::InitViewError::NameCollision(_) => StatusCode::CONFLICT,
                 _ => StatusCode::BAD_REQUEST,
             };
+            audit_admin(&s, route, &args, "error");
             (code, format!("create view failed: {e}")).into_response()
         }
     }
@@ -812,12 +904,15 @@ async fn delete_view(
     State(s): State<AdminState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let route = "DELETE /admin/views/:name";
     let canonical = cq_core::topic::canonicalize_topic(&name);
+    let args = format!("name={canonical}");
     // Serialize against create_view: both do a read-modify-write of
     // runtime_views.toml, so a concurrent create+delete must not
     // interleave and lose an update to the persisted file.
     let _guard = s.view_create_lock.lock().await;
     let Some((_, teardown)) = s.view_teardown.remove(&canonical) else {
+        audit_admin(&s, route, &args, "not_found");
         return (StatusCode::NOT_FOUND, format!("no such view: {canonical}")).into_response();
     };
     teardown.source.unregister_view_tap(teardown.left_tap_id);
@@ -841,8 +936,10 @@ async fn delete_view(
         Err(e) => Some(format!("view stopped but de-persist task failed: {e}")),
     };
     if let Some(msg) = remove_err {
+        audit_admin(&s, route, &args, "error_persist");
         return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
     }
+    audit_admin(&s, route, &args, "success");
     (StatusCode::OK, Json(serde_json::json!({ "deleted": canonical }))).into_response()
 }
 

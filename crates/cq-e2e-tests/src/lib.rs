@@ -232,6 +232,12 @@ pub struct ServerOpts {
     /// the server on its config defaults (max_connections = 10000,
     /// everything else off).
     pub transport_limits: Option<TransportLimitsOpts>,
+    /// D5/P0.5 — when `Some(_)`, the harness writes a top-level
+    /// `[audit]` section (sugar over the S25 sink machinery — see
+    /// `cq_server::logging`). `None` leaves audit events routed only
+    /// by whatever `logging_sinks` (or the stderr default) already
+    /// does.
+    pub audit: Option<AuditOpts>,
 }
 
 /// Replication config for the e2e harness. Mirrors
@@ -287,6 +293,24 @@ impl LogSinkSpec {
             file: Some(path.into()),
             filter: filter.into(),
             format: "text".into(),
+        }
+    }
+}
+
+/// D5/P0.5 `[audit]` spec used by the e2e harness. Mirrors
+/// `cq_server::logging::AuditConfig`.
+#[derive(Clone, Debug)]
+pub struct AuditOpts {
+    /// `"file"` or `"syslog"`.
+    pub sink: String,
+    pub path: String,
+}
+
+impl AuditOpts {
+    pub fn file(path: impl Into<String>) -> Self {
+        Self {
+            sink: "file".into(),
+            path: path.into(),
         }
     }
 }
@@ -507,6 +531,7 @@ impl Default for ServerOpts {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         }
     }
 }
@@ -946,6 +971,14 @@ fn build_toml(
         let escaped_filter = sink.filter.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(out, r#"filter = "{escaped_filter}""#).unwrap();
         writeln!(out, r#"format = "{}""#, sink.format).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    // [audit] — D5/P0.5 sugar over the sink machinery above.
+    if let Some(audit) = &opts.audit {
+        writeln!(out, "[audit]").unwrap();
+        writeln!(out, r#"sink = "{}""#, audit.sink).unwrap();
+        writeln!(out, r#"path = "{}""#, audit.path.replace('\\', "/")).unwrap();
         writeln!(out).unwrap();
     }
 

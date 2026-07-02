@@ -28,6 +28,34 @@
 //! When `[logging]` is absent (or empty), the server falls back to the
 //! historical single-stderr layer with the same `RUST_LOG` semantics
 //! it had before S25.
+//!
+//! ### D5/P0.5 — `[audit]` sugar
+//!
+//! ```toml
+//! [audit]
+//! sink = "file"      # or "syslog"
+//! path = "logs/audit.log"
+//! ```
+//!
+//! `[audit]` builds NO new plumbing — it is sugar over the same
+//! per-target-filter machinery above. `sink = "file"` is equivalent to
+//! hand-writing a `[[logging.sinks]]` entry with
+//! `filter = "off,cq_audit=info"` (ONLY `cq_audit`-targeted events land
+//! here, at any level) pointed at `path`. `sink = "syslog"` builds an
+//! analogous layer whose `MakeWriter` sends each formatted line to a
+//! syslog daemon over a Unix datagram socket at `path` (defaults to
+//! `/dev/log`, the conventional syslog socket) using RFC 3164 framing
+//! (`<PRI>message`) — no external syslog crate, since a single write()
+//! per line is all RFC 3164 needs. The `[audit]` layer is installed
+//! IN ADDITION to (not instead of) `[logging].sinks`, so operators can
+//! keep the historical stderr default for everything else while
+//! opting into a dedicated audit trail.
+//!
+//! Audit call sites always use `target: "cq_audit"` (see
+//! `crates/cq-transport/src/router.rs::handle_logon`,
+//! `crates/cq-server/src/admin.rs::audit_admin`, and
+//! `check_entitlement`'s denial branch) — the same target that
+//! hand-authored `[[logging.sinks]]` filters already route on.
 
 use serde::Deserialize;
 use std::fs::OpenOptions;
@@ -75,17 +103,53 @@ fn default_filter() -> String {
     "info".into()
 }
 
-/// Install the tracing-subscriber stack from `cfg`. Returns a list of
-/// any errors encountered while opening sink files; on error the
-/// affected sink is dropped (others still install) and the caller
+/// D5/P0.5 — top-level `[audit]` config. Sugar over the S25 sink
+/// machinery: routes every `target = "cq_audit"` event to a dedicated
+/// destination, independent of (and in addition to) `[logging].sinks`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditConfig {
+    /// `"file"` (default) or `"syslog"`.
+    #[serde(default)]
+    pub sink: AuditSinkKind,
+    /// File sink: destination path (created on demand, incl. parent
+    /// dirs). Syslog sink: path to the Unix datagram socket; when
+    /// absent, defaults to `/dev/log`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditSinkKind {
+    #[default]
+    File,
+    Syslog,
+}
+
+/// The tracing target every audit event is emitted with. Both the
+/// hand-authored `[[logging.sinks]]` path and the `[audit]` sugar
+/// route on this same value.
+pub const AUDIT_TARGET: &str = "cq_audit";
+
+/// Filter directive that captures ONLY audit-targeted events, at any
+/// level `>= info`, and nothing else.
+fn audit_only_filter() -> String {
+    format!("off,{AUDIT_TARGET}=info")
+}
+
+/// Install the tracing-subscriber stack from `cfg` (`[logging].sinks`)
+/// plus, when present, the `[audit]` sugar layer. Returns a list of
+/// any errors encountered while opening sink files/sockets; on error
+/// the affected sink is dropped (others still install) and the caller
 /// can log a warning via the surviving sinks.
 ///
-/// When `cfg.sinks` is empty, installs the historical single-stderr
-/// fmt layer driven by `RUST_LOG` (matches pre-S25 behaviour).
-pub fn install(cfg: &LoggingConfig) -> Vec<String> {
+/// When both `cfg.sinks` and `audit` are empty/`None`, installs the
+/// historical single-stderr fmt layer driven by `RUST_LOG` (matches
+/// pre-S25 behaviour).
+pub fn install(cfg: &LoggingConfig, audit: Option<&AuditConfig>) -> Vec<String> {
     let mut errors = Vec::new();
 
-    if cfg.sinks.is_empty() {
+    if cfg.sinks.is_empty() && audit.is_none() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -102,6 +166,12 @@ pub fn install(cfg: &LoggingConfig) -> Vec<String> {
             Err(e) => errors.push(e),
         }
     }
+    if let Some(audit_cfg) = audit {
+        match build_audit_layer(audit_cfg) {
+            Ok(layer) => layers.push(layer),
+            Err(e) => errors.push(e),
+        }
+    }
     if layers.is_empty() {
         // Every sink failed — fall back to stderr so we don't run silent.
         let _ = tracing_subscriber::fmt()
@@ -111,6 +181,40 @@ pub fn install(cfg: &LoggingConfig) -> Vec<String> {
     }
     let _ = Registry::default().with(layers).try_init();
     errors
+}
+
+/// Build the `[audit]`-sugar layer: a plain `SinkConfig` for `file`,
+/// or the syslog `MakeWriter` for `syslog`. Both use
+/// [`audit_only_filter`] so ONLY `target = "cq_audit"` events land
+/// here, regardless of what else `[logging].sinks` routes.
+fn build_audit_layer(
+    cfg: &AuditConfig,
+) -> Result<Box<dyn Layer<Registry> + Send + Sync>, String> {
+    let filter = EnvFilter::try_new(audit_only_filter())
+        .map_err(|e| format!("invalid audit filter: {e}"))?;
+    match cfg.sink {
+        AuditSinkKind::File => {
+            let path = cfg
+                .path
+                .as_deref()
+                .ok_or_else(|| "[audit] sink = \"file\" requires `path`".to_string())?;
+            let writer = open_file(path)?;
+            Ok(Box::new(
+                fmt::layer().with_writer(writer).with_ansi(false).with_filter(filter),
+            ))
+        }
+        AuditSinkKind::Syslog => {
+            let socket_path = cfg.path.clone().unwrap_or_else(|| "/dev/log".to_string());
+            let writer = SyslogWriter::new(socket_path)?;
+            Ok(Box::new(
+                fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_filter(filter),
+            ))
+        }
+    }
 }
 
 fn build_layer(sink: &SinkConfig) -> Result<Box<dyn Layer<Registry> + Send + Sync>, String> {
@@ -209,6 +313,102 @@ impl io::Write for SharedFileGuard {
     }
 }
 
+/// D5/P0.5 — `MakeWriter` that ships each formatted line to a syslog
+/// daemon over a Unix datagram socket (the same transport the
+/// standard `syslog()` libc call uses under the hood). Framed as RFC
+/// 3164 (`<PRI>message`, no structured-data / RFC 5424 header) since
+/// that's the lowest common denominator every syslog daemon accepts.
+/// `PRI` is fixed at `<14>` (facility=`user`(1), severity=`info`(6):
+/// `1*8+6=14`) — audit events are already filtered to `cq_audit=info`
+/// by the layer's `EnvFilter`, so a single fixed severity is
+/// sufficient and keeps this writer a plain byte-sink (no per-event
+/// level plumbing needed).
+///
+/// Connects (`UnixDatagram::connect`) once at construction so
+/// steady-state writes are a single `send()` syscall; if the daemon
+/// isn't listening yet, connect still succeeds for `SOCK_DGRAM` (no
+/// handshake) and sends simply fail until something is listening —
+/// acceptable for an audit sink (best-effort, matches syslog's own
+/// fire-and-forget contract) rather than fatal to server startup.
+#[derive(Clone)]
+pub struct SyslogWriter {
+    #[cfg(unix)]
+    inner: Arc<std::os::unix::net::UnixDatagram>,
+    #[cfg(not(unix))]
+    _path: Arc<String>,
+}
+
+impl SyslogWriter {
+    #[cfg(unix)]
+    pub fn new(socket_path: impl Into<String>) -> Result<Self, String> {
+        let socket_path = socket_path.into();
+        let sock = std::os::unix::net::UnixDatagram::unbound()
+            .map_err(|e| format!("syslog: create unbound socket: {e}"))?;
+        sock.connect(&socket_path)
+            .map_err(|e| format!("syslog: connect({socket_path}): {e}"))?;
+        Ok(Self {
+            inner: Arc::new(sock),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn new(socket_path: impl Into<String>) -> Result<Self, String> {
+        // Config parsing + validation still work on non-Unix targets
+        // (e.g. `cargo test` on Windows CI); only the actual socket
+        // connect is unavailable, so surface that as an install error
+        // rather than failing to compile.
+        Err(format!(
+            "syslog sink unsupported on this platform (socket_path = {})",
+            socket_path.into()
+        ))
+    }
+}
+
+impl<'a> fmt::MakeWriter<'a> for SyslogWriter {
+    type Writer = SyslogGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        SyslogGuard {
+            #[cfg(unix)]
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+pub struct SyslogGuard {
+    #[cfg(unix)]
+    inner: Arc<std::os::unix::net::UnixDatagram>,
+}
+
+impl io::Write for SyslogGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            // RFC 3164 PRI prefix; `buf` already ends with the
+            // newline tracing-subscriber's fmt layer appends, which
+            // syslog datagram framing doesn't need but tolerates.
+            let mut framed = Vec::with_capacity(buf.len() + 8);
+            framed.extend_from_slice(b"<14>");
+            framed.extend_from_slice(buf);
+            // Datagram sockets are message-atomic — a short write here
+            // would silently truncate the audit line, so treat it as
+            // an error rather than reporting a partial success.
+            match self.inner.send(&framed) {
+                Ok(n) if n == framed.len() => Ok(buf.len()),
+                Ok(_) => Err(io::Error::other("syslog: short datagram write")),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = buf;
+            Err(io::Error::other("syslog sink unsupported on this platform"))
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,7 +416,7 @@ mod tests {
     #[test]
     fn empty_logging_config_installs_default() {
         // The fallback path is a `try_init`, idempotent across tests.
-        let errs = install(&LoggingConfig::default());
+        let errs = install(&LoggingConfig::default(), None);
         assert!(errs.is_empty());
     }
 
@@ -253,5 +453,89 @@ mod tests {
         let r = build_layer(&s);
         assert!(r.is_ok(), "expected sink to open: {:?}", r.err());
         assert!(path.exists(), "audit.log should be created on open");
+    }
+
+    // --- D5/P0.5 [audit] config -------------------------------------
+
+    #[test]
+    fn audit_config_file_sink_parses() {
+        let toml = r#"
+            sink = "file"
+            path = "logs/audit.log"
+        "#;
+        let cfg: AuditConfig = toml::from_str(toml).expect("parse [audit] file sink");
+        assert_eq!(cfg.sink, AuditSinkKind::File);
+        assert_eq!(cfg.path.as_deref(), Some("logs/audit.log"));
+    }
+
+    #[test]
+    fn audit_config_syslog_sink_parses() {
+        // Task 2.4 brief: "if syslog is hard to test [in an e2e sense],
+        // wire config parsing + a unit test that config parses" —
+        // covered here independent of a live syslog daemon.
+        let toml = r#"
+            sink = "syslog"
+            path = "/var/run/syslog"
+        "#;
+        let cfg: AuditConfig = toml::from_str(toml).expect("parse [audit] syslog sink");
+        assert_eq!(cfg.sink, AuditSinkKind::Syslog);
+        assert_eq!(cfg.path.as_deref(), Some("/var/run/syslog"));
+    }
+
+    #[test]
+    fn audit_config_sink_defaults_to_file() {
+        let toml = r#"path = "logs/audit.log""#;
+        let cfg: AuditConfig = toml::from_str(toml).expect("parse [audit] without sink");
+        assert_eq!(cfg.sink, AuditSinkKind::File);
+    }
+
+    #[test]
+    fn audit_only_filter_captures_only_cq_audit_target() {
+        // Property under test: the filter directive `[audit]` builds is
+        // "off,cq_audit=info" — everything except cq_audit-targeted
+        // events is suppressed. Exercise that it at least parses (the
+        // full routing behavior is covered by the e2e suite).
+        let f = EnvFilter::try_new(audit_only_filter());
+        assert!(f.is_ok(), "audit_only_filter() should be a valid EnvFilter directive");
+    }
+
+    #[test]
+    fn build_audit_layer_file_sink_creates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit").join("audit.log");
+        let cfg = AuditConfig {
+            sink: AuditSinkKind::File,
+            path: Some(path.to_string_lossy().into_owned()),
+        };
+        let r = build_audit_layer(&cfg);
+        assert!(r.is_ok(), "expected audit file layer to build: {:?}", r.err());
+        assert!(path.exists(), "audit file should be created on open");
+    }
+
+    #[test]
+    fn build_audit_layer_file_sink_without_path_errors() {
+        let cfg = AuditConfig {
+            sink: AuditSinkKind::File,
+            path: None,
+        };
+        let r = build_audit_layer(&cfg);
+        assert!(r.is_err(), "file sink without `path` should error");
+    }
+
+    #[test]
+    fn install_with_audit_config_only_does_not_use_stderr_fallback() {
+        // Regression: `[audit]` with no `[logging].sinks` at all must
+        // still install the audit layer, not silently fall back to the
+        // pre-S25 stderr-only default (which would drop audit routing
+        // entirely).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.log");
+        let audit = AuditConfig {
+            sink: AuditSinkKind::File,
+            path: Some(path.to_string_lossy().into_owned()),
+        };
+        let errs = install(&LoggingConfig::default(), Some(&audit));
+        assert!(errs.is_empty(), "expected no install errors: {errs:?}");
+        assert!(path.exists(), "audit file should exist after install()");
     }
 }

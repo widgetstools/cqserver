@@ -69,6 +69,16 @@ pub struct ServerConfig {
     /// tracing-subscriber Registry; events are routed by `target`.
     #[serde(default)]
     pub logging: crate::logging::LoggingConfig,
+    /// D5/P0.5 — dedicated audit-log sink. Sugar over the S25
+    /// per-target sink machinery above: when set, every
+    /// `target = "cq_audit"` event (logon success/fail, admin
+    /// mutations, entitlement denials) is additionally routed to this
+    /// destination, independent of whatever `[logging].sinks` does.
+    /// `None` (the default) leaves audit events to fall through to
+    /// whatever `[logging].sinks` (or the stderr fallback) already
+    /// routes them to.
+    #[serde(default)]
+    pub audit: Option<crate::logging::AuditConfig>,
     /// H6 (minimum viable shard primitive): static topic-prefix →
     /// instance-URL map. When non-empty, the admin endpoint
     /// `/admin/shard-for/{topic}` answers with the owning instance's
@@ -962,6 +972,7 @@ impl Default for ServerConfig {
             replication: ReplicationConfig::default(),
             transport: TransportConfig::default(),
             logging: crate::logging::LoggingConfig::default(),
+            audit: None,
             shards: Vec::new(),
             query_limits: QueryLimitsConfig::default(),
             evaluator_lanes: None,
