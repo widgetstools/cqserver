@@ -171,8 +171,7 @@ impl Codec {
                 bson::from_document(doc)
                     .map_err(|e| CodecError::BsonDecode(e.to_string()))
             }
-            Codec::Fix => decode_fix_envelope(bytes)
-                .map_err(|e| CodecError::FixDecode(e.to_string())),
+            Codec::Fix => decode_fix_envelope(bytes),
         }
     }
 }
@@ -237,16 +236,17 @@ fn encode_fix_envelope(msg: &CqMessage) -> Result<Vec<u8>, String> {
     crate::fix::encode(&map).map_err(|e| e.to_string())
 }
 
-fn decode_fix_envelope(bytes: &[u8]) -> Result<CqMessage, String> {
+fn decode_fix_envelope(bytes: &[u8]) -> Result<CqMessage, CodecError> {
     use crate::command::{Command, Status};
-    let map = crate::fix::decode(bytes).map_err(|e| e.to_string())?;
+    let map = crate::fix::decode(bytes)
+        .map_err(|e| CodecError::FixDecode(e.to_string()))?;
     let command_str = map
         .get("35")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "missing tag 35 (command)".to_string())?;
+        .ok_or_else(|| CodecError::FixDecode("missing tag 35 (command)".to_string()))?;
     let command_value = serde_json::Value::String(command_str.to_string());
-    let command: Command =
-        serde_json::from_value(command_value).map_err(|e| e.to_string())?;
+    let command: Command = serde_json::from_value(command_value)
+        .map_err(|e| CodecError::FixDecode(e.to_string()))?;
     let mut out = CqMessage::new(command);
     out.command_id = map.get("11").and_then(|v| v.as_str()).map(String::from);
     out.topic = map.get("55").and_then(|v| v.as_str()).map(String::from);
@@ -264,10 +264,17 @@ fn decode_fix_envelope(bytes: &[u8]) -> Result<CqMessage, String> {
     if let Some(s) = map.get("5002").and_then(|v| v.as_str()) {
         // A8/E12 — same wire-nesting guard as the JSON codec; tag
         // 5002 carries a JSON-stringified `data` payload, so it's
-        // subject to the same decode-recursion risk.
-        if !crate::depth_guard::json_depth_exceeds_default(s.as_bytes()) {
-            out.data = serde_json::from_str(s).ok();
+        // subject to the same decode-recursion risk. Unlike the old
+        // behaviour (silently dropping to `data: None` and returning
+        // `Ok`), an over-depth payload must fail the same way the
+        // JSON codec arm does, so transports surface a clean error
+        // frame instead of a message that silently lost its data.
+        if crate::depth_guard::json_depth_exceeds_default(s.as_bytes()) {
+            return Err(CodecError::NestingTooDeep(
+                crate::depth_guard::MAX_WIRE_JSON_DEPTH,
+            ));
         }
+        out.data = serde_json::from_str(s).ok();
     }
     Ok(out)
 }
@@ -375,6 +382,32 @@ mod tests {
         assert!(
             Codec::Fix.decode(&j).is_err(),
             "FIX decoder must reject JSON-encoded bytes"
+        );
+    }
+
+    #[test]
+    fn fix_decode_rejects_over_depth_tag_5002_data() {
+        // Build a `data` payload nested well past
+        // `depth_guard::MAX_WIRE_JSON_DEPTH` (128), encode it into a
+        // FIX envelope (tag 5002 carries `data` as a JSON string),
+        // then decode. The over-depth guard must reject the whole
+        // envelope with `NestingTooDeep`, exactly like the JSON codec
+        // arm — not silently succeed with `data: None`.
+        let mut node = serde_json::json!("leaf");
+        for _ in 0..200 {
+            node = serde_json::json!({ "n": node });
+        }
+        let mut m = CqMessage::new(Command::Publish);
+        m.topic = Some("/deep".into());
+        m.data = Some(node);
+        let bytes = Codec::Fix.encode(&m).unwrap();
+
+        let err = Codec::Fix
+            .decode(&bytes)
+            .expect_err("over-depth tag 5002 data must be rejected, not silently dropped");
+        assert!(
+            matches!(err, CodecError::NestingTooDeep(_)),
+            "expected NestingTooDeep, got {err:?}"
         );
     }
 
