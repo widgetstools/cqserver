@@ -1,0 +1,82 @@
+name: Nightly
+
+# Gates the deliberately-#[ignore]d slow / environment-dependent
+# tests (stress, bench, mem/row measurement) that are excluded from
+# the per-PR `ci.yml` lane because they're too slow or too
+# environment-sensitive to run on every push. This workflow turns
+# them into real pass/fail gates via scripts/nightly-tests.sh, not
+# just logs — see that script for the full test table and the
+# mem_per_row_e2e baseline-ceiling gate.
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    # Generous ceiling: build + 9 tests, several of which sweep
+    # multiple row-count/pattern levels against 10k live connections.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly
+
+      - name: Raise file-descriptor limit
+        run: |
+          ulimit -n 65536 || true
+          ulimit -n
+
+      - name: Run nightly gate lane
+        run: |
+          ulimit -n 65536 || true
+          bash scripts/nightly-tests.sh
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-test-summary
+          path: target/nightly-tests/summary.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Separate job so the 1-hour soak doesn't block the rest of the
+  # nightly lane from reporting (and so its own timeout can be
+  # sized independently). Runs on the same daily schedule.
+  nightly-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-soak
+
+      - name: Run 1-hour active-set soak
+        env:
+          NIGHTLY_SOAK: "1"
+          # Skip everything except the soak test in this job — the
+          # sibling `nightly` job already covers the rest.
+          NIGHTLY_SKIP: "trader_view_pivot_e2e,mem_per_row_e2e,stress_10k_connections,stress_10k_max_rows,bench_wide_ingest_a,bench_wide_ingest_b,bench_wide_ingest_c,loadgen_scenario_h,loadgen_scenario_i"
+        run: bash scripts/nightly-tests.sh
+
+      - name: Upload soak summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-soak-summary
+          path: target/nightly-tests/summary.txt
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,39 @@
+# mem_per_row_e2e baseline — in-memory bytes/row ceilings
+#
+# Source test: crates/cq-e2e-tests/tests/mem_per_row_e2e.rs
+#   (fn measure_bytes_per_row_by_schema, #[ignore]d — run via
+#   `cargo test --release -p cq-e2e-tests --test mem_per_row_e2e -- --ignored --nocapture`)
+#
+# Method:
+#   1. Ran the test once at its default scale (CQ_MEM_ROWS=500000,
+#      i.e. no override) on the nightly reference box:
+#        - macOS (Darwin 25.5.0, arm64), 14 cores, 38 GB RAM
+#        - `cargo build --release -p cq-server` immediately beforehand
+#          (fresh binary, not stale) on 2026-07-02.
+#   2. The test prints one "in-mem≈ NNNN B/row" line per schema shape
+#      (narrow/medium/wide/real-world). Recorded the observed value
+#      for each shape below as `observed`.
+#   3. `ceiling = observed * 1.10` (10% slack over the observed
+#      baseline) — this is the GATE value scripts/nightly-tests.sh
+#      checks against. Exceeding it fails the nightly lane.
+#   4. To refresh this baseline after an intentional memory-layout
+#      change: re-run the test at default scale, replace `observed`,
+#      recompute `ceiling = observed * 1.10`, and note the date +
+#      reason in a comment.
+#
+# Format: <shape-key>=<ceiling-bytes-per-row>
+#   shape-key matches the leading label cargo prints, lowercased,
+#   spaces/parens stripped to '-', e.g. "real-world (200 col)" ->
+#   "real-world-200-col".
+#
+# observed 2026-07-02 (500_000 rows, narrow/medium; 250_000 wide;
+# 125_000 real-world — the test halves/quarters n for heavier shapes):
+#   narrow (5 col)        observed=296  B/row  -> ceiling=325.6
+#   medium (15 col)       observed=770  B/row  -> ceiling=847.0
+#   wide (100 col)        observed=3344 B/row  -> ceiling=3678.4
+#   real-world (200 col)  observed=6570 B/row  -> ceiling=7227.0
+
+narrow-5-col=325.6
+medium-15-col=847.0
+wide-100-col=3678.4
+real-world-200-col=7227.0
