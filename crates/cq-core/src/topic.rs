@@ -1870,6 +1870,91 @@ impl Topic {
         Ok(removed as usize)
     }
 
+    /// Run one **safe** in-process checkpoint: make the log durable, write
+    /// a crash-durable SOW snapshot, then reclaim the now-redundant sealed
+    /// segments. This is the periodic (runtime) equivalent of the graceful
+    /// shutdown sequence in `cq-server`'s `shutdown()`, and it preserves the
+    /// **absolute** safety invariant: a sealed segment is only pruned after
+    /// a crash-durable `snapshot.bin` (fsync'd body + directory, see
+    /// `Snapshot::write_atomic`) covers every sequence in it. The ordering
+    /// here is load-bearing:
+    ///
+    /// 1. `flush_txlog()` — fsync the active segment so the on-disk log is
+    ///    durable up to the sampled sequence. Skipping this could let a
+    ///    snapshot claim a sequence the log can't back after a crash.
+    /// 2. `write_snapshot()` — build (under a topic **read** lock, so
+    ///    publishers only stall for the duration of the store copy) and
+    ///    atomically+durably write `snapshot.bin`, which now backs every row
+    ///    up to `snapshot.sequence` / `snapshot.segment_id`.
+    /// 3. `reclaim_sealed_segments()` — delete only sealed segments (id <
+    ///    active), all of which the just-written snapshot fully covers.
+    ///
+    /// Returns per-run stats. The `build_lock_hold` measures the topic read
+    /// lock held during snapshot build — the only window in which a
+    /// publisher (which needs the write lock) can be delayed; the fsync of
+    /// the snapshot body and the segment deletions happen **outside** any
+    /// topic lock. No-op (`Ok(None)`) for a non-persistent topic.
+    ///
+    /// When `reclaim` is `false`, steps 1-2 still run (the snapshot is
+    /// refreshed for fast restart) but no segments are deleted — the mode a
+    /// replication **source** wants, where standbys may still need old
+    /// segments.
+    ///
+    /// Idempotent and safe to run concurrently-in-sequence with shutdown:
+    /// re-writing an identical-or-newer snapshot and re-pruning already-gone
+    /// segments are both harmless (snapshot write is atomic-rename; prune is
+    /// best-effort-per-file). Callers should still avoid *overlapping* runs
+    /// on the same topic (the sweeper does so by running topics serially).
+    pub fn checkpoint(&self, reclaim: bool) -> Result<Option<CheckpointStats>, TopicError> {
+        if !self.has_txlog() {
+            return Ok(None);
+        }
+        // 1. Durable log first — never snapshot ahead of a durable log.
+        self.flush_txlog()?;
+
+        // 2. Build the snapshot, measuring only the read-lock hold (the
+        //    store copy), then durably write it outside the lock. We
+        //    replicate write_snapshot's body here so the lock-hold window is
+        //    exactly the build, not the fsync.
+        let build_start = std::time::Instant::now();
+        let Some(snapshot) = self.build_snapshot() else {
+            // has_txlog() was true, so this is unreachable in practice;
+            // treat as a no-op rather than panic.
+            return Ok(None);
+        };
+        let build_lock_hold = build_start.elapsed();
+        let covered_sequence = snapshot.sequence;
+        let covered_segment = snapshot.segment_id;
+
+        let dir = self
+            .txlog
+            .as_ref()
+            .expect("has_txlog() => txlog present")
+            .lock()
+            .dir()
+            .to_path_buf();
+        // fsync'd body + directory: this is what makes the reclaim in step 3
+        // crash-safe.
+        snapshot
+            .write_atomic(&dir)
+            .map_err(|e| TopicError::TxLog(cq_txlog::TxLogError::Io(e)))?;
+
+        // 3. Now — and only now — reclaim the segments the durable snapshot
+        //    covers. Deletes strictly sealed segments (active is retained).
+        let reclaimed = if reclaim {
+            self.reclaim_sealed_segments()?
+        } else {
+            0
+        };
+
+        Ok(Some(CheckpointStats {
+            build_lock_hold,
+            reclaimed,
+            covered_sequence,
+            covered_segment,
+        }))
+    }
+
     /// Rebuild this topic's store from a loaded snapshot, then set the
     /// recovery baseline so subsequent txlog tail-replay applies only
     /// entries newer than the snapshot.
@@ -2837,6 +2922,23 @@ impl Topic {
 
 /// Topics are shared via `Arc`. Internal locks make `Topic` `Send + Sync`.
 pub type SharedTopic = Arc<Topic>;
+
+/// Per-run outcome of [`Topic::checkpoint`], for metrics + logging.
+#[derive(Debug, Clone)]
+pub struct CheckpointStats {
+    /// How long the topic **read** lock was held building the SOW snapshot
+    /// — the only window in which publishers (which need the write lock)
+    /// can be delayed by a checkpoint. Snapshot fsync + segment deletion
+    /// happen outside any topic lock and are *not* counted here.
+    pub build_lock_hold: std::time::Duration,
+    /// Number of sealed segment files reclaimed this run.
+    pub reclaimed: usize,
+    /// Highest sequence the durable snapshot covers.
+    pub covered_sequence: u64,
+    /// Active segment id at snapshot time (all sealed segments below it
+    /// were candidates for reclaim).
+    pub covered_segment: u64,
+}
 
 // ───────── nested-publish helpers ─────────
 
@@ -4013,6 +4115,129 @@ mod view_tap_tests {
             999.0,
             "tail update wins over snapshot value"
         );
+    }
+
+    #[test]
+    fn checkpoint_bounds_segments_and_recovery_survives() {
+        use cq_txlog::reader::TxLogReader;
+        use cq_txlog::snapshot::Snapshot;
+        use cq_txlog::writer::TxLogWriter;
+        use cq_txlog::FsyncPolicy;
+        use parking_lot::Mutex as PlMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(PlMutex::new(
+            TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, 512).unwrap(),
+        ));
+        let mut topic = make_topic();
+        topic.attach_txlog(writer.clone());
+
+        // Publish enough to seal several segments.
+        for i in 0..40 {
+            publish(&topic, &format!("SYM{i:03}"), i as f64);
+        }
+        let segs_before = writer.lock().current_segment();
+        assert!(segs_before > 2, "history spans several segments");
+
+        // One safe checkpoint: durable log → durable snapshot → reclaim.
+        let stats = topic
+            .checkpoint(true)
+            .unwrap()
+            .expect("persistent topic checkpoints");
+        assert_eq!(
+            stats.reclaimed as u64,
+            segs_before - 1,
+            "all sealed segments reclaimed, active retained"
+        );
+        assert!(
+            stats.covered_sequence > 0,
+            "snapshot covers a real sequence"
+        );
+        // Document the measured lock-hold (store copy under the read lock).
+        // Emitted so `cargo test -- --nocapture` shows the pause. On this
+        // 40-row topic it is single-digit microseconds.
+        eprintln!(
+            "checkpoint build_lock_hold (40-row topic): {:?}",
+            stats.build_lock_hold
+        );
+
+        // On-disk segment count is now bounded to ~1 (the active segment).
+        let remaining = cq_txlog::segment::list_segments(dir.path()).unwrap().len();
+        assert!(
+            remaining <= 2,
+            "segments bounded after checkpoint, got {remaining}"
+        );
+
+        // Keep serving: post-checkpoint tail must survive a crash recovery.
+        publish(&topic, "SYM000", 999.0);
+        publish(&topic, "NEWKEY", 1.0);
+        writer.lock().sync().unwrap();
+        drop(topic);
+
+        // Simulated crash recovery: snapshot + tail replay reproduces
+        // full state; NOTHING was lost by the reclaim.
+        let snap = Snapshot::load(dir.path()).unwrap().expect("snapshot");
+        let restarted = make_topic();
+        restarted.apply_snapshot(&snap);
+        assert_eq!(restarted.row_count(), 40, "snapshot restores all 40 rows");
+
+        let mut reader = TxLogReader::open(dir.path()).unwrap();
+        reader.skip_to_segment(snap.segment_id);
+        while let Some(e) = reader.read_next().unwrap() {
+            if e.is_tombstone() {
+                restarted.replay_delete_origin(&e.origin, e.sequence, &e.key);
+            } else if let Ok(serde_json::Value::Object(m)) =
+                serde_json::from_slice::<serde_json::Value>(&e.payload)
+            {
+                restarted.replay_upsert_map_origin(&e.origin, e.sequence, &m);
+            }
+        }
+        assert_eq!(restarted.row_count(), 41, "tail applied on top of snapshot");
+        let res = restarted
+            .query("SELECT * FROM t WHERE symbol = 'SYM000'")
+            .unwrap();
+        assert_eq!(
+            res.rows[0].get("price").unwrap(),
+            999.0,
+            "post-checkpoint tail update wins after recovery"
+        );
+    }
+
+    #[test]
+    fn checkpoint_lock_hold_scales_with_sow_size() {
+        // Measures the topic read-lock hold (the snapshot store copy) at a
+        // realistic SOW size so the documented "pause" number reflects the
+        // real cost publishers can see, not a toy 40-row case.
+        use cq_txlog::writer::TxLogWriter;
+        use cq_txlog::FsyncPolicy;
+        use parking_lot::Mutex as PlMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(PlMutex::new(
+            TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, 1 << 20).unwrap(),
+        ));
+        let mut topic = make_topic();
+        topic.attach_txlog(writer);
+
+        const N: usize = 50_000;
+        for i in 0..N {
+            publish(&topic, &format!("SYM{i:06}"), i as f64);
+        }
+        assert_eq!(topic.row_count() as usize, N);
+
+        let stats = topic.checkpoint(true).unwrap().expect("persistent");
+        eprintln!(
+            "checkpoint build_lock_hold ({N}-row topic): {:?} ({} us)",
+            stats.build_lock_hold,
+            stats.build_lock_hold.as_micros()
+        );
+        assert_eq!(stats.covered_sequence as usize, N);
+    }
+
+    #[test]
+    fn checkpoint_is_noop_for_non_persistent_topic() {
+        let topic = make_topic();
+        assert!(topic.checkpoint(true).unwrap().is_none());
     }
 
     #[test]

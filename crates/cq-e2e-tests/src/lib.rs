@@ -238,6 +238,18 @@ pub struct ServerOpts {
     /// by whatever `logging_sinks` (or the stderr default) already
     /// does.
     pub audit: Option<AuditOpts>,
+    /// Task 3.1 — force a small `[txlog] segment_size` (bytes) so tests
+    /// can trigger rapid segment rotation. `None` leaves the txlog crate's
+    /// 256 MB default. Independent of `txlog_archive.segment_size`, which
+    /// only applies when archiving is configured.
+    pub txlog_segment_size: Option<u64>,
+    /// Task 3.1 — emit `[txlog] snapshot_reclaim = true` so the periodic
+    /// checkpointer (and shutdown) may reclaim sealed segments. `false`
+    /// (default) matches the server default.
+    pub txlog_snapshot_reclaim: bool,
+    /// Task 3.1 — emit `[txlog] checkpoint_interval_secs`. `0` (default)
+    /// disables the periodic in-process checkpointer.
+    pub txlog_checkpoint_interval_secs: u64,
 }
 
 /// Replication config for the e2e harness. Mirrors
@@ -532,6 +544,9 @@ impl Default for ServerOpts {
             admin_tls: None,
             transport_limits: None,
             audit: None,
+            txlog_segment_size: None,
+            txlog_snapshot_reclaim: false,
+            txlog_checkpoint_interval_secs: 0,
         }
     }
 }
@@ -863,6 +878,24 @@ fn build_toml(
         if archive.compress {
             writeln!(out, "archive_compress = true").unwrap();
         }
+    }
+    // Task 3.1 knobs. Only emit segment_size here when the archive block
+    // above didn't already (they set the same key).
+    if opts.txlog_archive.is_none() {
+        if let Some(sz) = opts.txlog_segment_size {
+            writeln!(out, "segment_size = {sz}").unwrap();
+        }
+    }
+    if opts.txlog_snapshot_reclaim {
+        writeln!(out, "snapshot_reclaim = true").unwrap();
+    }
+    if opts.txlog_checkpoint_interval_secs > 0 {
+        writeln!(
+            out,
+            "checkpoint_interval_secs = {}",
+            opts.txlog_checkpoint_interval_secs
+        )
+        .unwrap();
     }
     writeln!(out).unwrap();
 

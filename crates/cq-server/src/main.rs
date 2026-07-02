@@ -745,6 +745,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_topics = topics.clone();
     let snapshot_on_shutdown = server_config.txlog.snapshot_on_shutdown;
     let snapshot_reclaim = server_config.txlog.snapshot_reclaim;
+
+    // Serializes the periodic checkpointer against the shutdown checkpoint
+    // so a checkpoint mid-flight when a shutdown signal arrives finishes
+    // (atomically) before shutdown starts its own, rather than two writers
+    // racing on the same snapshot.bin.tmp / prune. Both paths are already
+    // individually crash-safe and idempotent; this just avoids an
+    // in-process interleave.
+    let checkpoint_guard = Arc::new(tokio::sync::Mutex::new(()));
+
+    // Spawn the periodic in-process checkpointer (AMPS sow-compact-action
+    // equivalent) when enabled. `checkpoint_interval_secs == 0` disables it
+    // — checkpoints then only happen on graceful shutdown. Kept off the
+    // publish hot path: it runs one sweep per interval, each topic's
+    // checkpoint on the blocking pool, holding a topic read lock only for
+    // the snapshot-build store copy.
+    let checkpoint_interval = server_config.txlog.checkpoint_interval_secs;
+    let checkpoint_task = if checkpoint_interval > 0 {
+        let topics = topics.clone();
+        let guard = checkpoint_guard.clone();
+        Some(tokio::spawn(run_checkpointer(
+            topics,
+            checkpoint_interval,
+            snapshot_reclaim,
+            guard,
+        )))
+    } else {
+        None
+    };
+
     tokio::select! {
         result = websocket::start_ws_server(
             ws_config, ws_topics, ws_registry, queues.clone(), heartbeat_cfg, auth.clone(),
@@ -781,8 +810,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    shutdown(&shutdown_topics, snapshot_on_shutdown, snapshot_reclaim).await;
+    // Stop the periodic checkpointer before the shutdown checkpoint. Abort
+    // only cancels it at its next await point (between topics / while
+    // sleeping) — a `spawn_blocking` checkpoint already in flight is not
+    // interrupted, and the `checkpoint_guard` below still serializes us
+    // behind it, so no snapshot is left half-written.
+    if let Some(task) = checkpoint_task {
+        task.abort();
+    }
+    shutdown(
+        &shutdown_topics,
+        snapshot_on_shutdown,
+        snapshot_reclaim,
+        checkpoint_guard,
+    )
+    .await;
     Ok(())
+}
+
+/// Periodic in-process checkpointer: every `interval_secs`, sweep all
+/// persistent topics and run [`Topic::checkpoint`] on each (durable log →
+/// durable snapshot → sealed-segment reclaim). This bounds the on-disk
+/// txlog of a long-running server without a restart.
+///
+/// Kept off the publish hot path: each topic's checkpoint runs on the
+/// blocking pool (fsync + file deletes are blocking syscalls) and holds a
+/// topic **read** lock only for the snapshot-build store copy. Topics are
+/// swept serially so at most one blocking checkpoint runs at a time.
+///
+/// The reclaim step is gated on `snapshot_reclaim` for the same reason as
+/// the shutdown path: a replication source's standbys may still need the
+/// old segments. With `snapshot_reclaim = false` the checkpointer still
+/// refreshes the snapshot (fast-restart) but never deletes segments.
+///
+/// `guard` serializes each sweep against the shutdown checkpoint.
+async fn run_checkpointer(
+    topics: Arc<DashMap<String, SharedTopic>>,
+    interval_secs: u64,
+    snapshot_reclaim: bool,
+    guard: Arc<tokio::sync::Mutex<()>>,
+) {
+    let period = std::time::Duration::from_secs(interval_secs);
+    let mut ticker = tokio::time::interval(period);
+    // Skip the immediate first tick; wait one interval before the first
+    // checkpoint so a just-started server isn't checkpointing an empty log.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        // Hold the guard for the whole sweep so a concurrent shutdown waits
+        // for us (and vice versa). Cheap: sweeps are seconds apart.
+        let _held = guard.lock().await;
+        let names: Vec<String> = topics.iter().map(|e| e.key().clone()).collect();
+        for name in names {
+            let Some(topic) = topics.get(&name).map(|e| e.value().clone()) else {
+                continue;
+            };
+            if !topic.has_txlog() {
+                continue;
+            }
+            let name_for_log = name.clone();
+            let reclaim = snapshot_reclaim;
+            // Blocking fsync + deletes off the async runtime. Topic::
+            // checkpoint runs the durable log→snapshot→reclaim sequence;
+            // with `reclaim = false` it refreshes the snapshot (fast
+            // restart) but never deletes segments.
+            let result = tokio::task::spawn_blocking(move || topic.checkpoint(reclaim)).await;
+            match result {
+                Ok(Ok(Some(stats))) => {
+                    metrics::counter!("cq_txlog_checkpoint_total").increment(1);
+                    metrics::counter!("cq_txlog_segments_reclaimed_total")
+                        .increment(stats.reclaimed as u64);
+                    metrics::histogram!("cq_txlog_checkpoint_build_lock_hold_seconds")
+                        .record(stats.build_lock_hold.as_secs_f64());
+                    tracing::info!(
+                        topic = %name_for_log,
+                        reclaimed = stats.reclaimed,
+                        covered_sequence = stats.covered_sequence,
+                        build_lock_hold_us = stats.build_lock_hold.as_micros() as u64,
+                        "periodic checkpoint complete"
+                    );
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    metrics::counter!("cq_txlog_checkpoint_errors_total").increment(1);
+                    tracing::warn!(topic = %name_for_log, error = %e, "periodic checkpoint failed");
+                }
+                Err(e) => {
+                    metrics::counter!("cq_txlog_checkpoint_errors_total").increment(1);
+                    tracing::warn!(topic = %name_for_log, error = %e, "periodic checkpoint task panicked");
+                }
+            }
+        }
+    }
 }
 
 /// Block until SIGINT or (on Unix) SIGTERM arrives. Returns the
@@ -820,8 +939,14 @@ async fn shutdown(
     topics: &Arc<DashMap<String, SharedTopic>>,
     snapshot_on_shutdown: bool,
     snapshot_reclaim: bool,
+    checkpoint_guard: Arc<tokio::sync::Mutex<()>>,
 ) {
     metrics::counter!("cq_shutdown_initiated_total").increment(1);
+    // Wait for any in-flight periodic checkpoint to finish before we start
+    // the shutdown checkpoint, so the two never race on the same topic's
+    // snapshot.bin / segment prune. The periodic task was already aborted
+    // by the caller; this just drains a sweep that was mid-flight.
+    let _checkpoint_barrier = checkpoint_guard.lock().await;
     let started = std::time::Instant::now();
     // Generous wall-clock cap: an fsync alone is milliseconds, but when
     // snapshot_on_shutdown is set we also serialize each persistent

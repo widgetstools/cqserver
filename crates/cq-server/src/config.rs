@@ -859,6 +859,28 @@ pub struct TxLogConfig {
     /// tail-scan already make startup O(one segment) regardless.
     #[serde(default)]
     pub snapshot_reclaim: bool,
+    /// Interval (seconds) between periodic in-process checkpoints. `0`
+    /// (default) disables the checkpointer — checkpoints then only happen
+    /// on graceful shutdown. When set > 0, a background sweeper runs every
+    /// `checkpoint_interval_secs` and, for each persistent topic, performs
+    /// the same durable sequence as shutdown: fsync the log → write a
+    /// crash-durable `snapshot.bin` → reclaim the now-redundant sealed
+    /// segments. This bounds a long-running server's on-disk txlog WITHOUT
+    /// a restart (the AMPS `sow-compact-action` equivalent) and is the
+    /// prerequisite for multi-day soaks.
+    ///
+    /// Safety: reclaim only ever deletes sealed segments that the freshly
+    /// fsync'd snapshot fully covers, so a crash at any point recovers the
+    /// full acked state (snapshot + surviving tail replay). The snapshot
+    /// build holds only a topic **read** lock for the store copy, so
+    /// publishers are not blocked for the whole checkpoint.
+    ///
+    /// Like `snapshot_reclaim`, the reclaim step is unsafe for a
+    /// replication **source** whose standbys may still need old segments;
+    /// the periodic reclaim here is therefore gated on `snapshot_reclaim`
+    /// being enabled as well.
+    #[serde(default)]
+    pub checkpoint_interval_secs: u64,
 }
 
 impl Default for TxLogConfig {
@@ -873,6 +895,7 @@ impl Default for TxLogConfig {
             preallocate: false,
             snapshot_on_shutdown: true,
             snapshot_reclaim: false,
+            checkpoint_interval_secs: 0,
         }
     }
 }
