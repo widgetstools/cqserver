@@ -1122,6 +1122,18 @@ pub fn dispatch(session: &mut Session, mut msg: CqMessage, ctx: &RouterContext) 
         && !session.is_authenticated()
         && !matches!(msg.command, Command::Logon | Command::Heartbeat)
     {
+        // D5/P0.5 — a command sent before authenticating is a rejected
+        // access attempt (someone trying to skip the handshake); audit
+        // it. Only reached on the reject branch, so no hot-path cost.
+        tracing::warn!(
+            target: "cq_audit",
+            event = "unauth_command",
+            command = ?msg.command,
+            session = %session.id,
+            peer_addr = %session.remote_addr,
+            outcome = "rejected",
+            "Command rejected: not authenticated"
+        );
         let _ = session.send_message(&CqMessage::error(
             msg.command_id,
             "Not authenticated — send Logon first",
@@ -1296,8 +1308,18 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
     let negotiated = match outcome {
         cq_protocol::version::NegotiationOutcome::Negotiated(v) => v,
         cq_protocol::version::NegotiationOutcome::NoOverlap => {
+            // D5/P0.5 — this is the earliest possible logon rejection
+            // (before credentials are even read); it must still land
+            // on the audit sink like every other logon-fail branch,
+            // otherwise a client can be rejected here silently forever.
             tracing::warn!(
+                target: "cq_audit",
+                event = "logon",
+                outcome = "fail",
                 session = %session.id,
+                user = "",
+                peer_addr = %session.remote_addr,
+                reason = "version_mismatch",
                 client_versions = ?client_versions,
                 server_versions = ?cq_protocol::version::SUPPORTED_VERSIONS,
                 "Logon rejected: no overlapping protocol version"
@@ -1341,8 +1363,17 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
             // Disjoint compressions can only happen if the client
             // explicitly rules out None — which is an unusual choice.
             // Reject so the client knows.
+            //
+            // D5/P0.5 — audit this rejection too, matching every other
+            // logon-fail branch in this function.
             tracing::warn!(
+                target: "cq_audit",
+                event = "logon",
+                outcome = "fail",
                 session = %session.id,
+                user = "",
+                peer_addr = %session.remote_addr,
+                reason = "compression_mismatch",
                 client = ?client_compressions,
                 "Logon rejected: no overlapping compression algorithm"
             );
@@ -1374,8 +1405,16 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
     ) {
         cq_protocol::serialization::CodecNegotiationOutcome::Negotiated(c) => c,
         cq_protocol::serialization::CodecNegotiationOutcome::NoOverlap => {
+            // D5/P0.5 — same audit treatment as the version/compression
+            // mismatch branches above.
             tracing::warn!(
+                target: "cq_audit",
+                event = "logon",
+                outcome = "fail",
                 session = %session.id,
+                user = "",
+                peer_addr = %session.remote_addr,
+                reason = "codec_mismatch",
                 client = ?client_codecs,
                 "Logon rejected: no overlapping wire codec"
             );
@@ -1494,6 +1533,24 @@ fn handle_logon(session: &mut Session, msg: CqMessage, ctx: &RouterContext) {
 
     let Some((user, pass)) = credentials else {
         if auth.required {
+            // D5/P0.5 — this rejection is the simplest way to probe a
+            // secured server (empty/malformed credentials); it must
+            // leave an audit trail like every other logon-fail branch.
+            tracing::warn!(
+                target: "cq_audit",
+                event = "logon",
+                outcome = "fail",
+                session = %session.id,
+                user = %user.unwrap_or(""),
+                peer_addr = %session.remote_addr,
+                reason = "missing_credentials",
+                "Logon rejected: missing user/password"
+            );
+            metrics::counter!(
+                "cq_logon_total",
+                "result" => "fail_missing_credentials"
+            )
+            .increment(1);
             let _ = session.send_message(&CqMessage::error(
                 msg.command_id,
                 "Missing user/password in logon data",
@@ -4275,5 +4332,167 @@ mod session_limit_tests {
     #[test]
     fn reject_reason_label_matches_metric_convention() {
         assert_eq!(RejectReason::MaxSessionsPerUser.as_str(), "max_sessions_per_user");
+    }
+}
+
+/// Task 2.4 finding #3 — a non-Logon/Heartbeat command sent by an
+/// unauthenticated session (when `auth.required = true`) is rejected in
+/// `dispatch`'s gate at the very top of the function; that reject must
+/// emit a `target = "cq_audit", event = "unauth_command"` line. These
+/// tests install an in-process `tracing_subscriber` layer writing to a
+/// shared buffer so the emitted line can be asserted directly, without
+/// spinning up a real server (unit-level, matches the brief).
+#[cfg(test)]
+mod unauth_command_audit_tests {
+    use super::*;
+    use crate::auth::AuthStore;
+    use crate::session::{new_registry, OutboundFrame, Session};
+    use cq_protocol::command::{Command, Status};
+    use std::sync::{Arc as StdArc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Shared in-memory buffer + a `MakeWriter` impl over it, so a
+    /// `tracing_subscriber::fmt` layer can be pointed at it for the
+    /// scope of one test via `tracing::subscriber::with_default`.
+    #[derive(Clone, Default)]
+    struct BufWriter(StdArc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn ctx_auth_required() -> RouterContext {
+        RouterContext {
+            topics: Arc::new(DashMap::new()),
+            sessions: new_registry(),
+            queues: crate::queue::new_queue_registry(),
+            auth: Arc::new(AuthStore::new(true, vec![])),
+            sow_batch_size: 64,
+            bookmark_store: new_bookmark_store(),
+            spillover: None,
+            read_only: false,
+            query_limits: cq_core::query::QueryLimits::default(),
+            sync_replication: SyncReplication::default(),
+            connection_limits: None,
+        }
+    }
+
+    type MpscRx = tokio::sync::mpsc::Receiver<OutboundFrame>;
+
+    fn new_session() -> (Session, MpscRx) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundFrame>(16);
+        (Session::new("203.0.113.7:5555".into(), tx), rx)
+    }
+
+    fn last_ack(rx: &mut MpscRx) -> CqMessage {
+        let frame = rx.try_recv().expect("expected a frame");
+        serde_json::from_slice(frame.as_bytes()).unwrap()
+    }
+
+    /// Run `f` with a tracing subscriber capturing every event
+    /// (regardless of target/level) into a buffer, then return the
+    /// buffer's contents as a `String`.
+    fn capture_tracing(f: impl FnOnce()) -> String {
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("utf8 log output")
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_subscribe_is_rejected_and_audited() {
+        let ctx = ctx_auth_required();
+        let (mut session, mut rx) = new_session();
+        assert!(!session.is_authenticated());
+
+        let mut msg = CqMessage::new(Command::Subscribe);
+        msg.command_id = Some("cid-1".into());
+        msg.topic = Some("/nope".into());
+
+        let log = capture_tracing(|| dispatch(&mut session, msg, &ctx));
+
+        let ack = last_ack(&mut rx);
+        assert_eq!(ack.status, Some(Status::Error), "unauth command must be rejected");
+
+        assert!(
+            log.contains("cq_audit"),
+            "expected the reject branch to emit on the cq_audit target; got: {log}"
+        );
+        assert!(
+            log.contains("event=\"unauth_command\"") || log.contains("event=unauth_command"),
+            "expected event=unauth_command; got: {log}"
+        );
+        assert!(
+            log.contains("outcome=\"rejected\"") || log.contains("outcome=rejected"),
+            "expected outcome=rejected; got: {log}"
+        );
+        assert!(
+            log.contains("Subscribe"),
+            "expected the command name (Subscribe) in the audit line; got: {log}"
+        );
+        assert!(
+            log.contains("203.0.113.7:5555"),
+            "expected peer_addr on the audit line; got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logon_before_auth_does_not_emit_unauth_command_audit() {
+        // Logon itself must be exempt from the gate (it's how a client
+        // becomes authenticated in the first place) — no unauth_command
+        // event should fire for it, even though the session isn't
+        // authenticated yet when dispatch() is entered.
+        let ctx = ctx_auth_required();
+        let (mut session, _rx) = new_session();
+
+        let mut msg = CqMessage::new(Command::Logon);
+        msg.command_id = Some("logon-1".into());
+        let mut creds = serde_json::Map::new();
+        creds.insert("user".into(), "nobody".into());
+        creds.insert("password".into(), "wrong".into());
+        msg.data = Some(serde_json::Value::Object(creds));
+
+        let log = capture_tracing(|| dispatch(&mut session, msg, &ctx));
+
+        assert!(
+            !log.contains("unauth_command"),
+            "Logon must not trigger the unauth_command gate; got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_before_auth_does_not_emit_unauth_command_audit() {
+        let ctx = ctx_auth_required();
+        let (mut session, mut rx) = new_session();
+
+        let mut msg = CqMessage::new(Command::Heartbeat);
+        msg.command_id = Some("hb-1".into());
+
+        let log = capture_tracing(|| dispatch(&mut session, msg, &ctx));
+
+        assert!(
+            !log.contains("unauth_command"),
+            "Heartbeat must not trigger the unauth_command gate; got: {log}"
+        );
+        // Heartbeat is explicitly exempt from the auth gate and acks ok.
+        assert_eq!(last_ack(&mut rx).status, Some(Status::Ok));
     }
 }

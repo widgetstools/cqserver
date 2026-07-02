@@ -371,20 +371,39 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// all (unauthenticated deployments, e.g. loopback-only). If a richer
 /// admin identity (e.g. per-operator API keys) is added later, this
 /// is the single place to plumb it through.
-fn audit_admin(state: &AdminState, route: &str, args: &str, outcome: &str) {
-    let actor = if state.admin_token.is_some() {
+fn audit_actor(state: &AdminState) -> &'static str {
+    if state.admin_token.is_some() {
         "admin-token"
     } else {
         "open"
-    };
+    }
+}
+
+fn audit_admin(state: &AdminState, route: &str, args: &str, outcome: &str) {
     tracing::info!(
         target: "cq_audit",
         event = "admin",
         route = %route,
-        actor = %actor,
+        actor = %audit_actor(state),
         args = %args,
         outcome = %outcome,
         "Admin mutation"
+    );
+}
+
+/// D5/P0.5 — a distinct audit event for operator-forced subscription
+/// drops (one of the brief's four named event categories), so it can be
+/// filtered independently of generic admin mutations.
+fn audit_subscription_drop(state: &AdminState, sub_id: &str, topic: &str, session: &str, outcome: &str) {
+    tracing::warn!(
+        target: "cq_audit",
+        event = "subscription_drop",
+        actor = %audit_actor(state),
+        sub_id = %sub_id,
+        topic = %topic,
+        session = %session,
+        outcome = %outcome,
+        "Admin-forced subscription drop"
     );
 }
 
@@ -576,12 +595,7 @@ async fn delete_subscription(
     let route = match s.registry.remove(&sub_id) {
         Some((_, r)) => r,
         None => {
-            audit_admin(
-                &s,
-                "DELETE /subscriptions/:sub_id",
-                &format!("sub_id={sub_id}"),
-                "not_found",
-            );
+            audit_subscription_drop(&s, &sub_id, "", "", "not_found");
             return (StatusCode::NOT_FOUND, "no such subscription").into_response();
         }
     };
@@ -603,12 +617,7 @@ async fn delete_subscription(
     );
     // D5/P0.5 — subscription drop via admin is one of the explicitly
     // called-out security-relevant events.
-    audit_admin(
-        &s,
-        "DELETE /subscriptions/:sub_id",
-        &format!("sub_id={sub_id}, topic={}, session={}", route.topic, route.session_id),
-        "success",
-    );
+    audit_subscription_drop(&s, &sub_id, &route.topic, &route.session_id, "success");
     (
         StatusCode::OK,
         Json(serde_json::json!({

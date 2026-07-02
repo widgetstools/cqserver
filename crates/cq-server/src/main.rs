@@ -122,7 +122,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `logging::install`.
     let sink_errors = logging::install(&server_config.logging, server_config.audit.as_ref());
     for e in &sink_errors {
-        warn!(error = %e, "Logging sink failed to install");
+        // Fail-open by design (see cq_server::logging module docs): the
+        // audit sink failing to build must never stop the server from
+        // starting. But an operator silently losing their audit trail
+        // is a big deal, so give it a distinct, unmistakable warning
+        // rather than blending into routine sink-install noise.
+        if let Some(detail) = e.strip_prefix(logging::AUDIT_SINK_ERROR_PREFIX) {
+            warn!(
+                error = %detail,
+                "AUDIT SINK FAILED TO INITIALIZE — server running WITHOUT audit trail"
+            );
+        } else {
+            warn!(error = %e, "Logging sink failed to install");
+        }
     }
 
     info!("CQServer starting...");

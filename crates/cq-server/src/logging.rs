@@ -56,6 +56,35 @@
 //! `crates/cq-server/src/admin.rs::audit_admin`, and
 //! `check_entitlement`'s denial branch) — the same target that
 //! hand-authored `[[logging.sinks]]` filters already route on.
+//!
+//! ### Fail-open by design
+//!
+//! The audit subsystem is intentionally **fail-open**, not fail-closed:
+//!
+//! - **Startup**: if `[audit]` is configured but its sink fails to
+//!   build (e.g. an unwritable path, a directory where a file is
+//!   expected, or a syslog socket that can't be opened), `install`
+//!   below records the error in its returned `Vec<String>` and simply
+//!   omits that layer — it does NOT return `Err` and does NOT abort
+//!   server startup. The caller (`cq_server::main`) logs a loud,
+//!   unmistakable warning (see `AUDIT SINK FAILED TO INITIALIZE` in
+//!   `main.rs`) and the server continues running WITHOUT an audit
+//!   trail.
+//! - **Runtime**: once installed, a `tracing_subscriber::fmt::Layer`
+//!   writer that errors on a given event (e.g. a transient disk-full
+//!   or a syslog socket that stops accepting datagrams) has that
+//!   single write silently dropped by `tracing-subscriber` — there is
+//!   no retry, no backpressure, and no panic.
+//!
+//! This is a deliberate tradeoff, not an oversight: cqserver is a
+//! trading/data server, and audit logging must never be able to bring
+//! down (or stall) the primary read/write path. An operator losing
+//! their audit trail is bad; the server refusing to start — or
+//! blocking on every event — because a log sink hiccuped would be
+//! worse. If a fail-closed audit mode is ever needed (e.g. for a
+//! deployment with a hard compliance requirement that no unaudited
+//! action may occur), it should be an explicit, separately-configured
+//! opt-in — not a change to this default.
 
 use serde::Deserialize;
 use std::fs::OpenOptions;
@@ -137,6 +166,15 @@ fn audit_only_filter() -> String {
     format!("off,{AUDIT_TARGET}=info")
 }
 
+/// Prefix stamped on an error string in `install`'s returned `Vec`
+/// when the failure came from building the `[audit]` layer
+/// specifically (as opposed to a regular `[[logging.sinks]]` entry).
+/// `main.rs` greps for this prefix to decide whether to emit the loud
+/// "AUDIT SINK FAILED TO INITIALIZE" warning versus the generic
+/// per-sink warning — see the fail-open note in this module's doc
+/// comment.
+pub const AUDIT_SINK_ERROR_PREFIX: &str = "[audit] ";
+
 /// Install the tracing-subscriber stack from `cfg` (`[logging].sinks`)
 /// plus, when present, the `[audit]` sugar layer. Returns a list of
 /// any errors encountered while opening sink files/sockets; on error
@@ -146,6 +184,13 @@ fn audit_only_filter() -> String {
 /// When both `cfg.sinks` and `audit` are empty/`None`, installs the
 /// historical single-stderr fmt layer driven by `RUST_LOG` (matches
 /// pre-S25 behaviour).
+///
+/// **Fail-open**: a failure to build the `[audit]` layer (bad path,
+/// unwritable directory, bad syslog socket, ...) is reported via the
+/// returned `Vec<String>` (prefixed with [`AUDIT_SINK_ERROR_PREFIX`])
+/// but never turns into an `Err` — this function cannot fail server
+/// startup on account of the audit sink. See the module-level
+/// "Fail-open by design" doc above for the rationale.
 pub fn install(cfg: &LoggingConfig, audit: Option<&AuditConfig>) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -169,7 +214,10 @@ pub fn install(cfg: &LoggingConfig, audit: Option<&AuditConfig>) -> Vec<String> 
     if let Some(audit_cfg) = audit {
         match build_audit_layer(audit_cfg) {
             Ok(layer) => layers.push(layer),
-            Err(e) => errors.push(e),
+            // Tag with AUDIT_SINK_ERROR_PREFIX so main.rs can single
+            // this out for the loud "server running WITHOUT audit
+            // trail" warning instead of the generic per-sink log line.
+            Err(e) => errors.push(format!("{AUDIT_SINK_ERROR_PREFIX}{e}")),
         }
     }
     if layers.is_empty() {
@@ -520,6 +568,66 @@ mod tests {
         };
         let r = build_audit_layer(&cfg);
         assert!(r.is_err(), "file sink without `path` should error");
+    }
+
+    // --- Finding 4 (Task 2.4 report) — fail-open startup behavior ---
+
+    /// The audit sink is fail-open by design: a broken `[audit].path`
+    /// (here, a path that IS an existing directory, so `OpenOptions`
+    /// can never open it as a file) must not panic and must not stop
+    /// `install` from completing. It should come back as a tagged
+    /// error in the returned `Vec<String>` — `main.rs` uses the
+    /// `AUDIT_SINK_ERROR_PREFIX` tag to emit the loud
+    /// "AUDIT SINK FAILED TO INITIALIZE" warning.
+    #[test]
+    fn install_with_unwritable_audit_path_does_not_panic_and_reports_tagged_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory, not a file — `OpenOptions::open` on this path
+        // fails (EISDIR on Unix), simulating a misconfigured/unwritable
+        // audit destination.
+        let dir_as_path = tmp.path().join("this-is-a-directory");
+        std::fs::create_dir_all(&dir_as_path).unwrap();
+
+        let audit = AuditConfig {
+            sink: AuditSinkKind::File,
+            path: Some(dir_as_path.to_string_lossy().into_owned()),
+        };
+
+        // Must not panic (the whole point of this test): install()
+        // returning normally, rather than unwinding, is itself part of
+        // the assertion.
+        let errs = install(&LoggingConfig::default(), Some(&audit));
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected exactly one error (the broken audit sink): {errs:?}"
+        );
+        assert!(
+            errs[0].starts_with(AUDIT_SINK_ERROR_PREFIX),
+            "audit-sink error should be tagged with AUDIT_SINK_ERROR_PREFIX so \
+             main.rs can single it out for the loud warning; got: {}",
+            errs[0]
+        );
+    }
+
+    /// Mirrors the categorization `main.rs` performs on `install`'s
+    /// returned errors (`strip_prefix(AUDIT_SINK_ERROR_PREFIX)`):
+    /// an audit-tagged error must classify as "audit failed" and a
+    /// plain `[[logging.sinks]]` error must NOT.
+    #[test]
+    fn audit_sink_error_prefix_distinguishes_audit_from_generic_sink_errors() {
+        let audit_err = format!("{AUDIT_SINK_ERROR_PREFIX}open(/no/such/dir/audit.log): boom");
+        let generic_err = "invalid filter `garbage(((`: parse error".to_string();
+
+        assert!(
+            audit_err.strip_prefix(AUDIT_SINK_ERROR_PREFIX).is_some(),
+            "audit-tagged error must be recognized as an audit failure"
+        );
+        assert!(
+            generic_err.strip_prefix(AUDIT_SINK_ERROR_PREFIX).is_none(),
+            "a generic [[logging.sinks]] error must NOT be misclassified as an audit failure"
+        );
     }
 
     #[test]

@@ -216,6 +216,174 @@ async fn entitlement_denial_lands_in_audit_file() {
     );
 }
 
+/// Task 2.4 finding #1 (CRITICAL) — a Logon frame with NO
+/// user/password/token at all, sent when `auth.required = true`, used
+/// to be rejected with zero audit trail (silent hole: the simplest way
+/// to probe a secured server left no record). Asserts the rejection
+/// now lands in the audit file with `reason="missing_credentials"`.
+#[tokio::test]
+async fn missing_credentials_logon_lands_in_audit_file() {
+    let pw_hash = bcrypt::hash("secret", bcrypt::DEFAULT_COST).expect("bcrypt");
+    let audit_path = "logs/audit.log".to_string();
+    let opts = ServerOpts {
+        auth: Some(AuthOpts {
+            users: vec![UserSpec {
+                username: "dave".into(),
+                password_hash: pw_hash,
+                entitlements: vec!["*:*".into()],
+                row_filter: None,
+            }],
+            jwt: None,
+        }),
+        audit: Some(AuditOpts::file(audit_path.clone())),
+        ..ServerOpts::default()
+    };
+    let server = start_server_with(vec![topic()], opts).await;
+
+    // `handshake_protocol()` sends a bare Logon frame (protocol/
+    // compression/codec negotiation only, `data = None` — no
+    // user/password/token). With auth.required this must be rejected.
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    let result = client.handshake_protocol().await;
+    assert!(
+        result.is_err(),
+        "expected credential-less logon to be rejected when auth is required"
+    );
+
+    let contents = read_audit_file(&server, &audit_path).await;
+    assert!(
+        contents.contains("event=\"logon\"") || contents.contains("event=logon"),
+        "expected a logon audit event; got: {contents}"
+    );
+    assert!(
+        contents.contains("outcome=\"fail\"") || contents.contains("outcome=fail"),
+        "expected outcome=fail for the credential-less logon; got: {contents}"
+    );
+    assert!(
+        contents.contains("reason=\"missing_credentials\"")
+            || contents.contains("reason=missing_credentials"),
+        "expected reason=missing_credentials in the audit log; got: {contents}"
+    );
+    assert!(
+        contents.contains("peer_addr"),
+        "expected a peer_addr field on the logon-fail audit line; got: {contents}"
+    );
+    assert!(
+        contents.contains("127.0.0.1"),
+        "expected the real peer IP in the audit log; got: {contents}"
+    );
+}
+
+/// Task 2.4 finding #2 (CRITICAL) — an operator dropping a client's
+/// subscription via `DELETE /subscriptions/:id` must emit a distinct
+/// `event="subscription_drop"` audit line carrying the `sub_id` and
+/// the acting identity (`actor`), independent of the generic
+/// `event="admin"` mutation log. (Client self-unsubscribe is normal
+/// traffic and must NOT be audited — not exercised here since this
+/// test only drives the admin-triggered path.)
+#[tokio::test]
+async fn admin_subscription_drop_lands_in_audit_file() {
+    let audit_path = "logs/audit.log".to_string();
+    let opts = ServerOpts {
+        audit: Some(AuditOpts::file(audit_path.clone())),
+        admin_token: Some(TOKEN.to_string()),
+        ..ServerOpts::default()
+    };
+    let server = start_server_with(vec![topic()], opts).await;
+
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    let sub = client
+        .subscribe("/audit-e2e", None)
+        .await
+        .expect("subscribe");
+    let sub_id = sub.sub_id.clone();
+
+    let rc = reqwest::Client::new();
+    let del_url = format!("{}/subscriptions/{}", server.admin_url(), sub_id);
+    let resp = rc
+        .delete(&del_url)
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("delete-subscription request");
+    assert!(
+        resp.status().is_success(),
+        "admin subscription drop should succeed, got {:?}",
+        resp.status()
+    );
+
+    let contents = read_audit_file(&server, &audit_path).await;
+    assert!(
+        contents.contains("event=\"subscription_drop\"")
+            || contents.contains("event=subscription_drop"),
+        "expected a subscription_drop audit event; got: {contents}"
+    );
+    assert!(
+        contents.contains(&sub_id),
+        "expected the dropped sub_id `{sub_id}` in the audit log; got: {contents}"
+    );
+    assert!(
+        contents.contains("actor="),
+        "expected an actor field on the subscription_drop audit line; got: {contents}"
+    );
+    assert!(
+        contents.contains("admin-token"),
+        "expected actor=admin-token (token was configured) in the audit log; got: {contents}"
+    );
+    assert!(
+        contents.contains("outcome=\"success\"") || contents.contains("outcome=success"),
+        "expected outcome=success on the subscription_drop audit line; got: {contents}"
+    );
+}
+
+/// Task 2.4 finding #3 (IMPORTANT) — a command sent BEFORE authenticating
+/// (skipping the Logon handshake) on an auth-required server is a rejected
+/// access attempt that used to leave no audit trail. Asserts the reject now
+/// lands as `event="unauth_command"`.
+#[tokio::test]
+async fn unauthenticated_command_lands_in_audit_file() {
+    let pw_hash = bcrypt::hash("secret", bcrypt::DEFAULT_COST).expect("bcrypt");
+    let audit_path = "logs/audit.log".to_string();
+    let opts = ServerOpts {
+        auth: Some(AuthOpts {
+            users: vec![UserSpec {
+                username: "erin".into(),
+                password_hash: pw_hash,
+                entitlements: vec!["*:*".into()],
+                row_filter: None,
+            }],
+            jwt: None,
+        }),
+        audit: Some(AuditOpts::file(audit_path.clone())),
+        ..ServerOpts::default()
+    };
+    let server = start_server_with(vec![topic()], opts).await;
+
+    // Connect but do NOT logon; the server requires auth, so a subscribe
+    // must be rejected at the dispatch gate before any handler runs.
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    let sub_result = client.subscribe("/audit-e2e", None).await;
+    assert!(
+        sub_result.is_err(),
+        "expected the pre-auth subscribe to be rejected"
+    );
+
+    let contents = read_audit_file(&server, &audit_path).await;
+    assert!(
+        contents.contains("event=\"unauth_command\"")
+            || contents.contains("event=unauth_command"),
+        "expected an unauth_command audit event; got: {contents}"
+    );
+    assert!(
+        contents.contains("outcome=\"rejected\"") || contents.contains("outcome=rejected"),
+        "expected outcome=rejected on the unauth_command line; got: {contents}"
+    );
+    assert!(
+        contents.contains("127.0.0.1"),
+        "expected the peer IP on the unauth_command audit line; got: {contents}"
+    );
+}
+
 /// `[audit] sink = "syslog"` — config parsing + server boot only (no
 /// live syslog daemon in CI). Confirms the server doesn't refuse to
 /// start / doesn't panic when `[audit]` names the syslog sink; actual

@@ -42,6 +42,9 @@ zstd.workspace = true
 compact_str.workspace = true
 tempfile.workspace = true
 parking_lot.workspace = true
+# Task 2.4 finding #3 — capture tracing output in-process to assert the
+# `unauth_command` cq_audit event fires on the reject branch of dispatch().
+tracing-subscriber.workspace = true
 # Self-signed certs for TLS-handshake-timeout unit tests (tcp.rs).
 # Same version/features cq-e2e-tests already uses for its TLS harness.
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
