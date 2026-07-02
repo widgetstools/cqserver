@@ -77,6 +77,7 @@ async fn adaptive_conflation_widens_under_pressure() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;

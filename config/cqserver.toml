@@ -3,7 +3,13 @@
 tcp_addr = "0.0.0.0:9007"
 websocket_addr = "0.0.0.0:9008"
 websocket_path = "/cq/json"
-admin_addr = "0.0.0.0:8085"
+# Loopback by default: the admin port exposes mutating endpoints
+# (unsubscribe, journal rotation, store shrink, view create/delete,
+# schema mutation) and, without a token, unauthenticated config
+# disclosure. Expose beyond loopback only with `admin_token` set
+# below and, ideally, a `[admin.tls]` block in front of it.
+admin_addr = "127.0.0.1:8085"
+# admin_token = "change-me"
 
 # Per-session outbound queue depth (frames). SOW uses backpressure (await
 # on send) and won't drop even when this is exceeded — sizing this is

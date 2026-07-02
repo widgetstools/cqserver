@@ -27,6 +27,7 @@ async fn compressed_archive_segments_replay_on_restart() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;
@@ -78,6 +79,7 @@ async fn compressed_archive_recovers_last_write_per_key() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;
@@ -126,6 +128,7 @@ async fn compressed_archive_empty_topic_restart() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;

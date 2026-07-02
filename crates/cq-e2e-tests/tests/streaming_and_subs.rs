@@ -80,6 +80,7 @@ async fn snapshot_beyond_queue_capacity_completes() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;
@@ -131,6 +132,7 @@ async fn many_concurrent_subscribes_no_ack_drops() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;

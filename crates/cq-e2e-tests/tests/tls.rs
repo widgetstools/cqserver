@@ -29,6 +29,7 @@ async fn tls_publish_and_sow_roundtrip() {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         },
     )
     .await;

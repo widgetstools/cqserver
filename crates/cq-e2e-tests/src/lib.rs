@@ -209,6 +209,12 @@ pub struct ServerOpts {
     /// `Some(0)` exercises the "cap disabled" path. `None` leaves the
     /// server default (5M).
     pub hard_max_sow_result_rows: Option<u64>,
+    /// When `Some(_)`, emit `admin_token = "..."` at the top level so
+    /// the spawned server requires an `Authorization: Bearer <token>`
+    /// header on every admin route except `GET /healthz`. `None`
+    /// leaves the admin API unauthenticated (default, matches
+    /// `ServerConfig::admin_token`'s own default).
+    pub admin_token: Option<String>,
 }
 
 /// Replication config for the e2e harness. Mirrors
@@ -469,6 +475,7 @@ impl Default for ServerOpts {
             logging_sinks: Vec::new(),
             replication: None,
             hard_max_sow_result_rows: None,
+            admin_token: None,
         }
     }
 }
@@ -640,6 +647,9 @@ fn build_toml(
     writeln!(out, r#"websocket_addr = "127.0.0.1:{ws_port}""#).unwrap();
     writeln!(out, r#"websocket_path = "/cq/json""#).unwrap();
     writeln!(out, r#"admin_addr = "127.0.0.1:{admin_port}""#).unwrap();
+    if let Some(token) = &opts.admin_token {
+        writeln!(out, r#"admin_token = "{token}""#).unwrap();
+    }
     writeln!(out, "heartbeat_interval_s = 60").unwrap();
     writeln!(out, "heartbeat_idle_timeout_s = 600").unwrap();
     writeln!(out).unwrap();
