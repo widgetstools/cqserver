@@ -1380,8 +1380,10 @@ mod tests {
 
         // Client connects but never writes a byte — no ClientHello ever
         // arrives, so the handshake future would hang forever without
-        // the timeout wrapper.
-        let _client = TcpStream::connect(addr).await.unwrap();
+        // the timeout wrapper. Keep the client stream around so we can
+        // observe, from its side, that the server actually tears down
+        // the connection (not just gives up waiting on it).
+        let mut client = TcpStream::connect(addr).await.unwrap();
 
         let (stream, peer) = listener.accept().await.unwrap();
 
@@ -1404,5 +1406,39 @@ mod tests {
             "handshake should have been aborted by the injected 200ms timeout, took {:?}",
             elapsed
         );
+
+        // Prove closure, not just that the server stopped waiting: read
+        // on the still-open client socket and expect EOF (server closed
+        // its write side) or a reset/pipe error indicating the server's
+        // fd was torn down. Bound the read with its own short timeout so
+        // a wrong premise (server leaks the fd) fails fast instead of
+        // hanging the test.
+        let mut buf = [0u8; 16];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        match read_result {
+            Ok(Ok(0)) => {} // EOF — server closed the connection, as expected.
+            Ok(Ok(n)) => panic!(
+                "expected EOF from a torn-down connection, got {} unexpected bytes",
+                n
+            ),
+            Ok(Err(e)) => {
+                use std::io::ErrorKind;
+                assert!(
+                    matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::UnexpectedEof
+                    ),
+                    "expected a connection-teardown error, got {:?}",
+                    e
+                );
+            }
+            Err(_) => panic!(
+                "timed out waiting for server to close the socket after handshake timeout \
+                 — server is not actually closing the connection, only abandoning the wait"
+            ),
+        }
     }
 }

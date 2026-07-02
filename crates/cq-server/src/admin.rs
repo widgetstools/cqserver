@@ -1322,17 +1322,54 @@ mod tests {
         // Client connects but never writes a byte — no ClientHello ever
         // arrives, so without the timeout wrapper the server's spawned
         // task (and this socket) would hang forever.
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
 
-        // The server should give up on the handshake and move on to
-        // accepting the next connection well within a couple of
-        // seconds. Prove liveness by connecting again and confirming
-        // the accept loop is still servicing new connections (it
-        // would still be blocked in the first `acceptor.accept` had
-        // the timeout not fired).
+        // Give the injected 200ms handshake timeout time to fire.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Prove the server actually tore down the connection (not just
+        // gave up awaiting it): read on the still-open client socket and
+        // expect EOF, or a reset/pipe error, indicating the server side
+        // closed its fd. Bound the read with its own short timeout so a
+        // wrong premise (server leaks the fd) fails fast instead of
+        // hanging the test. This check must happen before the client is
+        // dropped, so the closure we observe is server-initiated.
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        match read_result {
+            Ok(Ok(0)) => {} // EOF — server closed the connection, as expected.
+            Ok(Ok(n)) => panic!(
+                "expected EOF from a torn-down connection, got {} unexpected bytes",
+                n
+            ),
+            Ok(Err(e)) => {
+                use std::io::ErrorKind;
+                assert!(
+                    matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::UnexpectedEof
+                    ),
+                    "expected a connection-teardown error, got {:?}",
+                    e
+                );
+            }
+            Err(_) => panic!(
+                "timed out waiting for server to close the socket after handshake timeout \
+                 — server is not actually closing the connection, only abandoning the wait"
+            ),
+        }
+
         drop(client);
 
+        // The server should also have moved on to accepting the next
+        // connection well within a couple of seconds. Prove liveness by
+        // connecting again and confirming the accept loop is still
+        // servicing new connections (it would still be blocked in the
+        // first `acceptor.accept` had the timeout not fired).
         let second = tokio::time::timeout(
             Duration::from_secs(2),
             tokio::net::TcpStream::connect(addr),
