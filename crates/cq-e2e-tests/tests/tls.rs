@@ -32,6 +32,7 @@ async fn tls_publish_and_sow_roundtrip() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;

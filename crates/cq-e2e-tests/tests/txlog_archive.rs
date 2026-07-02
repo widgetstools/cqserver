@@ -33,6 +33,7 @@ async fn archived_segments_replay_on_restart() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;
@@ -95,6 +96,7 @@ async fn restart_with_no_archived_segments_recovers_from_live_log() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;
@@ -141,6 +143,7 @@ async fn restart_mixes_archived_and_live_segments() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;

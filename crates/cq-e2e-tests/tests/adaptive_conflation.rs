@@ -80,6 +80,7 @@ async fn adaptive_conflation_widens_under_pressure() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;

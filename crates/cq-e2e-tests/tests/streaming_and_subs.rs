@@ -83,6 +83,7 @@ async fn snapshot_beyond_queue_capacity_completes() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;
@@ -137,6 +138,7 @@ async fn many_concurrent_subscribes_no_ack_drops() {
             admin_token: None,
             admin_tls: None,
             transport_limits: None,
+            audit: None,
         },
     )
     .await;
