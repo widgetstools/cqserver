@@ -96,6 +96,14 @@ pub struct ParsedQuery {
     /// output row by the non-aggregate executor. Aggregate-path
     /// support (`SUM(a + b)`) is tracked separately.
     pub computed: Vec<ComputedColumn>,
+    /// Task 1.4 — scalar-over-aggregate projection columns
+    /// (`NULLIF(SUM(qty), 0) AS denom`, `SUM(x)/NULLIF(SUM(y),0) AS
+    /// vwap`). Each references aggregate aliases / group columns via
+    /// `PostAggExpr::Ref` and is evaluated over the finalised aggregate
+    /// output row, AFTER `aggregates` are computed and BEFORE emit.
+    /// Empty for non-aggregate queries and for aggregate queries that
+    /// don't wrap aggregates in scalar functions.
+    pub post_agg: Vec<PostAggColumn>,
 }
 
 /// P2 — one computed column in the SELECT list. The alias is what
@@ -123,6 +131,13 @@ pub enum ScalarExpr {
     Mul(Box<ScalarExpr>, Box<ScalarExpr>),
     Div(Box<ScalarExpr>, Box<ScalarExpr>),
     Neg(Box<ScalarExpr>),
+    /// Task 1.4 — unary numeric scalar functions in SELECT projection
+    /// (`ABS(v)`, `ROUND(v)`, `FLOOR(v)`, `CEIL(v)`). Null/non-numeric
+    /// input propagates to `Value::Null` per the soft-null contract.
+    Abs(Box<ScalarExpr>),
+    Round(Box<ScalarExpr>),
+    Floor(Box<ScalarExpr>),
+    Ceil(Box<ScalarExpr>),
     /// R4 — `COALESCE(a, b, c, …)`. Returns the first arg whose
     /// evaluation isn't `Value::Null`. Polymorphic — works on both
     /// string and numeric columns. Empty list = always null
@@ -161,6 +176,10 @@ impl ScalarExpr {
                 Some(x) => Value::Double(-x),
                 None => Value::Null,
             },
+            ScalarExpr::Abs(e) => unary_num(&e.eval(row), f64::abs),
+            ScalarExpr::Round(e) => unary_num(&e.eval(row), f64::round),
+            ScalarExpr::Floor(e) => unary_num(&e.eval(row), f64::floor),
+            ScalarExpr::Ceil(e) => unary_num(&e.eval(row), f64::ceil),
             ScalarExpr::Coalesce(args) => {
                 for arg in args {
                     let v = arg.eval(row);
@@ -212,6 +231,150 @@ fn value_as_f64(v: &Value) -> Option<f64> {
     // Delegate to the store's null-aware coercion so NULL_LONG /
     // NULL_INT / NaN aren't silently treated as zero.
     v.as_f64()
+}
+
+/// Apply a unary f64 function (ABS/ROUND/FLOOR/CEIL) with soft-null
+/// propagation: a null / non-numeric operand yields `Value::Null`.
+fn unary_num(v: &Value, op: impl Fn(f64) -> f64) -> Value {
+    match value_as_f64(v) {
+        Some(x) => Value::Double(op(x)),
+        None => Value::Null,
+    }
+}
+
+/// Task 1.4 — a scalar expression evaluated over an *aggregate output
+/// row* (the finalised `serde_json::Map` keyed by group-column name /
+/// aggregate alias), rather than over a positional source row like
+/// `ScalarExpr`. Its leaves are `Ref(alias)` look-ups against that
+/// map, so `NULLIF(SUM(qty), 0)` becomes `NullIf(Ref("__agg0"), 0)`
+/// once the inner `SUM(qty)` is registered as a hidden aggregate.
+///
+/// All arithmetic runs in f64 with soft-null propagation, exactly
+/// like `ScalarExpr`, so the two layers behave identically — the only
+/// difference is where the leaf value comes from.
+#[derive(Debug, Clone)]
+pub enum PostAggExpr {
+    /// Look up an aggregate alias or group-column name in the output row.
+    Ref(String),
+    LitDouble(f64),
+    LitLong(i64),
+    LitString(String),
+    Add(Box<PostAggExpr>, Box<PostAggExpr>),
+    Sub(Box<PostAggExpr>, Box<PostAggExpr>),
+    Mul(Box<PostAggExpr>, Box<PostAggExpr>),
+    Div(Box<PostAggExpr>, Box<PostAggExpr>),
+    Neg(Box<PostAggExpr>),
+    Abs(Box<PostAggExpr>),
+    Round(Box<PostAggExpr>),
+    Floor(Box<PostAggExpr>),
+    Ceil(Box<PostAggExpr>),
+    Coalesce(Vec<PostAggExpr>),
+    NullIf(Box<PostAggExpr>, Box<PostAggExpr>),
+}
+
+/// Task 1.4 — one scalar-over-aggregate projection column. `alias` is
+/// the JSON key emitted; `expr` evaluates over the finished aggregate
+/// row map.
+#[derive(Debug, Clone)]
+pub struct PostAggColumn {
+    pub alias: String,
+    pub expr: PostAggExpr,
+}
+
+impl PostAggExpr {
+    /// Evaluate against a finalised aggregate output row. Returns a
+    /// JSON value (soft-null on missing refs, div-by-zero, type errors)
+    /// suitable for direct insertion into the output map.
+    pub fn eval(&self, row: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+        use serde_json::Value as J;
+        // Coerce a JSON cell to f64, treating null / non-number as None.
+        fn as_f64(v: &J) -> Option<f64> {
+            v.as_f64()
+        }
+        match self {
+            PostAggExpr::Ref(name) => row.get(name).cloned().unwrap_or(J::Null),
+            PostAggExpr::LitDouble(d) => J::from(*d),
+            PostAggExpr::LitLong(l) => J::from(*l),
+            PostAggExpr::LitString(s) => J::from(s.as_str()),
+            PostAggExpr::Add(a, b) => post_binop(&a.eval(row), &b.eval(row), |x, y| x + y),
+            PostAggExpr::Sub(a, b) => post_binop(&a.eval(row), &b.eval(row), |x, y| x - y),
+            PostAggExpr::Mul(a, b) => post_binop(&a.eval(row), &b.eval(row), |x, y| x * y),
+            PostAggExpr::Div(a, b) => {
+                let l = a.eval(row);
+                let r = b.eval(row);
+                match (as_f64(&l), as_f64(&r)) {
+                    (Some(_), Some(0.0)) => J::Null,
+                    (Some(x), Some(y)) => json_from_f64(x / y),
+                    _ => J::Null,
+                }
+            }
+            PostAggExpr::Neg(e) => match as_f64(&e.eval(row)) {
+                Some(x) => json_from_f64(-x),
+                None => J::Null,
+            },
+            PostAggExpr::Abs(e) => post_unary(&e.eval(row), f64::abs),
+            PostAggExpr::Round(e) => post_unary(&e.eval(row), f64::round),
+            PostAggExpr::Floor(e) => post_unary(&e.eval(row), f64::floor),
+            PostAggExpr::Ceil(e) => post_unary(&e.eval(row), f64::ceil),
+            PostAggExpr::Coalesce(args) => {
+                for arg in args {
+                    let v = arg.eval(row);
+                    if !v.is_null() {
+                        return v;
+                    }
+                }
+                J::Null
+            }
+            PostAggExpr::NullIf(a, b) => {
+                let av = a.eval(row);
+                let bv = b.eval(row);
+                if json_values_equal_for_nullif(&av, &bv) {
+                    J::Null
+                } else {
+                    av
+                }
+            }
+        }
+    }
+}
+
+fn json_from_f64(x: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(x)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn post_binop(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    op: impl Fn(f64, f64) -> f64,
+) -> serde_json::Value {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => json_from_f64(op(x, y)),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn post_unary(v: &serde_json::Value, op: impl Fn(f64) -> f64) -> serde_json::Value {
+    match v.as_f64() {
+        Some(x) => json_from_f64(op(x)),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// NULLIF equality over JSON cells: NULL is never equal to anything,
+/// NaN never equals NaN, numbers compare via f64, strings byte-exact.
+fn json_values_equal_for_nullif(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    if let (Some(av), Some(bv)) = (a.as_f64(), b.as_f64()) {
+        return !av.is_nan() && !bv.is_nan() && av == bv;
+    }
+    match (a.as_str(), b.as_str()) {
+        (Some(s1), Some(s2)) => s1 == s2,
+        _ => false,
+    }
 }
 
 /// Q7 — one window-function column on the SELECT list.
@@ -1203,7 +1366,7 @@ fn parse_select(
     //     column refs + aggregate function calls. The presence of
     //     either an aggregate call or a non-empty GROUP BY switches
     //     the executor into aggregate mode.
-    let (projection, aggregates, computed, windows) =
+    let (projection, aggregates, computed, windows, post_agg) =
         parse_projection_or_aggregates(&select.projection, schema, &group_by)?;
 
     // --- HAVING (P3) — compile against [group_names ++ aggregate_aliases].
@@ -1265,6 +1428,7 @@ fn parse_select(
         having,
         offset,
         windows,
+        post_agg,
     })
 }
 
@@ -1581,6 +1745,7 @@ fn parse_pivot_query(
         unpivot: None,
         join: None,
         computed: Vec::new(),
+        post_agg: Vec::new(),
         having: None,
         offset: None,
         windows: Vec::new(),
@@ -1702,6 +1867,7 @@ fn parse_unpivot_query(
         unpivot: Some(unpivot),
         join: None,
         computed: Vec::new(),
+        post_agg: Vec::new(),
         having: None,
         offset: None,
         windows: Vec::new(),
@@ -1732,23 +1898,41 @@ fn parse_group_by(
 ///      aggregate function calls. The projection vector is left empty
 ///      in case (2); the executor instead uses `aggregates` +
 ///      `group_by` to build output rows.
+#[allow(clippy::type_complexity)]
 fn parse_projection_or_aggregates(
     items: &[SelectItem],
     schema: &Schema,
     group_by: &[usize],
-) -> Result<(Vec<usize>, Vec<AggregateSpec>, Vec<ComputedColumn>, Vec<WindowColumn>), QueryError> {
+) -> Result<
+    (
+        Vec<usize>,
+        Vec<AggregateSpec>,
+        Vec<ComputedColumn>,
+        Vec<WindowColumn>,
+        Vec<PostAggColumn>,
+    ),
+    QueryError,
+> {
     // First pass: detect whether any item is an aggregate function.
     let has_agg = items
         .iter()
         .any(|i| matches!(extract_expr(i), Some(e) if is_aggregate_function_call(e)));
+    // Task 1.4 — also treat a SELECT list that WRAPS an aggregate in a
+    // scalar function (`NULLIF(SUM(qty),0)`) as an aggregate query, so
+    // it takes the aggregate execution path even though the top-level
+    // node isn't itself an aggregate call.
+    let has_agg_wrap = items
+        .iter()
+        .any(|i| matches!(extract_expr(i), Some(e) if expr_contains_aggregate(e)));
 
-    if !has_agg && group_by.is_empty() {
+    if !has_agg && !has_agg_wrap && group_by.is_empty() {
         let (projection, computed, windows) = parse_projection(items, schema)?;
-        return Ok((projection, Vec::new(), computed, windows));
+        return Ok((projection, Vec::new(), computed, windows, Vec::new()));
     }
 
     // Aggregate path.
     let mut aggregates = Vec::new();
+    let mut post_agg: Vec<PostAggColumn> = Vec::new();
     for item in items {
         let (expr, alias_override) = match item {
             SelectItem::UnnamedExpr(e) => (e, None),
@@ -1767,6 +1951,19 @@ fn parse_projection_or_aggregates(
 
         if let Some(spec) = parse_aggregate_call(expr, schema, alias_override.as_deref())? {
             aggregates.push(spec);
+        } else if expr_contains_aggregate(expr) {
+            // Task 1.4 — scalar function / arithmetic WRAPPING one or
+            // more aggregates (`NULLIF(SUM(qty),0)`,
+            // `SUM(x)/NULLIF(SUM(y),0)`). Compile it into a
+            // `PostAggExpr`: every nested aggregate is registered as a
+            // hidden aggregate spec (synthetic alias) and referenced by
+            // that alias in the expr. Evaluated over the finalised
+            // aggregate row at emit time.
+            let alias = alias_override
+                .clone()
+                .unwrap_or_else(|| expr_display_alias(expr));
+            let pe = compile_post_agg(expr, schema, &mut aggregates)?;
+            post_agg.push(PostAggColumn { alias, expr: pe });
         } else {
             // Non-aggregate projection element: must be a column that
             // appears in GROUP BY (otherwise its value isn't
@@ -1790,7 +1987,184 @@ fn parse_projection_or_aggregates(
         // executor by leaving both vectors as-is.
     }
 
-    Ok((Vec::new(), aggregates, Vec::new(), Vec::new()))
+    Ok((Vec::new(), aggregates, Vec::new(), Vec::new(), post_agg))
+}
+
+/// Task 1.4 — does `expr`'s subtree contain an aggregate function call
+/// anywhere? Used to route `NULLIF(SUM(qty),0)`-style projections onto
+/// the aggregate path and into the post-aggregate expression layer.
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(_) if is_aggregate_function_call(expr) => true,
+        Expr::Function(f) => {
+            if let FunctionArguments::List(l) = &f.args {
+                l.args.iter().any(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => expr_contains_aggregate(e),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Nested(e) => expr_contains_aggregate(e),
+        _ => false,
+    }
+}
+
+/// Task 1.4 — compile a scalar-over-aggregate expression. Aggregate
+/// calls found in the subtree are appended to `aggregates` with a
+/// synthetic alias (reusing an existing matching spec when one is
+/// already registered for the same func+col), and referenced by that
+/// alias in the returned `PostAggExpr`. Non-aggregate leaves resolve to
+/// group columns (also `Ref` by name) or numeric/string literals.
+fn compile_post_agg(
+    expr: &Expr,
+    schema: &Schema,
+    aggregates: &mut Vec<AggregateSpec>,
+) -> Result<PostAggExpr, QueryError> {
+    use sqlparser::ast::{BinaryOperator, UnaryOperator, Value as SqlValue, ValueWithSpan};
+    // An aggregate call anywhere in the tree → register + Ref its alias.
+    if is_aggregate_function_call(expr) {
+        if let Some(spec) = parse_aggregate_call(expr, schema, None)? {
+            // Reuse an already-registered aggregate with the same
+            // func+col+expr shape so `SUM(qty)` mentioned twice is
+            // computed once.
+            let alias = if let Some(existing) = aggregates
+                .iter()
+                .find(|a| a.func == spec.func && a.col == spec.col && agg_expr_eq(a, &spec))
+            {
+                existing.alias.clone()
+            } else {
+                let hidden = format!("__postagg_{}", aggregates.len());
+                let mut spec = spec;
+                spec.alias = hidden.clone();
+                aggregates.push(spec);
+                hidden
+            };
+            return Ok(PostAggExpr::Ref(alias));
+        }
+    }
+    match expr {
+        Expr::Identifier(id) => {
+            // A bare column here must be a group column; reference it by
+            // name (the executor emits group columns under their name).
+            // Validity (in GROUP BY) is enforced by the surrounding
+            // aggregate-path checks / executor, mirroring HAVING refs.
+            Ok(PostAggExpr::Ref(id.value.clone()))
+        }
+        Expr::Value(ValueWithSpan { value, .. }) => match value {
+            SqlValue::Number(n, _) => {
+                if let Ok(i) = n.parse::<i64>() {
+                    Ok(PostAggExpr::LitLong(i))
+                } else {
+                    Ok(PostAggExpr::LitDouble(n.parse().unwrap_or(0.0)))
+                }
+            }
+            SqlValue::SingleQuotedString(s) => Ok(PostAggExpr::LitString(s.clone())),
+            other => Err(QueryError::ParseError(format!(
+                "unsupported literal in scalar-over-aggregate expression: {other:?}"
+            ))),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let l = Box::new(compile_post_agg(left, schema, aggregates)?);
+            let r = Box::new(compile_post_agg(right, schema, aggregates)?);
+            match op {
+                BinaryOperator::Plus => Ok(PostAggExpr::Add(l, r)),
+                BinaryOperator::Minus => Ok(PostAggExpr::Sub(l, r)),
+                BinaryOperator::Multiply => Ok(PostAggExpr::Mul(l, r)),
+                BinaryOperator::Divide => Ok(PostAggExpr::Div(l, r)),
+                _ => Err(QueryError::ParseError(format!(
+                    "unsupported binary op in scalar-over-aggregate expression: {op:?}"
+                ))),
+            }
+        }
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+            Ok(PostAggExpr::Neg(Box::new(compile_post_agg(expr, schema, aggregates)?)))
+        }
+        Expr::Nested(inner) => compile_post_agg(inner, schema, aggregates),
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_uppercase();
+            let args = match &f.args {
+                FunctionArguments::List(l) => &l.args,
+                _ => {
+                    return Err(QueryError::ParseError(format!(
+                        "unsupported function in scalar-over-aggregate context: {name}"
+                    )))
+                }
+            };
+            // Compile each function argument, threading `aggregates`
+            // through so nested aggregate calls get registered.
+            let mut compiled_args: Vec<PostAggExpr> = Vec::with_capacity(args.len());
+            for a in args {
+                match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                        compiled_args.push(compile_post_agg(e, schema, aggregates)?);
+                    }
+                    _ => {
+                        return Err(QueryError::ParseError(format!(
+                            "{name}: arguments must be expressions"
+                        )))
+                    }
+                }
+            }
+            match name.as_str() {
+                "COALESCE" => {
+                    if compiled_args.is_empty() {
+                        return Err(QueryError::ParseError(
+                            "COALESCE requires at least one argument".into(),
+                        ));
+                    }
+                    Ok(PostAggExpr::Coalesce(compiled_args))
+                }
+                "NULLIF" => {
+                    if compiled_args.len() != 2 {
+                        return Err(QueryError::ParseError(format!(
+                            "NULLIF expects exactly two arguments, got {}",
+                            compiled_args.len()
+                        )));
+                    }
+                    let mut it = compiled_args.into_iter();
+                    let a = it.next().unwrap();
+                    let b = it.next().unwrap();
+                    Ok(PostAggExpr::NullIf(Box::new(a), Box::new(b)))
+                }
+                "ABS" | "ROUND" | "FLOOR" | "CEIL" | "CEILING" => {
+                    if compiled_args.len() != 1 {
+                        return Err(QueryError::ParseError(format!(
+                            "{name} expects exactly one argument, got {}",
+                            compiled_args.len()
+                        )));
+                    }
+                    let inner = Box::new(compiled_args.into_iter().next().unwrap());
+                    Ok(match name.as_str() {
+                        "ABS" => PostAggExpr::Abs(inner),
+                        "ROUND" => PostAggExpr::Round(inner),
+                        "FLOOR" => PostAggExpr::Floor(inner),
+                        _ => PostAggExpr::Ceil(inner),
+                    })
+                }
+                _ => Err(QueryError::ParseError(format!(
+                    "unsupported function in scalar-over-aggregate context: {name}"
+                ))),
+            }
+        }
+        _ => Err(QueryError::ParseError(format!(
+            "unsupported expression in scalar-over-aggregate context: {expr:?}"
+        ))),
+    }
+}
+
+/// Compare the R3 `expr` (NumExpr) input of two aggregate specs for
+/// dedup purposes. Two specs with identical func+col but expression
+/// inputs are only equal when both lack an expression (bare-column
+/// aggregates); expression-input aggregates are never deduped (they'd
+/// need structural NumExpr equality we don't track).
+fn agg_expr_eq(a: &AggregateSpec, b: &AggregateSpec) -> bool {
+    a.expr.is_none() && b.expr.is_none()
 }
 
 fn extract_expr(item: &SelectItem) -> Option<&Expr> {
@@ -2402,7 +2776,12 @@ fn try_compile_scalar_expr(
         // resolve-as-column fallback rejects them.
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_uppercase();
-            if matches!(name.as_str(), "COALESCE" | "NULLIF") {
+            // Task 1.4 — ABS/ROUND/FLOOR/CEIL join COALESCE/NULLIF as
+            // scalar functions the SELECT projection path handles.
+            if matches!(
+                name.as_str(),
+                "COALESCE" | "NULLIF" | "ABS" | "ROUND" | "FLOOR" | "CEIL" | "CEILING"
+            ) {
                 Ok(Some(compile_scalar(expr, schema)?))
             } else {
                 Ok(None)
@@ -2512,6 +2891,32 @@ fn compile_scalar(expr: &Expr, schema: &Schema) -> Result<ScalarExpr, QueryError
                     let a = it.next().unwrap();
                     let b = it.next().unwrap();
                     Ok(ScalarExpr::NullIf(Box::new(a), Box::new(b)))
+                }
+                // Task 1.4 — unary numeric scalar functions in SELECT.
+                "ABS" | "ROUND" | "FLOOR" | "CEIL" | "CEILING" => {
+                    if args.len() != 1 {
+                        return Err(QueryError::ParseError(format!(
+                            "{name} expects exactly one argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let e = match &args[0] {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => e,
+                        _ => {
+                            return Err(QueryError::ParseError(format!(
+                                "{name}: argument must be an expression"
+                            )));
+                        }
+                    };
+                    let inner = Box::new(compile_scalar(e, schema)?);
+                    Ok(match name.as_str() {
+                        "ABS" => ScalarExpr::Abs(inner),
+                        "ROUND" => ScalarExpr::Round(inner),
+                        "FLOOR" => ScalarExpr::Floor(inner),
+                        _ => ScalarExpr::Ceil(inner),
+                    })
                 }
                 _ => Err(QueryError::ParseError(format!(
                     "unsupported function in scalar context: {name}"
@@ -3740,6 +4145,26 @@ impl AggState {
     }
 }
 
+/// Task 1.4 — finalise a single aggregate output row: evaluate every
+/// scalar-over-aggregate projection column against the row (which
+/// already contains group columns + all aggregate aliases, including
+/// hidden `__postagg_*` ones), then drop the hidden aliases so they
+/// never reach the client. Called at each emit site AFTER HAVING.
+fn apply_post_agg(
+    query: &ParsedQuery,
+    row_map: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if query.post_agg.is_empty() {
+        return;
+    }
+    for pa in &query.post_agg {
+        let v = pa.expr.eval(row_map);
+        row_map.insert(pa.alias.clone(), v);
+    }
+    // Strip hidden aggregate columns synthesised for nested aggregates.
+    row_map.retain(|k, _| !k.starts_with("__postagg_"));
+}
+
 /// Aggregate execution: scan candidate rows, maintain a running
 /// state per `(group_key, aggregate)`, emit one output row per
 /// distinct group key. Single-pass O(rows × aggregates), no second
@@ -3851,6 +4276,7 @@ fn execute_aggregate_query(
         }
         // P3 — HAVING also applies to the implicit-group row.
         if query.having.as_ref().map(|h| h.matches(&row_map)).unwrap_or(true) {
+            apply_post_agg(query, &mut row_map);
             rows.push(row_map);
         }
     }
@@ -3869,6 +4295,7 @@ fn execute_aggregate_query(
                 continue;
             }
         }
+        apply_post_agg(query, &mut row_map);
         rows.push(row_map);
     }
 
@@ -4003,6 +4430,7 @@ pub fn aggregate_one_group(
             return None;
         }
     }
+    apply_post_agg(query, &mut row_map);
     Some(row_map)
 }
 
@@ -5199,6 +5627,130 @@ mod tests {
                 .unwrap(),
             5
         );
+    }
+
+    // ---- Task 1.4: scalar-over-aggregate projection ----
+
+    #[test]
+    fn nullif_wrapping_aggregate_yields_null_on_match() {
+        // NULLIF(SUM(quantity), 365) — with the trades store, total
+        // quantity is 100+50+10+5+200 = 365, so NULLIF collapses to null.
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT SUM(quantity) AS total, NULLIF(SUM(quantity), 365) AS denom FROM trades",
+            &schema,
+        )
+        .expect("scalar-over-aggregate must compile");
+        let result = execute_query(&query, &store);
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row.get("total").unwrap().as_i64().unwrap(), 365);
+        assert!(
+            row.get("denom").map(|v| v.is_null()).unwrap_or(true),
+            "NULLIF(365,365) must be null; got {:?}",
+            row.get("denom")
+        );
+    }
+
+    #[test]
+    fn nullif_wrapping_aggregate_passes_through_when_differ() {
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT NULLIF(SUM(quantity), 0) AS denom FROM trades",
+            &schema,
+        )
+        .unwrap();
+        let result = execute_query(&query, &store);
+        assert_eq!(
+            result.rows[0].get("denom").unwrap().as_f64().unwrap(),
+            365.0,
+            "SUM=365 != 0, NULLIF passes SUM through"
+        );
+    }
+
+    #[test]
+    fn division_over_aggregates_with_nullif_guard() {
+        // SUM(price*qty) / NULLIF(SUM(qty), 0) — VWAP shape.
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT SUM(price * quantity) / NULLIF(SUM(quantity), 0) AS vwap FROM trades",
+            &schema,
+        )
+        .unwrap();
+        let result = execute_query(&query, &store);
+        // num = 150*100 + 300*50 + 2800*10 + 3400*5 + 250*200
+        //     = 15000 + 15000 + 28000 + 17000 + 50000 = 125000
+        // denom = 365 ; vwap = 125000/365
+        let vwap = result.rows[0].get("vwap").unwrap().as_f64().unwrap();
+        assert!((vwap - (125000.0 / 365.0)).abs() < 1e-6, "vwap={vwap}");
+    }
+
+    #[test]
+    fn division_over_aggregates_divzero_guarded_per_group() {
+        // Group with SUM(quantity)=0 → NULLIF makes denom null → vwap null.
+        let schema = Arc::new(Schema::from_strs(
+            &["g", "price", "qty"],
+            &[ColumnType::String, ColumnType::Double, ColumnType::Long],
+        ));
+        let mut store = ColumnStore::new(schema.clone(), 100);
+        // group "z": qty sums to 0 (one row with qty 0)
+        store.append_row(&[
+            Value::String(Some(CompactString::new("z"))),
+            Value::Double(100.0),
+            Value::Long(0),
+        ]);
+        // group "y": qty 4
+        store.append_row(&[
+            Value::String(Some(CompactString::new("y"))),
+            Value::Double(10.0),
+            Value::Long(4),
+        ]);
+        let query = parse_query(
+            "SELECT g, SUM(price*qty)/NULLIF(SUM(qty),0) AS vwap FROM t GROUP BY g",
+            &schema,
+        )
+        .unwrap();
+        let result = execute_query(&query, &store);
+        let mut by_g = std::collections::HashMap::new();
+        for r in &result.rows {
+            by_g.insert(r.get("g").unwrap().as_str().unwrap().to_string(), r.clone());
+        }
+        assert!(
+            by_g["z"].get("vwap").map(|v| v.is_null()).unwrap_or(true),
+            "divide-by-zero group guarded → null"
+        );
+        assert_eq!(by_g["y"].get("vwap").unwrap().as_f64().unwrap(), 10.0);
+    }
+
+    #[test]
+    fn scalar_fn_abs_in_plain_select_projection() {
+        // Gap #3 — ABS in a non-aggregate SELECT projection.
+        let schema = Arc::new(Schema::from_strs(
+            &["k", "v"],
+            &[ColumnType::String, ColumnType::Double],
+        ));
+        let mut store = ColumnStore::new(schema.clone(), 100);
+        store.append_row(&[
+            Value::String(Some(CompactString::new("a"))),
+            Value::Double(-5.0),
+        ]);
+        let query = parse_query("SELECT k, ABS(v) AS av FROM t", &schema)
+            .expect("ABS in SELECT projection must compile");
+        let result = execute_query(&query, &store);
+        assert_eq!(result.rows[0].get("av").unwrap().as_f64().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn aggregate_wrap_and_coalesce_combined() {
+        // COALESCE over an aggregate: COALESCE(NULLIF(SUM(qty),365), 0) → 0.
+        let (schema, store) = make_store();
+        let query = parse_query(
+            "SELECT COALESCE(NULLIF(SUM(quantity), 365), 0) AS d FROM trades",
+            &schema,
+        )
+        .unwrap();
+        let result = execute_query(&query, &store);
+        assert_eq!(result.rows[0].get("d").unwrap().as_f64().unwrap(), 0.0);
     }
 
     #[test]

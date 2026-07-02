@@ -94,10 +94,8 @@ async fn nullif_guards_divide_by_zero_per_row() {
     // Row-level NULLIF: `SELECT a / NULLIF(b, 0) AS r FROM t` — when
     // b is 0, the divisor becomes null and the division yields null
     // (no inf, no crash). The aggregate-wrap form
-    // `NULLIF(SUM(qty), 0)` needs a post-aggregate expression layer
-    // that's tracked separately (see r4_aggregate_wrap_nullif_known_limit
-    // below) — neither AMPS nor cqserver evaluates NULLIF over an
-    // aggregate in a single SELECT today without that layer.
+    // `NULLIF(SUM(qty), 0)` is handled by the post-aggregate
+    // projection layer (Task 1.4) — see `nullif_after_aggregate` below.
     let topic = TopicSpec::new("/r4-nullif-row", "k")
         .with_inline_columns([("k", "string"), ("a", "double"), ("b", "long")]);
     let server = start_server(vec![topic]).await;
@@ -131,14 +129,15 @@ async fn nullif_guards_divide_by_zero_per_row() {
 }
 
 /// `NULLIF(SUM(...), 0)` — NULLIF wrapping an aggregate is a
-/// post-aggregate scalar expression. Today cqserver evaluates
-/// scalar expressions per-row OR as aggregate inputs (R3) but NOT
-/// over aggregate OUTPUTS. The fix needs a new "computed-over-
-/// aggregate" projection layer — out of scope for R4. This test
-/// documents the limit so the gap is visible.
+/// post-aggregate scalar expression. Task 1.4 added the
+/// "computed-over-aggregate" projection layer: scalar functions and
+/// arithmetic wrapping aggregate calls are compiled into a
+/// `PostAggExpr` evaluated over the finalised aggregate output row.
+/// This test now verifies the divide-by-zero VWAP guard works
+/// end-to-end: `SUM(qty)` = 0 → `NULLIF(SUM(qty),0)` = null →
+/// `SUM(price*qty)/NULLIF(SUM(qty),0)` = null (no inf, no crash).
 #[tokio::test]
-#[ignore]
-async fn r4_aggregate_wrap_nullif_known_limit() {
+async fn nullif_after_aggregate() {
     let topic = TopicSpec::new("/r4-agg-nullif", "k")
         .with_inline_columns([("k", "string"), ("price", "double"), ("qty", "long")]);
     let server = start_server(vec![topic]).await;
@@ -148,19 +147,30 @@ async fn r4_aggregate_wrap_nullif_known_limit() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    // Expected, once supported: NULLIF(SUM(qty), 0) → null when
-    // SUM(qty)=0; SUM(price*qty)/NULLIF(SUM(qty),0) → null.
+    // NULLIF(SUM(qty), 0) → null when SUM(qty)=0; and the VWAP
+    // ratio SUM(price*qty)/NULLIF(SUM(qty),0) → null too.
     let row = client
         .sow_sql(
             "/r4-agg-nullif",
-            "SELECT SUM(price * qty) AS num, NULLIF(SUM(qty), 0) AS denom FROM t",
+            "SELECT SUM(price * qty) AS num, NULLIF(SUM(qty), 0) AS denom, \
+             SUM(price * qty) / NULLIF(SUM(qty), 0) AS vwap FROM t",
         )
         .await
-        .unwrap()
+        .expect("scalar-over-aggregate projection must compile")
         .pop()
         .unwrap();
     let denom = row.get("denom");
-    assert!(denom.is_none() || denom.unwrap().is_null());
+    assert!(
+        denom.is_none() || denom.unwrap().is_null(),
+        "NULLIF(SUM(qty)=0, 0) must be null; got {denom:?}"
+    );
+    let vwap = row.get("vwap");
+    assert!(
+        vwap.is_none() || vwap.unwrap().is_null(),
+        "divide by null denom must be null; got {vwap:?}"
+    );
+    // num is still computed: SUM(100*0) = 0.
+    assert_eq!(row.get("num").unwrap().as_f64().unwrap(), 0.0);
 }
 
 #[tokio::test]
@@ -242,4 +252,36 @@ async fn coalesce_in_where_clause() {
         .collect();
     assert!(ks.contains("a") && ks.contains("b"));
     assert!(!ks.contains("c"));
+}
+
+/// Task 1.4 — the positive VWAP case: non-zero denominator, so the
+/// full ratio is computed via the post-aggregate projection layer.
+#[tokio::test]
+async fn vwap_over_aggregates_nonzero_denominator() {
+    let topic = TopicSpec::new("/r4-vwap", "k")
+        .with_inline_columns([("k", "string"), ("price", "double"), ("qty", "long")]);
+    let server = start_server(vec![topic]).await;
+    let client = Client::connect(&server.tcp_url()).await.expect("connect");
+    // price*qty: 100*2=200, 50*8=400 ; sum(price*qty)=600 ; sum(qty)=10
+    // vwap = 600/10 = 60
+    client
+        .publish("/r4-vwap", json!({ "k": "a", "price": 100.0, "qty": 2 }))
+        .await
+        .unwrap();
+    client
+        .publish("/r4-vwap", json!({ "k": "b", "price": 50.0, "qty": 8 }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let row = client
+        .sow_sql(
+            "/r4-vwap",
+            "SELECT SUM(price * qty) / NULLIF(SUM(qty), 0) AS vwap FROM t",
+        )
+        .await
+        .expect("VWAP scalar-over-aggregate must compile")
+        .pop()
+        .unwrap();
+    assert_eq!(row.get("vwap").unwrap().as_f64().unwrap(), 60.0);
 }
