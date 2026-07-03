@@ -159,16 +159,63 @@ match the demo's shapes exactly. `max_sow_estimated_bytes` /
 `hard_max_sow_result_bytes` are raised the same way, since Atlas rows
 are 200+ columns wide.
 
+## Analyzing a soak run (Bucket B, task B3)
+
+`cq-loadgen --scenario soak-analyze` reads Prometheus over the run
+window and prints a machine-checkable verdict, so a multi-day soak
+self-judges instead of a human staring at Grafana. Four criteria, each
+PASS/FAIL with measured value + threshold:
+
+| criterion | metric(s) | what FAILs it |
+|---|---|---|
+| `rss_slope` | `cq_process_rss_bytes` | linear-fit slope (after excluding the first 10% of the window as warmup) implies growth beyond `--soak-analyze-max-rss-growth-mb-per-hour` (default 50 MB/hour) — a leak |
+| `delta_drop_ratio` | `cq_deltas_dropped_total`, `cq_deltas_delivered_total` | dropped/delivered ratio over the window exceeds `--soak-analyze-max-drop-ratio` (default 0.05). The slow-consumer class is *expected* to cause some drops — this bounds them, it doesn't require zero |
+| `txlog_bounded` | `cq_txlog_checkpoint_total`, `cq_txlog_segments_reclaimed_total` | no checkpoints fired, or no segments were ever reclaimed, over the window — the txlog would grow unboundedly instead of sawtoothing |
+| `p99_publish_latency` | `cq_publish_latency_us` (`histogram_quantile(0.99, ...)`) | the worst p99 sample in the window exceeds `--soak-analyze-max-p99-latency-us` (default 50000 = 50ms) |
+
+Run it after (or during) a soak, pointed at the soak's Prometheus:
+
+```sh
+# Against the docker-compose soak topology's Prometheus (port 9090
+# above), analyzing the last hour:
+cargo run -p cq-loadgen -- --scenario soak-analyze \
+  --prometheus-url http://127.0.0.1:9090 \
+  --soak-analyze-last-minutes 60
+
+# Or an explicit window (Unix seconds) — useful for a multi-day soak
+# where you want to analyze a specific day's slice:
+cargo run -p cq-loadgen -- --scenario soak-analyze \
+  --prometheus-url http://127.0.0.1:9090 \
+  --soak-analyze-start 1735689600 --soak-analyze-end 1735776000
+```
+
+It exits nonzero on `SOAK VERDICT: FAIL`, so it composes directly into
+CI or a runbook gate, e.g.:
+
+```sh
+cq-loadgen --scenario soak-analyze --prometheus-url http://127.0.0.1:9090 \
+  --soak-analyze-last-minutes 1440 || echo "soak failed — see verdict table above"
+```
+
+The verdict math (linear fit, drop ratio, checkpoint/reclaim presence,
+p99 threshold) lives in `crates/cq-loadgen/src/soak_analyze.rs` as pure
+functions and is unit-tested against synthetic metric series (leaking
+RSS → FAIL, flat RSS → PASS, runaway drops → FAIL, bounded drops →
+PASS, no reclaim events → FAIL, reclaim events present → PASS) — no
+live Prometheus needed for `cargo test -p cq-loadgen`.
+
+**Known gap**: there is no txlog-bytes-on-disk gauge exported by the
+server today (only the checkpoint/reclaim/error counters — grepped
+`crates/cq-server`, `crates/cq-txlog`), so `txlog_bounded` proves
+checkpoint+reclaim *activity* rather than directly asserting a bounded
+byte count. A dedicated size gauge, or scraping node_exporter's disk
+usage for the txlog volume, would close that gap — flagged as a
+follow-up, not blocking for B3.
+
 ## What this does NOT do (yet)
 
 - **Single node** — no replication/failover in this topology; that's
   Bucket C (HA/failover).
-- **No automated pass/fail** — this is an operator-driven harness for
-  watching Prometheus/the admin UI over a long run, not a CI gate. The
-  load driver's own summary line is the closest thing to a pass/fail
-  signal today (issued/acked/errors + per-class delivered counts);
-  analyzing the Prometheus history over a multi-day run is Bucket B's
-  next task (B3).
 - **No per-client conflation knob** — the "conflated" subscriber class
   subscribes the same way as "fast"; conflation comes entirely from the
   topic's own `conflation_ms` (set on `/positions` in `soak.toml`). The

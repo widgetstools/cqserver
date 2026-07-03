@@ -19,6 +19,7 @@
 pub mod histogram;
 pub mod rate_limiter;
 pub mod scenarios;
+pub mod soak_analyze;
 
 pub use histogram::LatencyHistogram;
 pub use rate_limiter::RateLimiter;

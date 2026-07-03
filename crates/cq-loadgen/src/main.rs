@@ -76,6 +76,16 @@ enum Scenario {
     /// (`--soak-slow-subscribers`, `--soak-slow-read-delay-ms`). Logs
     /// progress every `--soak-progress-interval-secs` and a final summary.
     Soak,
+    /// Bucket B, task B3 — read Prometheus over a run window and emit a
+    /// machine-checkable PASS/FAIL verdict for a soak: RSS slope ≈ 0
+    /// after warmup, bounded delta drops, checkpoint+reclaim activity
+    /// (txlog bounded), and p99 publish latency under target. Exits
+    /// nonzero on FAIL so CI/the runbook can gate on it. Point
+    /// `--prometheus-url` at the soak's Prometheus (see
+    /// `tests/cloud/SOAK.md`) and either `--soak-analyze-last-minutes`
+    /// or an explicit `--soak-analyze-start`/`--soak-analyze-end`
+    /// window.
+    SoakAnalyze,
 }
 
 #[derive(Parser, Debug)]
@@ -152,6 +162,50 @@ struct Args {
     /// `tests/cloud/configs/soak.toml`'s `/positions` topic).
     #[arg(long, default_value = "")]
     soak_key_field: String,
+
+    /// soak-analyze: Prometheus base URL, e.g. http://localhost:9090.
+    #[arg(long, default_value = "http://127.0.0.1:9090")]
+    prometheus_url: String,
+
+    /// soak-analyze: analyze the last N minutes ending now. Ignored if
+    /// `--soak-analyze-start` / `--soak-analyze-end` are both given.
+    #[arg(long, default_value_t = 60.0)]
+    soak_analyze_last_minutes: f64,
+
+    /// soak-analyze: explicit window start, Unix seconds. Overrides
+    /// `--soak-analyze-last-minutes` when set together with `--soak-analyze-end`.
+    #[arg(long)]
+    soak_analyze_start: Option<f64>,
+
+    /// soak-analyze: explicit window end, Unix seconds.
+    #[arg(long)]
+    soak_analyze_end: Option<f64>,
+
+    /// soak-analyze: Prometheus query step in seconds. 0 ⇒ 10 (matches
+    /// `tests/cloud/prometheus-soak.yml`'s scrape interval).
+    #[arg(long, default_value_t = 0.0)]
+    soak_analyze_step_secs: f64,
+
+    /// soak-analyze: max allowed RSS growth after warmup exclusion, in
+    /// MB/hour, before the rss_slope criterion FAILs (a leak signal).
+    #[arg(long, default_value_t = 50.0)]
+    soak_analyze_max_rss_growth_mb_per_hour: f64,
+
+    /// soak-analyze: fraction (0.0-1.0) of the window treated as warmup
+    /// and excluded from the RSS slope fit.
+    #[arg(long, default_value_t = 0.10)]
+    soak_analyze_warmup_fraction: f64,
+
+    /// soak-analyze: max allowed ratio of dropped to delivered deltas
+    /// over the window before delta_drop_ratio FAILs. Slow-consumer
+    /// drops are expected — this bounds them, it doesn't require zero.
+    #[arg(long, default_value_t = 0.05)]
+    soak_analyze_max_drop_ratio: f64,
+
+    /// soak-analyze: max allowed p99 publish latency in microseconds
+    /// before p99_publish_latency FAILs.
+    #[arg(long, default_value_t = 50_000.0)]
+    soak_analyze_max_p99_latency_us: f64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -203,6 +257,25 @@ async fn main() -> Result<()> {
         }
         Scenario::Soak => {
             scenarios::soak(&cfg).await?;
+        }
+        Scenario::SoakAnalyze => {
+            use cq_loadgen::soak_analyze::{analyze_config_from_args, run};
+            let analyze_cfg = analyze_config_from_args(
+                args.prometheus_url,
+                args.soak_analyze_last_minutes,
+                args.soak_analyze_start,
+                args.soak_analyze_end,
+                args.soak_analyze_step_secs,
+                args.soak_analyze_max_rss_growth_mb_per_hour,
+                args.soak_analyze_warmup_fraction,
+                args.soak_analyze_max_drop_ratio,
+                args.soak_analyze_max_p99_latency_us,
+            );
+            let report = run(&analyze_cfg).await?;
+            print!("{}", report.render());
+            if !report.overall().is_pass() {
+                std::process::exit(1);
+            }
         }
     };
     Ok(())
