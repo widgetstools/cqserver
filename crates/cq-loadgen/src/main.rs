@@ -65,6 +65,17 @@ enum Scenario {
     /// delivered fraction vs ideal `rate × N` fanout, and peak server RSS.
     /// Use for 2000/5000/10000-connection egress tests.
     EgressFanout,
+    /// Long-running Atlas-shaped soak (Bucket B, task B2). Seeds a wide
+    /// row set on `--topic` (default caller should pass `/positions` to
+    /// match `tests/cloud/configs/soak.toml`), then holds 3 subscriber
+    /// classes open for `--duration-secs` while ticking sparse
+    /// `delta_publish` updates at `--rate`/s: fast full-firehose
+    /// (`--soak-fast-subscribers`), conflated (`--soak-conflated-subscribers`
+    /// — conflation itself comes from the topic's server-side
+    /// `conflation_ms`), and deliberately-slow
+    /// (`--soak-slow-subscribers`, `--soak-slow-read-delay-ms`). Logs
+    /// progress every `--soak-progress-interval-secs` and a final summary.
+    Soak,
 }
 
 #[derive(Parser, Debug)]
@@ -112,6 +123,35 @@ struct Args {
     /// sow-wide: columns per row (including the `k` key). 0 ⇒ 400.
     #[arg(long, default_value_t = 0)]
     cols: usize,
+
+    /// soak: number of fast full-firehose subscribers held for the
+    /// whole run. 0 ⇒ 2.
+    #[arg(long, default_value_t = 0)]
+    soak_fast_subscribers: usize,
+
+    /// soak: number of conflated-class subscribers held for the whole
+    /// run. 0 ⇒ 2.
+    #[arg(long, default_value_t = 0)]
+    soak_conflated_subscribers: usize,
+
+    /// soak: number of deliberately-slow subscribers held for the whole
+    /// run. 0 ⇒ 1.
+    #[arg(long, default_value_t = 0)]
+    soak_slow_subscribers: usize,
+
+    /// soak: milliseconds a slow subscriber sleeps between reads. 0 ⇒ 200.
+    #[arg(long, default_value_t = 0)]
+    soak_slow_read_delay_ms: u64,
+
+    /// soak: seconds between progress log lines. 0 ⇒ 10.
+    #[arg(long, default_value_t = 0)]
+    soak_progress_interval_secs: u64,
+
+    /// soak: the topic's key field name (so seeded rows + delta ticks
+    /// carry a key the server recognizes). Empty ⇒ "position_id" (matches
+    /// `tests/cloud/configs/soak.toml`'s `/positions` topic).
+    #[arg(long, default_value = "")]
+    soak_key_field: String,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -129,6 +169,12 @@ async fn main() -> Result<()> {
         payload_bytes: args.payload_bytes,
         wide_rows: args.rows,
         wide_cols: args.cols,
+        soak_fast_subscribers: args.soak_fast_subscribers,
+        soak_conflated_subscribers: args.soak_conflated_subscribers,
+        soak_slow_subscribers: args.soak_slow_subscribers,
+        soak_slow_read_delay_ms: args.soak_slow_read_delay_ms,
+        soak_progress_interval_secs: args.soak_progress_interval_secs,
+        soak_key_field: args.soak_key_field,
     };
     match args.scenario {
         Scenario::PublishThroughput => scenarios::publish_throughput(&cfg).await?.print(),
@@ -154,6 +200,9 @@ async fn main() -> Result<()> {
         }
         Scenario::EgressFanout => {
             scenarios::egress_fanout(&cfg).await?;
+        }
+        Scenario::Soak => {
+            scenarios::soak(&cfg).await?;
         }
     };
     Ok(())

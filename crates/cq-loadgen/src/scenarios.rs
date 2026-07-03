@@ -41,6 +41,29 @@ pub struct ScenarioConfig {
     pub wide_rows: usize,
     /// `sow-wide`: number of columns per row (including the `k` key). 0 ⇒ 400.
     pub wide_cols: usize,
+    /// `soak`: number of fast (full-firehose, drain-as-fast-as-possible)
+    /// subscribers to hold for the whole run. 0 ⇒ 2.
+    pub soak_fast_subscribers: usize,
+    /// `soak`: number of conflated-class subscribers to hold for the whole
+    /// run. These subscribe to the same topic as the fast class; the
+    /// conflation behavior comes from the topic's own `conflation_ms`
+    /// server config (e.g. `/positions` in `tests/cloud/configs/soak.toml`),
+    /// not a client-side option. 0 ⇒ 2.
+    pub soak_conflated_subscribers: usize,
+    /// `soak`: number of deliberately-slow subscribers to hold for the
+    /// whole run — each sleeps `soak_slow_read_delay_ms` between reads to
+    /// exercise the slow-consumer / drop path. 0 ⇒ 1.
+    pub soak_slow_subscribers: usize,
+    /// `soak`: milliseconds a slow subscriber sleeps between reads. 0 ⇒ 200.
+    pub soak_slow_read_delay_ms: u64,
+    /// `soak`: how often (seconds) the driver logs a progress line. 0 ⇒ 10.
+    pub soak_progress_interval_secs: u64,
+    /// `soak`: the topic's key field name, so seeded rows and delta ticks
+    /// carry a key the server recognizes. Empty ⇒ `"position_id"`, matching
+    /// `tests/cloud/configs/soak.toml`'s `/positions` topic (`key =
+    /// ["position_id"]`). Set this when pointing `--topic` at a
+    /// differently-keyed topic.
+    pub soak_key_field: String,
 }
 
 impl Default for ScenarioConfig {
@@ -56,6 +79,12 @@ impl Default for ScenarioConfig {
             payload_bytes: 0,
             wide_rows: 0,
             wide_cols: 0,
+            soak_fast_subscribers: 0,
+            soak_conflated_subscribers: 0,
+            soak_slow_subscribers: 0,
+            soak_slow_read_delay_ms: 0,
+            soak_progress_interval_secs: 0,
+            soak_key_field: String::new(),
         }
     }
 }
@@ -1587,6 +1616,398 @@ pub async fn schema_evolution_under_load(cfg: &ScenarioConfig) -> Result<Evoluti
         publish_ack_p99: ack_hist.p99(),
         duration: started.elapsed(),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// soak: long-running Atlas-shaped workload — Bucket B, task B2.
+//
+// One publisher seeds a wide-ish row set on a persistent topic (default
+// `/positions`, matching `tests/cloud/configs/soak.toml`) and then drives
+// sparse `delta_publish` ticks at a configurable rate for the whole run.
+// Three subscriber CLASSES are held open for the entire duration:
+//
+//   1. fast    — plain `subscribe`, drains as fast as it can. Models a
+//                healthy full-firehose consumer.
+//   2. conflated — subscribes to the same topic. Conflation itself is a
+//                *topic*-level server setting (`conflation_ms` in the
+//                TOML config, e.g. `/positions` in soak.toml), not a
+//                client-side subscribe option — the SDK has no
+//                per-subscription conflation knob (see
+//                `crates/cq-core/src/conflation.rs` /
+//                `crates/cq-protocol/src/message.rs`). This class simply
+//                proves the conflation path stays healthy under sustained
+//                load: on a topic with `conflation_ms` set, coalesced
+//                deltas mean this class should see materially fewer raw
+//                deltas than `fast` for the same publish stream while
+//                still tracking the latest value with no drops.
+//   3. slow    — deliberately slow: sleeps `soak_slow_read_delay_ms`
+//                between reads, exercising the slow-consumer / queue-drop
+//                path (see `crates/cq-e2e-tests/tests/slow_consumer.rs`
+//                for the equivalent short-lived e2e).
+//
+// The driver logs progress every `soak_progress_interval_secs` (published
+// count, per-class delivered count, elapsed) and prints a final summary on
+// exit — the gap between a class's `delivered` and the publisher's `acked`
+// is the client-visible proxy for "this class is falling behind / dropping"
+// (drops themselves happen server-side, in the outbound queue). Runs until
+// `cfg.duration` elapses (`--duration-secs`)
+// or the process receives SIGINT/SIGTERM (Ctrl-C / `docker stop`), in
+// which case it still prints the summary before exiting.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Per-class soak subscriber counters. `delivered` is every delta actually
+/// read off the subscription; `subs_failed` counts connect/subscribe
+/// failures (kept at 0 unless the server rejects the connection — a real
+/// occurrence would be a soak finding in itself). There's no direct
+/// client-visible "dropped" counter (drops happen server-side, in the
+/// outbound queue, before the client ever sees the delta) — the summary
+/// instead reports `delivered` alongside the publisher's `acked` count so
+/// the gap between classes is visible: a healthy fast/conflated class
+/// tracks `acked` closely; a slow class falling behind is the expected,
+/// deliberate signal that the slow-consumer path is being exercised.
+struct SoakClassCounters {
+    class: &'static str,
+    subs_opened: AtomicU64,
+    subs_failed: AtomicU64,
+    delivered: AtomicU64,
+}
+
+impl SoakClassCounters {
+    fn new(class: &'static str) -> Self {
+        Self {
+            class,
+            subs_opened: AtomicU64::new(0),
+            subs_failed: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Spawn one soak subscriber of the given class. `read_delay` is applied
+/// *after* every successfully-read delta (slow class only — `Duration::ZERO`
+/// for fast/conflated). Runs until `stop` flips.
+async fn run_soak_subscriber(
+    idx: usize,
+    url: String,
+    topic: String,
+    read_delay: Duration,
+    counters: Arc<SoakClassCounters>,
+    stop: Arc<AtomicBool>,
+) {
+    let client = match tokio::time::timeout(Duration::from_secs(15), Client::connect(&url)).await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("soak sub {idx} ({}) connect failed: {e}", counters.class);
+            counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            eprintln!("soak sub {idx} ({}) connect timed out", counters.class);
+            counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    let mut sub = match tokio::time::timeout(
+        Duration::from_secs(30),
+        client.sow_and_subscribe(&topic, None, None),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            eprintln!("soak sub {idx} ({}) subscribe failed: {e}", counters.class);
+            counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            eprintln!("soak sub {idx} ({}) subscribe timed out", counters.class);
+            counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    counters.subs_opened.fetch_add(1, Ordering::Relaxed);
+
+    while !stop.load(Ordering::Relaxed) {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next_delta()).await {
+            Ok(Some(_delta)) => {
+                counters.delivered.fetch_add(1, Ordering::Relaxed);
+                if read_delay > Duration::ZERO {
+                    tokio::time::sleep(read_delay).await;
+                }
+            }
+            Ok(None) => break, // stream closed server-side
+            Err(_) => continue, // timeout — re-check stop flag
+        }
+    }
+}
+
+/// Build one wide soak row keyed by `key_field` (e.g. `position_id` for
+/// `/positions`). Unlike `wide_row` (used by `sow-wide`, which hardcodes a
+/// `"k"` key), this targets a real Atlas-shaped topic whose key field name
+/// is configurable — `delta_publish` rejects any payload missing the
+/// topic's actual key field(s). `cols - 1` numeric filler columns
+/// (`c1..c{cols-1}`) round out the row width.
+fn soak_wide_row(key_field: &str, r: u64, cols: usize) -> serde_json::Value {
+    let mut obj = serde_json::Map::with_capacity(cols);
+    obj.insert(key_field.into(), json!(format!("SOAK-{r:08}")));
+    for c in 1..cols {
+        let v = r.wrapping_mul(2_654_435_761).wrapping_add(c as u64) % 1_000_000;
+        obj.insert(format!("c{c}"), json!(v));
+    }
+    obj.insert("_t".into(), json!(0u64));
+    serde_json::Value::Object(obj)
+}
+
+/// Long-running Atlas-shaped soak driver (task B2). Seeds `wide_rows`
+/// wide rows (default 2_000 × `wide_cols`, default 60 columns — a
+/// deliberately smaller default than `sow-wide`'s 30k × 400 so a local
+/// 60s run is cheap) on `cfg.topic` (default caller passes `/positions`
+/// to match `tests/cloud/configs/soak.toml`), then holds the 3
+/// subscriber classes open for `cfg.duration` while a single publisher
+/// issues sparse `delta_publish` ticks at `cfg.publish_rate`/s. Prints a
+/// progress line every `soak_progress_interval_secs` and a final summary.
+pub async fn soak(cfg: &ScenarioConfig) -> Result<()> {
+    let rows = if cfg.wide_rows == 0 { 2_000 } else { cfg.wide_rows };
+    let cols = if cfg.wide_cols == 0 { 60 } else { cfg.wide_cols };
+    let n_fast = if cfg.soak_fast_subscribers == 0 { 2 } else { cfg.soak_fast_subscribers };
+    let n_conflated =
+        if cfg.soak_conflated_subscribers == 0 { 2 } else { cfg.soak_conflated_subscribers };
+    let n_slow = if cfg.soak_slow_subscribers == 0 { 1 } else { cfg.soak_slow_subscribers };
+    let slow_delay_ms =
+        if cfg.soak_slow_read_delay_ms == 0 { 200 } else { cfg.soak_slow_read_delay_ms };
+    let progress_secs =
+        if cfg.soak_progress_interval_secs == 0 { 10 } else { cfg.soak_progress_interval_secs };
+    let publish_rate = if cfg.publish_rate <= 0.0 { 50.0 } else { cfg.publish_rate };
+    let key_field = if cfg.soak_key_field.is_empty() { "position_id" } else { &cfg.soak_key_field };
+
+    println!("──────────────────────────────────────────────────");
+    println!("Scenario: soak  (topic={}, duration={:.0}s)", cfg.topic, cfg.duration.as_secs_f64());
+    println!(
+        "Seed:      {rows} rows × {cols} cols (key field '{key_field}')  |  ticks: delta_publish @ {publish_rate:.0}/s"
+    );
+    println!(
+        "Subscribers: fast={n_fast}  conflated={n_conflated}  slow={n_slow} (read delay {slow_delay_ms}ms)"
+    );
+
+    // ---- seed --------------------------------------------------------
+    let seeder = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| format!("seeder connect {}", cfg.server_url))?;
+    let per_row_bytes =
+        serde_json::to_vec(&soak_wide_row(key_field, 0, cols)).map(|v| v.len()).unwrap_or(0);
+    const FRAME_TARGET: usize = 8 * 1024 * 1024;
+    let batch_size = (FRAME_TARGET / per_row_bytes.max(1)).clamp(1, 500);
+    let seed_start = Instant::now();
+    let mut batch: Vec<serde_json::Value> = Vec::with_capacity(batch_size);
+    for r in 0..rows as u64 {
+        batch.push(soak_wide_row(key_field, r, cols));
+        if batch.len() == batch_size {
+            seeder
+                .publish_batch(&cfg.topic, std::mem::take(&mut batch))
+                .await
+                .with_context(|| "soak seed publish_batch failed")?;
+            batch = Vec::with_capacity(batch_size);
+        }
+    }
+    if !batch.is_empty() {
+        seeder.publish_batch(&cfg.topic, batch).await?;
+    }
+    println!(
+        "Seed done: {rows} rows in {:.2}s (~{} B/row)",
+        seed_start.elapsed().as_secs_f64(),
+        per_row_bytes,
+    );
+
+    // ---- hold the 3 subscriber classes open for the whole run --------
+    let stop = Arc::new(AtomicBool::new(false));
+    let fast_counters = Arc::new(SoakClassCounters::new("fast"));
+    let conflated_counters = Arc::new(SoakClassCounters::new("conflated"));
+    let slow_counters = Arc::new(SoakClassCounters::new("slow"));
+
+    let mut sub_handles = Vec::with_capacity(n_fast + n_conflated + n_slow);
+    for i in 0..n_fast {
+        sub_handles.push(tokio::spawn(run_soak_subscriber(
+            i,
+            cfg.server_url.clone(),
+            cfg.topic.clone(),
+            Duration::ZERO,
+            fast_counters.clone(),
+            stop.clone(),
+        )));
+    }
+    for i in 0..n_conflated {
+        sub_handles.push(tokio::spawn(run_soak_subscriber(
+            i,
+            cfg.server_url.clone(),
+            cfg.topic.clone(),
+            Duration::ZERO,
+            conflated_counters.clone(),
+            stop.clone(),
+        )));
+    }
+    let slow_delay = Duration::from_millis(slow_delay_ms);
+    for i in 0..n_slow {
+        sub_handles.push(tokio::spawn(run_soak_subscriber(
+            i,
+            cfg.server_url.clone(),
+            cfg.topic.clone(),
+            slow_delay,
+            slow_counters.clone(),
+            stop.clone(),
+        )));
+    }
+
+    // Let every subscriber finish connecting + draining the seed snapshot
+    // before the live publisher starts, so early ticks don't race
+    // registration and bias the first progress readout.
+    let ramp_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let opened = fast_counters.subs_opened.load(Ordering::Relaxed)
+            + conflated_counters.subs_opened.load(Ordering::Relaxed)
+            + slow_counters.subs_opened.load(Ordering::Relaxed);
+        let failed = fast_counters.subs_failed.load(Ordering::Relaxed)
+            + conflated_counters.subs_failed.load(Ordering::Relaxed)
+            + slow_counters.subs_failed.load(Ordering::Relaxed);
+        if opened + failed >= (n_fast + n_conflated + n_slow) as u64 {
+            break;
+        }
+        if Instant::now() >= ramp_deadline {
+            println!("  warning: not all soak subscribers registered before ramp deadline");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // ---- live publisher: sparse delta_publish ticks -------------------
+    let pub_client = Client::connect(&cfg.server_url)
+        .await
+        .with_context(|| "soak live publisher connect")?;
+    let admin_hostport = cfg
+        .admin_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string();
+    let admin = cq_client::admin::AdminClient::new(&admin_hostport).ok();
+
+    let mut limiter = RateLimiter::new(publish_rate);
+    let mut ack_hist = LatencyHistogram::new();
+    let started = Instant::now();
+    let deadline = started + cfg.duration;
+    let mut last_progress = started;
+    let mut seed_rng: u64 = 0x9E3779B97F4A7C15;
+    let mut issued: u64 = 0;
+    let mut acked: u64 = 0;
+    let mut errors: u64 = 0;
+
+    // Ctrl-C / SIGTERM (e.g. `docker stop`) should still print a summary
+    // instead of the process just vanishing mid-soak — long-running soaks
+    // are exactly the case where an operator wants the final numbers.
+    tokio::pin! {
+        let ctrl_c = tokio::signal::ctrl_c();
+    }
+
+    while Instant::now() < deadline {
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                println!("  received interrupt — stopping soak early");
+                break;
+            }
+            _ = limiter.tick() => {
+                seed_rng ^= seed_rng << 13;
+                seed_rng ^= seed_rng >> 7;
+                seed_rng ^= seed_rng << 17;
+                let key = seed_rng % rows as u64;
+                let now_us = started.elapsed().as_micros() as u64;
+                let body = json!({
+                    key_field: format!("SOAK-{key:08}"),
+                    "c1": issued,
+                    "_t": now_us,
+                });
+                let t0 = Instant::now();
+                match pub_client.delta_publish(&cfg.topic, body).await {
+                    Ok(_) => {
+                        ack_hist.record(t0.elapsed());
+                        acked += 1;
+                    }
+                    Err(e) => {
+                        if errors < 5 {
+                            eprintln!("soak delta_publish error at issued={issued}: {e}");
+                        }
+                        errors += 1;
+                    }
+                }
+                issued += 1;
+            }
+        }
+
+        if last_progress.elapsed() >= Duration::from_secs(progress_secs) {
+            let rss = if let Some(a) = &admin {
+                read_rss_subs(a).await.map(|(r, _)| r).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            println!(
+                "  [{:>5.0}s] published={issued} acked={acked} errors={errors}  fast_delivered={} conflated_delivered={} slow_delivered={}  rss={:.0}MB",
+                started.elapsed().as_secs_f64(),
+                fast_counters.delivered.load(Ordering::Relaxed),
+                conflated_counters.delivered.load(Ordering::Relaxed),
+                slow_counters.delivered.load(Ordering::Relaxed),
+                rss,
+            );
+            last_progress = Instant::now();
+        }
+    }
+
+    // Let tail deltas land, then stop subscribers.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.store(true, Ordering::Relaxed);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::join_all(sub_handles),
+    )
+    .await;
+
+    let elapsed = started.elapsed();
+    let fast_delivered = fast_counters.delivered.load(Ordering::Relaxed);
+    let conflated_delivered = conflated_counters.delivered.load(Ordering::Relaxed);
+    let slow_delivered = slow_counters.delivered.load(Ordering::Relaxed);
+    println!("──────────────────────────────────────────────────");
+    println!("Soak summary");
+    println!("Duration:  {:.1}s (target {:.0}s)", elapsed.as_secs_f64(), cfg.duration.as_secs_f64());
+    println!(
+        "Publish:   issued={issued} acked={acked} errors={errors}  actual_rate={:.1}/s",
+        limiter.actual_rate()
+    );
+    println!(
+        "Ack lat:   p50={}µs p99={}µs",
+        ack_hist.p50().as_micros(),
+        ack_hist.p99().as_micros()
+    );
+    for c in [&fast_counters, &conflated_counters, &slow_counters] {
+        let opened = c.subs_opened.load(Ordering::Relaxed);
+        let failed = c.subs_failed.load(Ordering::Relaxed);
+        let delivered = c.delivered.load(Ordering::Relaxed);
+        let lag = acked.saturating_sub(delivered);
+        println!(
+            "Class {:>10}: subs opened={opened} failed={failed}  delivered={delivered}  lag_vs_acked={lag}",
+            c.class,
+        );
+    }
+    if slow_delivered < fast_delivered {
+        println!(
+            "  slow class trails fast by {} deltas — slow-consumer path exercised as expected",
+            fast_delivered.saturating_sub(slow_delivered)
+        );
+    }
+    if conflated_delivered > 0 && conflated_delivered < acked {
+        println!(
+            "  conflated class saw {conflated_delivered} deltas vs {acked} acked publishes — conflation coalescing observed"
+        );
+    }
+    println!("──────────────────────────────────────────────────");
+    Ok(())
 }
 
 async fn read_rss_subs(admin: &cq_client::admin::AdminClient) -> Result<(f64, u64)> {

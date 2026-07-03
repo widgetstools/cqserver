@@ -10,10 +10,12 @@
 #   cqserver     :8085 admin/metrics/ui   :9007 tcp   :9008 ws
 #                persistent Atlas-shaped topics, checkpoint_interval_secs
 #                set so the txlog stays disk-bounded across the whole soak
-#   load-driver  no exposed ports; placeholder in B1 (sleep loop hitting
-#                cqserver's /healthz). B2 replaces `command:` with the
-#                real soak driver — same service, same network, so the
-#                swap is a one-line diff.
+#   load-driver  no exposed ports; runs `cq-loadgen --scenario soak`
+#                (Dockerfile.loadgen) against cqserver:9007/:8085 — seeds
+#                wide /positions rows, then ticks delta_publish while
+#                holding 3 subscriber classes (fast / conflated / slow)
+#                open for the whole run (task B2). Overridable via the
+#                SOAK_* env vars below or by overriding `command:`.
 #   prometheus   :9090, scrapes cqserver:8085/metrics every 10s per
 #                prometheus-soak.yml
 #
@@ -70,31 +72,51 @@ services:
       start_period: 5s
       retries: 20
 
-  # Placeholder for B2 — the real soak load driver. Kept on the same
-  # runtime image + network so B2 only needs to change `command:`
-  # (and, if it ships as a separate binary, `entrypoint:`) without
-  # touching topology, networking, or the cqserver service.
+  # B2 — the real soak load driver: cq-loadgen's `soak` scenario. Same
+  # network as B1's placeholder so no topology changes were needed; only
+  # `image`/`build`/`command` changed. SOAK_* env vars override the
+  # workload shape without editing this file (e.g. `SOAK_DURATION_SECS=3600
+  # docker compose -f docker-compose.soak.yml up load-driver`); `command:`
+  # itself can also be overridden per the usual compose semantics.
   load-driver:
     container_name: cq-soak-load-driver
-    image: cqserver:local
+    image: cq-loadgen:local
+    build:
+      context: ../..
+      dockerfile: tests/cloud/Dockerfile.loadgen
     networks:
       cq-soak: {}
     depends_on:
       cqserver:
         condition: service_healthy
+    environment:
+      SOAK_DURATION_SECS: "${SOAK_DURATION_SECS:-60}"
+      SOAK_RATE: "${SOAK_RATE:-50}"
+      SOAK_ROWS: "${SOAK_ROWS:-2000}"
+      SOAK_COLS: "${SOAK_COLS:-60}"
+      SOAK_FAST_SUBSCRIBERS: "${SOAK_FAST_SUBSCRIBERS:-2}"
+      SOAK_CONFLATED_SUBSCRIBERS: "${SOAK_CONFLATED_SUBSCRIBERS:-2}"
+      SOAK_SLOW_SUBSCRIBERS: "${SOAK_SLOW_SUBSCRIBERS:-1}"
+      SOAK_SLOW_READ_DELAY_MS: "${SOAK_SLOW_READ_DELAY_MS:-300}"
+      SOAK_PROGRESS_INTERVAL_SECS: "${SOAK_PROGRESS_INTERVAL_SECS:-10}"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo "[load-driver] placeholder (B1) — B2 replaces this command with the real soak driver.";
-        while true; do
-          if curl -fsS http://cqserver:8085/healthz >/dev/null 2>&1; then
-            echo "[load-driver] $(date -u +%FT%TZ) cqserver healthy";
-          else
-            echo "[load-driver] $(date -u +%FT%TZ) cqserver NOT healthy";
-          fi
-          sleep 30
-        done
-    restart: unless-stopped
+        exec /usr/local/bin/cq-loadgen \
+          --server tcp://cqserver:9007 \
+          --admin-url http://cqserver:8085 \
+          --topic /positions \
+          --scenario soak \
+          --rate "$$SOAK_RATE" \
+          --duration-secs "$$SOAK_DURATION_SECS" \
+          --rows "$$SOAK_ROWS" \
+          --cols "$$SOAK_COLS" \
+          --soak-fast-subscribers "$$SOAK_FAST_SUBSCRIBERS" \
+          --soak-conflated-subscribers "$$SOAK_CONFLATED_SUBSCRIBERS" \
+          --soak-slow-subscribers "$$SOAK_SLOW_SUBSCRIBERS" \
+          --soak-slow-read-delay-ms "$$SOAK_SLOW_READ_DELAY_MS" \
+          --soak-progress-interval-secs "$$SOAK_PROGRESS_INTERVAL_SECS"
+    restart: "no"
 
   prometheus:
     container_name: cq-soak-prometheus

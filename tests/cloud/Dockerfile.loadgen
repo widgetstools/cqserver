@@ -1,0 +1,28 @@
+# Thin runtime image for cq-loadgen — CLOUD_REPLICATION_TEST_WORKLOG Bucket B,
+# task B2 (soak load driver).
+#
+# Same pattern as Dockerfile.runtime: doesn't build the binary itself,
+# expects `target/release/cq-loadgen` to already exist for
+# linux/amd64 — the Makefile / SOAK.md build step produces it (see the
+# cross-compile note in SOAK.md for building it from a macOS host via
+# `rust:1-bookworm`, since Dockerfile.runtime's "build on host" shortcut
+# only works when the host toolchain already targets the container's
+# platform).
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r cq && useradd -r -g cq -d /var/lib/cqloadgen -s /sbin/nologin cq \
+    && mkdir -p /var/lib/cqloadgen \
+    && chown -R cq:cq /var/lib/cqloadgen
+
+COPY --chown=cq:cq target/release/cq-loadgen /usr/local/bin/cq-loadgen
+RUN chmod 0755 /usr/local/bin/cq-loadgen
+
+USER cq
+WORKDIR /var/lib/cqloadgen
+
+ENTRYPOINT ["/usr/local/bin/cq-loadgen"]
