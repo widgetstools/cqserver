@@ -9,14 +9,25 @@
 //!    over the window excluding the first ~10% (warmup), FAIL if the
 //!    fitted slope implies growth beyond a configurable MB/hour
 //!    threshold (a leak).
-//! 2. **Delta drops bounded** — `cq_deltas_dropped_total` vs
-//!    `cq_deltas_delivered_total`. The slow-consumer policy *causes*
-//!    some drops by design (see `crates/cq-transport/src/delivery.rs`),
-//!    so the check is that the drop ratio over the window stays under
-//!    a configurable threshold, not that drops are zero.
-//!    `cq_deltas_dropped_total` is a Prometheus counter that only
-//!    appears after its first increment, so an absent series means
-//!    zero drops occurred — treated as a PASS, not an error.
+//! 2. **Drops bounded (both routes)** — (`cq_deltas_dropped_total` +
+//!    `cq_subscription_dropped_total`) vs `cq_deltas_delivered_total`.
+//!    The direct (non-conflated) route drops via
+//!    `cq_deltas_dropped_total` (see
+//!    `crates/cq-transport/src/delivery.rs`); any topic with
+//!    `conflation_ms` set (e.g. `/positions`, the soak's primary topic)
+//!    drops via the differently-named `cq_subscription_dropped_total`
+//!    instead (see `crates/cq-transport/src/session.rs`) — the
+//!    conflator's flush loop returns before
+//!    `cq_deltas_dropped_total`/`cq_deltas_delivered_total` are ever
+//!    touched, so checking only the deltas counter would be a
+//!    near-no-op for the shipped conflated topology. The slow-consumer
+//!    policy *causes* some drops by design on both routes, so the
+//!    check is that the summed drop ratio over the window stays under
+//!    a configurable threshold, not that drops are zero. Both counters
+//!    are Prometheus counters that only appear after their first
+//!    increment, so an absent series (on either route) means zero
+//!    drops occurred on that route — treated as a PASS contribution,
+//!    not an error.
 //! 3. **Txlog bounded** — asserts an actual bounded *byte count*, not
 //!    just activity: `cq_txlog_bytes` (a per-topic on-disk-size gauge,
 //!    summed across topics) is linear-fit over the window the same way
@@ -303,43 +314,70 @@ pub fn check_rss_slope(rss_series: &[Sample], thresholds: &Thresholds) -> Criter
     )
 }
 
-/// Criterion 2: delta drops bounded relative to delivered volume.
+/// Criterion 2: drops bounded relative to delivered volume, across
+/// BOTH drop routes.
 ///
-/// Both series are Prometheus counters (monotonic); this function
-/// takes the `last - first` delta over the window for each and
-/// computes `dropped_delta / max(delivered_delta, 1)`. Slow-consumer
-/// drops are expected and healthy — the check is a *ratio* threshold,
-/// not zero-drops.
+/// The server has two independent, differently-named drop counters
+/// depending on the topic's delivery path:
 ///
-/// `cq_deltas_dropped_total` is a Prometheus counter that the server
-/// only starts exporting after its first increment (see
-/// `crates/cq-transport/src/delivery.rs`) — a counter simply isn't
-/// registered until something bumps it. So an EMPTY `dropped_series`
-/// is the expected, healthy shape of "zero drops happened in the
-/// window," not an error: it's treated as a dropped_delta of 0 and the
-/// ratio check proceeds (and passes, since 0/delivered <= any
-/// threshold). Only an empty `delivered_series` — which should always
-/// be present once any publish has happened — degrades the result,
-/// and even then only to a soft "insufficient data" note rather than a
-/// hard FAIL, since a soak window with literally no delivered samples
-/// yet (e.g. queried too early) isn't itself proof of a problem.
+/// - `cq_deltas_dropped_total` — the direct (non-conflated) route,
+///   incremented in `crates/cq-transport/src/delivery.rs`.
+/// - `cq_subscription_dropped_total` — the conflated route (any topic
+///   with `conflation_ms` set, e.g. `/positions`, the soak's primary
+///   topic), incremented in `crates/cq-transport/src/session.rs`. The
+///   conflator's `try_submit_to_conflator` call returns *before*
+///   `cq_deltas_delivered_total`/`cq_deltas_dropped_total` are ever
+///   touched, so a conflated topic's drops are entirely invisible to
+///   `cq_deltas_dropped_total` — checking only that counter would be a
+///   near-no-op for the shipped conflated topology, reporting 0 drops
+///   even while the conflated path sheds load.
+///
+/// This function sums both counters' window deltas into a single
+/// `total_dropped` and divides by `delivered_delta` (from
+/// `cq_deltas_delivered_total` — the only delivered counter the server
+/// exports; there is no conflated/subscription-route "delivered"
+/// counter to sum in, so this remains the best available denominator
+/// even though it under-counts conflated-route delivered volume).
+/// Slow-consumer drops are expected and healthy — the check is a
+/// *ratio* threshold, not zero-drops.
+///
+/// Both `cq_deltas_dropped_total` and `cq_subscription_dropped_total`
+/// are Prometheus counters that the server only starts exporting after
+/// their first increment — a counter simply isn't registered until
+/// something bumps it. So an EMPTY series for either is the expected,
+/// healthy shape of "zero drops happened on that route in the window,"
+/// not an error: each is treated as a delta of 0 independently, and
+/// the ratio check proceeds on whatever sum results (and passes if
+/// both are empty, since 0/delivered <= any threshold). Only an empty
+/// `delivered_series` — which should always be present once any
+/// publish has happened — degrades the result, and even then only to
+/// a soft "insufficient data" note rather than a hard FAIL, since a
+/// soak window with literally no delivered samples yet (e.g. queried
+/// too early) isn't itself proof of a problem.
 pub fn check_drop_ratio(
-    dropped_series: &[Sample],
+    deltas_dropped_series: &[Sample],
+    subscription_dropped_series: &[Sample],
     delivered_series: &[Sample],
     thresholds: &Thresholds,
 ) -> CriterionResult {
-    const NAME: &str = "delta_drop_ratio";
+    const NAME: &str = "drop_ratio";
     if delivered_series.is_empty() {
         return CriterionResult::new(NAME, "no samples", "n/a", false).with_note(
             "cq_deltas_delivered_total absent — insufficient data (expected once delta_publish \
              has happened; dropped-but-not-delivered would be unusual this early in a soak)",
         );
     }
-    let dropped_delta = if dropped_series.is_empty() {
+    let deltas_dropped_delta = if deltas_dropped_series.is_empty() {
         0.0
     } else {
-        counter_delta(dropped_series)
+        counter_delta(deltas_dropped_series)
     };
+    let subscription_dropped_delta = if subscription_dropped_series.is_empty() {
+        0.0
+    } else {
+        counter_delta(subscription_dropped_series)
+    };
+    let dropped_delta = deltas_dropped_delta + subscription_dropped_delta;
     let delivered_delta = counter_delta(delivered_series);
     let ratio = dropped_delta / delivered_delta.max(1.0);
     let pass = ratio <= thresholds.max_drop_ratio;
@@ -347,16 +385,28 @@ pub fn check_drop_ratio(
     let mut result = CriterionResult::new(
         NAME,
         format!(
-            "{:.4} (dropped={:.0}, delivered={:.0})",
-            ratio, dropped_delta, delivered_delta
+            "{:.4} (dropped={:.0} [deltas={:.0} subscription={:.0}], delivered={:.0})",
+            ratio, dropped_delta, deltas_dropped_delta, subscription_dropped_delta, delivered_delta
         ),
         format!("<= {:.4}", thresholds.max_drop_ratio),
         pass,
     );
-    if dropped_series.is_empty() {
-        result.note = "cq_deltas_dropped_total absent — the counter isn't registered until its \
-                       first increment, so this is treated as zero drops (healthy), not an error"
-            .to_string();
+    if deltas_dropped_series.is_empty() || subscription_dropped_series.is_empty() {
+        let absent = match (
+            deltas_dropped_series.is_empty(),
+            subscription_dropped_series.is_empty(),
+        ) {
+            (true, true) => "cq_deltas_dropped_total and cq_subscription_dropped_total are both",
+            (true, false) => "cq_deltas_dropped_total is",
+            (false, true) => "cq_subscription_dropped_total is",
+            (false, false) => unreachable!(),
+        };
+        result.note = format!(
+            "{absent} absent — a counter isn't registered until its first increment, so this is \
+             treated as zero drops on that route (healthy), not an error. Covers both the \
+             direct-delta route (cq_deltas_dropped_total) and the conflated/subscription route \
+             (cq_subscription_dropped_total, e.g. /positions)."
+        );
     }
     result
 }
@@ -522,7 +572,8 @@ pub fn check_p99_publish_latency(
 #[allow(clippy::too_many_arguments)]
 pub fn analyze(
     rss_series: &[Sample],
-    dropped_series: &[Sample],
+    deltas_dropped_series: &[Sample],
+    subscription_dropped_series: &[Sample],
     delivered_series: &[Sample],
     checkpoint_series: &[Sample],
     reclaimed_series: &[Sample],
@@ -533,7 +584,12 @@ pub fn analyze(
     SoakReport {
         criteria: vec![
             check_rss_slope(rss_series, thresholds),
-            check_drop_ratio(dropped_series, delivered_series, thresholds),
+            check_drop_ratio(
+                deltas_dropped_series,
+                subscription_dropped_series,
+                delivered_series,
+                thresholds,
+            ),
             check_txlog_bounded(
                 checkpoint_series,
                 reclaimed_series,
@@ -716,7 +772,7 @@ pub async fn run(cfg: &AnalyzeConfig) -> Result<SoakReport> {
     )
     .await
     .context("fetching cq_process_rss_bytes")?;
-    let dropped = fetch_range(
+    let deltas_dropped = fetch_range(
         &client,
         &cfg.prometheus_url,
         "sum(cq_deltas_dropped_total)",
@@ -724,6 +780,22 @@ pub async fn run(cfg: &AnalyzeConfig) -> Result<SoakReport> {
     )
     .await
     .context("fetching cq_deltas_dropped_total")?;
+    // Conflated topics (any topic with `conflation_ms` set, e.g.
+    // `/positions` — the soak's primary topic) drop via a differently
+    // named counter: the conflator's flush loop
+    // (`crates/cq-transport/src/session.rs`) returns before
+    // `cq_deltas_dropped_total`/`cq_deltas_delivered_total` are ever
+    // touched, so its drops only show up here. Without this,
+    // `check_drop_ratio` would be a near-no-op for the shipped
+    // conflated topology.
+    let subscription_dropped = fetch_range(
+        &client,
+        &cfg.prometheus_url,
+        "sum(cq_subscription_dropped_total)",
+        cfg.window,
+    )
+    .await
+    .context("fetching cq_subscription_dropped_total")?;
     let delivered = fetch_range(
         &client,
         &cfg.prometheus_url,
@@ -777,7 +849,8 @@ pub async fn run(cfg: &AnalyzeConfig) -> Result<SoakReport> {
 
     Ok(analyze(
         &rss,
-        &dropped,
+        &deltas_dropped,
+        &subscription_dropped,
         &delivered,
         &checkpoints,
         &reclaimed,
@@ -885,7 +958,7 @@ mod tests {
         let dropped: Vec<Sample> = (0..10)
             .map(|i| (i as f64 * 10.0, i as f64 * 10.0))
             .collect();
-        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        let result = check_drop_ratio(&dropped, &[], &delivered, &thresholds());
         assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
     }
 
@@ -899,7 +972,7 @@ mod tests {
         let dropped: Vec<Sample> = (0..10)
             .map(|i| (i as f64 * 10.0, i as f64 * 950.0))
             .collect();
-        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        let result = check_drop_ratio(&dropped, &[], &delivered, &thresholds());
         assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
     }
 
@@ -909,7 +982,7 @@ mod tests {
             .map(|i| (i as f64 * 10.0, i as f64 * 1000.0))
             .collect();
         let dropped: Vec<Sample> = (0..10).map(|i| (i as f64 * 10.0, 0.0)).collect();
-        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        let result = check_drop_ratio(&dropped, &[], &delivered, &thresholds());
         assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
     }
 
@@ -925,7 +998,7 @@ mod tests {
             .map(|i| (i as f64 * 10.0, i as f64 * 1000.0))
             .collect();
         let dropped: Vec<Sample> = Vec::new(); // absent — no drops ever happened.
-        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        let result = check_drop_ratio(&dropped, &[], &delivered, &thresholds());
         assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
         assert!(
             result.measured.contains("dropped=0"),
@@ -948,13 +1021,102 @@ mod tests {
     fn absent_delivered_counter_is_insufficient_data() {
         let delivered: Vec<Sample> = Vec::new();
         let dropped: Vec<Sample> = Vec::new();
-        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        let result = check_drop_ratio(&dropped, &[], &delivered, &thresholds());
         assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
         assert!(
             result.note.to_lowercase().contains("insufficient"),
             "expected an insufficient-data note: {:?}",
             result
         );
+    }
+
+    /// The load-bearing regression this fix exists for: topics with
+    /// `conflation_ms` set (e.g. `/positions`, the soak's primary topic)
+    /// drop via `cq_subscription_dropped_total`, NOT
+    /// `cq_deltas_dropped_total` — the conflator path
+    /// (`crates/cq-transport/src/session.rs`) returns before
+    /// `cq_deltas_delivered_total`/`cq_deltas_dropped_total` are ever
+    /// touched. If `cq_deltas_dropped_total` is absent (as it would be
+    /// for an all-conflated soak) but `cq_subscription_dropped_total` is
+    /// climbing, the ratio must reflect that — not silently read as
+    /// zero drops.
+    #[test]
+    fn subscription_dropped_only_computes_correct_ratio() {
+        let delivered: Vec<Sample> = (0..10)
+            .map(|i| (i as f64 * 10.0, i as f64 * 1000.0))
+            .collect();
+        // cq_deltas_dropped_total: absent (conflated route never
+        // increments it).
+        let deltas_dropped: Vec<Sample> = Vec::new();
+        // cq_subscription_dropped_total: climbs to 200 by the end — 200 /
+        // 9000 delivered =~ 0.022, under the 5% default threshold, so
+        // this should PASS, but on a *nonzero, correctly computed*
+        // ratio, not a vacuous 0/9000.
+        let subscription_dropped: Vec<Sample> = (0..10)
+            .map(|i| (i as f64 * 10.0, i as f64 * 20.0))
+            .collect();
+        let result = check_drop_ratio(
+            &deltas_dropped,
+            &subscription_dropped,
+            &delivered,
+            &thresholds(),
+        );
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+        assert!(
+            result.measured.contains("dropped=180"),
+            "expected the subscription-dropped delta (180, i.e. 9*20) to be counted, not read as \
+             zero: {:?}",
+            result
+        );
+    }
+
+    /// Both drop counters absent (nothing ever dropped, on either route)
+    /// must still be a healthy PASS at ratio 0 — the "absent counter =
+    /// 0, not error" semantics apply to `cq_subscription_dropped_total`
+    /// exactly as they already do for `cq_deltas_dropped_total`.
+    #[test]
+    fn both_drop_counters_absent_treated_as_zero_passes() {
+        let delivered: Vec<Sample> = (0..10)
+            .map(|i| (i as f64 * 10.0, i as f64 * 1000.0))
+            .collect();
+        let deltas_dropped: Vec<Sample> = Vec::new();
+        let subscription_dropped: Vec<Sample> = Vec::new();
+        let result = check_drop_ratio(
+            &deltas_dropped,
+            &subscription_dropped,
+            &delivered,
+            &thresholds(),
+        );
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+        assert!(
+            result.measured.contains("dropped=0"),
+            "expected dropped=0 in measured value: {:?}",
+            result
+        );
+    }
+
+    /// Runaway `cq_subscription_dropped_total` alone (deltas-dropped
+    /// stays at zero/absent the whole time — an all-conflated soak)
+    /// must FAIL. This is the shape a real shedding conflated topology
+    /// would produce, and is exactly what the pre-fix analyzer would
+    /// have missed (it only looked at `cq_deltas_dropped_total`).
+    #[test]
+    fn runaway_subscription_drops_alone_fail() {
+        let delivered: Vec<Sample> = (0..10)
+            .map(|i| (i as f64 * 10.0, i as f64 * 1000.0))
+            .collect();
+        let deltas_dropped: Vec<Sample> = Vec::new();
+        // Grows just as fast as delivered => ratio ~1.0, way over 5%.
+        let subscription_dropped: Vec<Sample> = (0..10)
+            .map(|i| (i as f64 * 10.0, i as f64 * 950.0))
+            .collect();
+        let result = check_drop_ratio(
+            &deltas_dropped,
+            &subscription_dropped,
+            &delivered,
+            &thresholds(),
+        );
+        assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
     }
 
     #[test]
@@ -970,7 +1132,7 @@ mod tests {
             (30.0, 4000.0),
         ];
         let dropped: Vec<Sample> = vec![(0.0, 10.0), (10.0, 20.0), (20.0, 0.0), (30.0, 10.0)];
-        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        let result = check_drop_ratio(&dropped, &[], &delivered, &thresholds());
         // delivered_delta = 3000 + 1000 + 3000 = 7000; dropped_delta = 10 + 0(reset->0 counted as 0) + 10 = 20
         // ratio well under 5%.
         assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
@@ -1238,6 +1400,7 @@ mod tests {
         let report = analyze(
             &rss,
             &dropped,
+            &[],
             &delivered,
             &checkpoints,
             &reclaimed,
@@ -1271,6 +1434,7 @@ mod tests {
         let report = analyze(
             &rss,
             &dropped,
+            &[],
             &delivered,
             &checkpoints,
             &reclaimed,

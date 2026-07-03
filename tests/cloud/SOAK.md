@@ -169,7 +169,7 @@ PASS/FAIL with measured value + threshold:
 | criterion | metric(s) | what FAILs it |
 |---|---|---|
 | `rss_slope` | `cq_process_rss_bytes` | linear-fit slope (after excluding the first 10% of the window as warmup) implies growth beyond `--soak-analyze-max-rss-growth-mb-per-hour` (default 50 MB/hour) — a leak |
-| `delta_drop_ratio` | `cq_deltas_dropped_total`, `cq_deltas_delivered_total` | dropped/delivered ratio over the window exceeds `--soak-analyze-max-drop-ratio` (default 0.05). The slow-consumer class is *expected* to cause some drops — this bounds them, it doesn't require zero |
+| `drop_ratio` | `cq_deltas_dropped_total`, `cq_subscription_dropped_total`, `cq_deltas_delivered_total` | (deltas-route drops + conflated/subscription-route drops) / delivered ratio over the window exceeds `--soak-analyze-max-drop-ratio` (default 0.05). Covers both drop counters: `cq_deltas_dropped_total` for the direct (non-conflated) route and `cq_subscription_dropped_total` for the conflated route (any topic with `conflation_ms` set, e.g. `/positions` — the soak's primary topic). The conflator (`crates/cq-transport/src/session.rs`) never touches `cq_deltas_dropped_total`/`cq_deltas_delivered_total`, so checking only the deltas counter would be a near-no-op for the shipped conflated topology. The slow-consumer class is *expected* to cause some drops — this bounds them, it doesn't require zero |
 | `txlog_bounded` | `cq_txlog_bytes` (per-topic on-disk-size gauge, summed), `cq_txlog_checkpoint_total`, `cq_txlog_segments_reclaimed_total` | linear-fit slope of `cq_txlog_bytes` (after excluding the first 10% of the window as warmup) implies growth beyond `--soak-analyze-max-txlog-growth-mb-per-hour` (default 50 MB/hour) — reclaim is losing the race against the write rate, so disk grows unboundedly — **or** no checkpoints fired, or no segments were ever reclaimed, over the window (activity check, kept as a complementary signal) |
 | `p99_publish_latency` | `cq_publish_latency_us` (`histogram_quantile(0.99, ...)`) | the worst p99 sample in the window exceeds `--soak-analyze-max-p99-latency-us` (default 50000 = 50ms) |
 
@@ -201,8 +201,10 @@ The verdict math (linear fit, drop ratio, checkpoint/reclaim presence,
 txlog byte-growth bound, p99 threshold) lives in
 `crates/cq-loadgen/src/soak_analyze.rs` as pure functions and is
 unit-tested against synthetic metric series (leaking RSS → FAIL, flat
-RSS → PASS, runaway drops → FAIL, bounded drops → PASS, no reclaim
-events → FAIL, reclaim events present → PASS, linearly-growing
+RSS → PASS, runaway drops → FAIL, bounded drops → PASS, drops via
+`cq_subscription_dropped_total` alone correctly ratio'd (not read as
+zero) → PASS/FAIL as appropriate, both drop counters absent → PASS,
+no reclaim events → FAIL, reclaim events present → PASS, linearly-growing
 `cq_txlog_bytes` → FAIL even with healthy checkpoint/reclaim activity,
 sawtooth/flat `cq_txlog_bytes` → PASS) — no live Prometheus needed for
 `cargo test -p cq-loadgen`.

@@ -197,8 +197,11 @@ struct Args {
     soak_analyze_warmup_fraction: f64,
 
     /// soak-analyze: max allowed ratio of dropped to delivered deltas
-    /// over the window before delta_drop_ratio FAILs. Slow-consumer
-    /// drops are expected — this bounds them, it doesn't require zero.
+    /// over the window before drop_ratio FAILs. Covers both the direct
+    /// delta route (cq_deltas_dropped_total) and the conflated/
+    /// subscription route (cq_subscription_dropped_total, e.g.
+    /// /positions). Slow-consumer drops are expected — this bounds
+    /// them, it doesn't require zero.
     #[arg(long, default_value_t = 0.05)]
     soak_analyze_max_drop_ratio: f64,
 
