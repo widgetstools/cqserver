@@ -14,6 +14,9 @@
 //!    some drops by design (see `crates/cq-transport/src/delivery.rs`),
 //!    so the check is that the drop ratio over the window stays under
 //!    a configurable threshold, not that drops are zero.
+//!    `cq_deltas_dropped_total` is a Prometheus counter that only
+//!    appears after its first increment, so an absent series means
+//!    zero drops occurred — treated as a PASS, not an error.
 //! 3. **Txlog bounded** — asserts an actual bounded *byte count*, not
 //!    just activity: `cq_txlog_bytes` (a per-topic on-disk-size gauge,
 //!    summed across topics) is linear-fit over the window the same way
@@ -30,8 +33,13 @@
 //!    distinct, actionable failure mode (reclaim runs but the write
 //!    rate outpaces it) from no-activity-at-all (checkpointing itself
 //!    is broken).
-//! 4. **p99 publish latency under target** — `cq_publish_latency_us`
-//!    histogram, `histogram_quantile(0.99, ...)` over the window, must
+//! 4. **p99 publish latency under target** — `cq_publish_latency_us`.
+//!    The server's Prometheus exporter is installed with no bucket
+//!    config, so this renders as a Prometheus *summary*
+//!    (`cq_publish_latency_us{quantile="0.99", ...}`), not a
+//!    `_bucket` histogram — the analyzer queries the exported
+//!    `quantile="0.99"` series directly (maxed across topics) rather
+//!    than `histogram_quantile(...)`, which would match nothing. Must
 //!    stay under a configurable microsecond target.
 //!
 //! The verdict math (linear fit, ratio/rate checks, threshold
@@ -302,22 +310,41 @@ pub fn check_rss_slope(rss_series: &[Sample], thresholds: &Thresholds) -> Criter
 /// computes `dropped_delta / max(delivered_delta, 1)`. Slow-consumer
 /// drops are expected and healthy — the check is a *ratio* threshold,
 /// not zero-drops.
+///
+/// `cq_deltas_dropped_total` is a Prometheus counter that the server
+/// only starts exporting after its first increment (see
+/// `crates/cq-transport/src/delivery.rs`) — a counter simply isn't
+/// registered until something bumps it. So an EMPTY `dropped_series`
+/// is the expected, healthy shape of "zero drops happened in the
+/// window," not an error: it's treated as a dropped_delta of 0 and the
+/// ratio check proceeds (and passes, since 0/delivered <= any
+/// threshold). Only an empty `delivered_series` — which should always
+/// be present once any publish has happened — degrades the result,
+/// and even then only to a soft "insufficient data" note rather than a
+/// hard FAIL, since a soak window with literally no delivered samples
+/// yet (e.g. queried too early) isn't itself proof of a problem.
 pub fn check_drop_ratio(
     dropped_series: &[Sample],
     delivered_series: &[Sample],
     thresholds: &Thresholds,
 ) -> CriterionResult {
     const NAME: &str = "delta_drop_ratio";
-    if dropped_series.is_empty() || delivered_series.is_empty() {
-        return CriterionResult::new(NAME, "no samples", "n/a", false)
-            .with_note("need cq_deltas_dropped_total and cq_deltas_delivered_total samples");
+    if delivered_series.is_empty() {
+        return CriterionResult::new(NAME, "no samples", "n/a", false).with_note(
+            "cq_deltas_delivered_total absent — insufficient data (expected once delta_publish \
+             has happened; dropped-but-not-delivered would be unusual this early in a soak)",
+        );
     }
-    let dropped_delta = counter_delta(dropped_series);
+    let dropped_delta = if dropped_series.is_empty() {
+        0.0
+    } else {
+        counter_delta(dropped_series)
+    };
     let delivered_delta = counter_delta(delivered_series);
     let ratio = dropped_delta / delivered_delta.max(1.0);
     let pass = ratio <= thresholds.max_drop_ratio;
 
-    CriterionResult::new(
+    let mut result = CriterionResult::new(
         NAME,
         format!(
             "{:.4} (dropped={:.0}, delivered={:.0})",
@@ -325,7 +352,13 @@ pub fn check_drop_ratio(
         ),
         format!("<= {:.4}", thresholds.max_drop_ratio),
         pass,
-    )
+    );
+    if dropped_series.is_empty() {
+        result.note = "cq_deltas_dropped_total absent — the counter isn't registered until its \
+                       first increment, so this is treated as zero drops (healthy), not an error"
+            .to_string();
+    }
+    result
 }
 
 /// Sum of positive increments across a counter series, handling
@@ -439,12 +472,25 @@ pub fn check_txlog_bounded(
 
 /// Criterion 4: p99 publish latency under target.
 ///
-/// `p99_series` is expected to already be `histogram_quantile(0.99,
-/// rate(cq_publish_latency_us_bucket[...]))` samples from Prometheus
-/// (the quantile math happens server-side in PromQL — see
-/// [`fetch_p99_publish_latency_us`]). This function just takes the max
-/// observed p99 across the window (the worst moment, which is what a
-/// soak gate cares about) and compares it to the target.
+/// `p99_series` is expected to already be the `quantile="0.99"` series
+/// of the exported `cq_publish_latency_us` metric, maxed across the
+/// `topic` label (see [`run`]'s PromQL). The server records
+/// `cq_publish_latency_us` via `metrics::histogram!`
+/// (`crates/cq-transport/src/router.rs`), but the Prometheus exporter
+/// (`crates/cq-server/src/main.rs`, `PrometheusBuilder::new()`) is
+/// built with no bucket configuration, so `metrics-exporter-prometheus`
+/// renders histograms as Prometheus *summaries* — i.e. it exports
+/// `cq_publish_latency_us{quantile="0.99", topic="..."}` (plus `_sum`
+/// / `_count`), NOT a `cq_publish_latency_us_bucket` series. A
+/// `histogram_quantile(0.99, rate(cq_publish_latency_us_bucket[...]))`
+/// query therefore matches nothing against this server; the quantile
+/// is already computed server-side into the `quantile` label, so this
+/// function just takes the max observed value across the window (the
+/// worst moment, which is what a soak gate cares about) and compares
+/// it to the target. `0.99` is one of the exporter's default quantiles
+/// (`[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]`, set in
+/// `PrometheusBuilder::new()`), so it's always present once any
+/// `delta_publish` has happened.
 pub fn check_p99_publish_latency(
     p99_series: &[Sample],
     thresholds: &Thresholds,
@@ -713,10 +759,18 @@ pub async fn run(cfg: &AnalyzeConfig) -> Result<SoakReport> {
     )
     .await
     .context("fetching cq_txlog_bytes")?;
-    // Server-side quantile: histogram_quantile needs the full bucket
-    // set, so compute it in PromQL rather than pulling every bucket
-    // series and refitting client-side.
-    let p99_query = "histogram_quantile(0.99, sum(rate(cq_publish_latency_us_bucket[1m])) by (le))";
+    // cq_publish_latency_us is recorded via metrics::histogram!, but the
+    // Prometheus exporter is installed with no bucket configuration
+    // (PrometheusBuilder::new() in crates/cq-server/src/main.rs), so
+    // metrics-exporter-prometheus renders it as a Prometheus *summary*:
+    // cq_publish_latency_us{quantile="0.99", topic="..."} (+ _sum/_count),
+    // not a cq_publish_latency_us_bucket series. There is no
+    // _bucket series for histogram_quantile() to consume, so the
+    // quantile is already computed server-side in the `quantile` label
+    // — query it directly and take the max across topics. 0.99 is one
+    // of the exporter's default quantiles, so it's always present once
+    // any delta_publish has happened.
+    let p99_query = "max(cq_publish_latency_us{quantile=\"0.99\"})";
     let p99 = fetch_range(&client, &cfg.prometheus_url, p99_query, cfg.window)
         .await
         .context("fetching cq_publish_latency_us p99")?;
@@ -857,6 +911,50 @@ mod tests {
         let dropped: Vec<Sample> = (0..10).map(|i| (i as f64 * 10.0, 0.0)).collect();
         let result = check_drop_ratio(&dropped, &delivered, &thresholds());
         assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+    }
+
+    /// The load-bearing regression this fix exists for: `cq_deltas_dropped_total`
+    /// is a Prometheus counter that Prometheus/the exporter only starts
+    /// serving after its first `increment()` call — zero drops in the
+    /// window means the series is entirely ABSENT, not present-with-zero
+    /// samples. An absent dropped series must be treated as zero drops
+    /// (PASS), never as a missing-metric FAIL or a crash.
+    #[test]
+    fn absent_dropped_counter_treated_as_zero_passes() {
+        let delivered: Vec<Sample> = (0..10)
+            .map(|i| (i as f64 * 10.0, i as f64 * 1000.0))
+            .collect();
+        let dropped: Vec<Sample> = Vec::new(); // absent — no drops ever happened.
+        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+        assert!(
+            result.measured.contains("dropped=0"),
+            "expected dropped=0 in measured value: {:?}",
+            result
+        );
+        assert!(
+            !result.note.is_empty(),
+            "expected a note explaining the absent counter: {:?}",
+            result
+        );
+    }
+
+    /// Complement: an absent `cq_deltas_delivered_total` (which should
+    /// normally always be present once any publish has happened) is a
+    /// distinct case — insufficient data, not a healthy zero. This must
+    /// degrade to a soft FAIL-with-note ("insufficient data"), not panic
+    /// or silently pass.
+    #[test]
+    fn absent_delivered_counter_is_insufficient_data() {
+        let delivered: Vec<Sample> = Vec::new();
+        let dropped: Vec<Sample> = Vec::new();
+        let result = check_drop_ratio(&dropped, &delivered, &thresholds());
+        assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
+        assert!(
+            result.note.to_lowercase().contains("insufficient"),
+            "expected an insufficient-data note: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1040,6 +1138,83 @@ mod tests {
         series.push((200.0, 200_000.0));
         let result = check_p99_publish_latency(&series, &thresholds());
         assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
+    }
+
+    /// The load-bearing regression this fix exists for: `cq_publish_latency_us`
+    /// is exported as a Prometheus *summary* (no bucket config on the
+    /// exporter — see `run`'s doc comment), so the analyzer queries
+    /// `max(cq_publish_latency_us{quantile="0.99"})` instead of
+    /// `histogram_quantile(0.99, rate(..._bucket[...]))`. This test feeds
+    /// a synthetic `query_range` JSON payload shaped exactly like what
+    /// Prometheus returns for that query — a single result series of
+    /// `[unix_ts, "string_value"]` pairs, the same shape `fetch_range`
+    /// parses via `PromRangeResponse` — through the real deserialization
+    /// path (no network) and confirms it produces the right p99 value
+    /// and passing verdict.
+    #[test]
+    fn summary_quantile_query_result_parses_into_p99_value() {
+        // Shaped exactly like a real Prometheus query_range response body
+        // for `max(cq_publish_latency_us{quantile="0.99"})`: values are
+        // [unix_ts, "string"] pairs, matching PromRangeResult.values.
+        let body = r#"{
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [
+                    {
+                        "metric": {},
+                        "values": [
+                            [1700000000.000, "1200.5"],
+                            [1700000010.000, "1350.0"],
+                            [1700000020.000, "980.25"],
+                            [1700000030.000, "NaN"]
+                        ]
+                    }
+                ]
+            }
+        }"#;
+
+        let parsed: PromRangeResponse =
+            serde_json::from_str(body).expect("synthetic payload must deserialize");
+        assert_eq!(parsed.status, "success");
+        let data = parsed.data.expect("data field must be present");
+        let first = data
+            .result
+            .into_iter()
+            .next()
+            .expect("one result series expected");
+
+        // Mirror fetch_range's own filter_map: parse to f64, skip
+        // non-finite (the "NaN" entry, matching a bucket/quantile with
+        // no samples yet).
+        let samples: Vec<Sample> = first
+            .values
+            .into_iter()
+            .filter_map(|(ts, v)| {
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(|f| (ts, f))
+            })
+            .collect();
+
+        assert_eq!(
+            samples,
+            vec![
+                (1700000000.0, 1200.5),
+                (1700000010.0, 1350.0),
+                (1700000020.0, 980.25),
+            ],
+            "NaN sample must be filtered out same as fetch_range does"
+        );
+
+        let result = check_p99_publish_latency(&samples, &thresholds());
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+        assert!(
+            result.measured.contains("1350"),
+            "expected max p99 value 1350us in measured output: {:?}",
+            result
+        );
     }
 
     // ---- full report / overall verdict -------------------------------------
