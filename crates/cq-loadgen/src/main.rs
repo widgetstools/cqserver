@@ -206,6 +206,13 @@ struct Args {
     /// before p99_publish_latency FAILs.
     #[arg(long, default_value_t = 50_000.0)]
     soak_analyze_max_p99_latency_us: f64,
+
+    /// soak-analyze: max allowed on-disk txlog growth after warmup
+    /// exclusion, in MB/hour, before the txlog_bounded criterion FAILs
+    /// (reclaim losing the race against the write rate — disk growing
+    /// unboundedly).
+    #[arg(long, default_value_t = 50.0)]
+    soak_analyze_max_txlog_growth_mb_per_hour: f64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -270,6 +277,7 @@ async fn main() -> Result<()> {
                 args.soak_analyze_warmup_fraction,
                 args.soak_analyze_max_drop_ratio,
                 args.soak_analyze_max_p99_latency_us,
+                args.soak_analyze_max_txlog_growth_mb_per_hour,
             );
             let report = run(&analyze_cfg).await?;
             print!("{}", report.render());

@@ -14,17 +14,22 @@
 //!    some drops by design (see `crates/cq-transport/src/delivery.rs`),
 //!    so the check is that the drop ratio over the window stays under
 //!    a configurable threshold, not that drops are zero.
-//! 3. **Txlog bounded** — `cq_txlog_checkpoint_total` must increase
-//!    over the window (checkpoints fired) AND
-//!    `cq_txlog_segments_reclaimed_total` must show at least one
-//!    reclaim (segments were actually freed), so disk sawtooths
-//!    instead of growing monotonically. There is currently no
-//!    txlog-bytes-on-disk gauge exported by the server (grepped
-//!    `crates/cq-server`, `crates/cq-txlog` — only the checkpoint/
-//!    reclaim/error counters and a lock-hold-time histogram exist), so
-//!    this criterion cannot directly assert a bounded byte count; a
-//!    node-exporter-style disk-usage gauge or a dedicated txlog-bytes
-//!    gauge is a follow-up if stronger proof is needed.
+//! 3. **Txlog bounded** — asserts an actual bounded *byte count*, not
+//!    just activity: `cq_txlog_bytes` (a per-topic on-disk-size gauge,
+//!    summed across topics) is linear-fit over the window the same way
+//!    as RSS (post-warmup exclusion), and FAILs if the fitted growth
+//!    rate exceeds a configurable MB/hour threshold — this is the
+//!    direct proof that reclaim is winning the race against the write
+//!    rate, not just that reclaim activity happened at all (a reclaim
+//!    that's losing the race — freeing less than is being written —
+//!    would still fire checkpoints and reclaim segments, so activity
+//!    alone can't tell the two cases apart). The pre-existing activity
+//!    checks (`cq_txlog_checkpoint_total` increased, at least one
+//!    `cq_txlog_segments_reclaimed_total` reclaim) are kept as
+//!    complementary signals: activity-with-unbounded-growth is a
+//!    distinct, actionable failure mode (reclaim runs but the write
+//!    rate outpaces it) from no-activity-at-all (checkpointing itself
+//!    is broken).
 //! 4. **p99 publish latency under target** — `cq_publish_latency_us`
 //!    histogram, `histogram_quantile(0.99, ...)` over the window, must
 //!    stay under a configurable microsecond target.
@@ -59,6 +64,12 @@ pub struct Thresholds {
     pub max_drop_ratio: f64,
     /// Max allowed p99 publish latency, in microseconds.
     pub max_p99_publish_latency_us: f64,
+    /// Max allowed on-disk txlog growth slope, in MB/hour, after warmup
+    /// exclusion (same fit approach as RSS). This is the direct
+    /// bounded-disk assertion: reclaim must free segments at least as
+    /// fast as the write rate adds them, or this fails even though
+    /// checkpoint/reclaim activity counters look healthy.
+    pub max_txlog_growth_mb_per_hour: f64,
 }
 
 impl Default for Thresholds {
@@ -68,6 +79,7 @@ impl Default for Thresholds {
             warmup_fraction: 0.10,
             max_drop_ratio: 0.05,
             max_p99_publish_latency_us: 50_000.0,
+            max_txlog_growth_mb_per_hour: 50.0,
         }
     }
 }
@@ -211,6 +223,49 @@ fn linear_fit(points: &[Sample]) -> (f64, f64) {
     (slope, intercept)
 }
 
+/// Shared warmup-exclusion + linear-fit step used by both the RSS-slope
+/// and txlog-byte-growth criteria: discard the first `warmup_fraction`
+/// of the window (by time span, not sample count) so startup ramp-up
+/// doesn't get mistaken for unbounded growth, then OLS-fit the rest and
+/// convert the slope from units/sec to MB/hour.
+///
+/// Returns `Err(CriterionResult)` (a ready-to-return failing result)
+/// when there aren't enough samples to fit; `Ok(slope_mb_per_hour)`
+/// otherwise.
+fn post_warmup_growth_mb_per_hour(
+    series: &[Sample],
+    warmup_fraction: f64,
+    name: &'static str,
+    insufficient_note: &str,
+    warmup_note: &str,
+) -> Result<f64, CriterionResult> {
+    if series.len() < 2 {
+        return Err(
+            CriterionResult::new(name, "insufficient samples", "n/a", false)
+                .with_note(insufficient_note),
+        );
+    }
+    let t0 = series.first().unwrap().0;
+    let t1 = series.last().unwrap().0;
+    let span = t1 - t0;
+    let warmup_cutoff = t0 + span * warmup_fraction;
+    let post_warmup: Vec<Sample> = series
+        .iter()
+        .copied()
+        .filter(|(t, _)| *t >= warmup_cutoff)
+        .collect();
+
+    if post_warmup.len() < 2 {
+        return Err(
+            CriterionResult::new(name, "insufficient post-warmup samples", "n/a", false)
+                .with_note(warmup_note),
+        );
+    }
+
+    let (slope_per_sec, _intercept) = linear_fit(&post_warmup);
+    Ok(slope_per_sec * 3600.0 / (1024.0 * 1024.0))
+}
+
 /// Criterion 1: RSS slope ≈ 0 after warmup exclusion.
 ///
 /// `rss_series` is `(timestamp_secs, rss_bytes)` samples across the
@@ -220,27 +275,16 @@ fn linear_fit(points: &[Sample]) -> (f64, f64) {
 /// mistaken for a leak.
 pub fn check_rss_slope(rss_series: &[Sample], thresholds: &Thresholds) -> CriterionResult {
     const NAME: &str = "rss_slope";
-    if rss_series.len() < 2 {
-        return CriterionResult::new(NAME, "insufficient samples", "n/a", false)
-            .with_note("need >= 2 cq_process_rss_bytes samples to fit a slope");
-    }
-    let t0 = rss_series.first().unwrap().0;
-    let t1 = rss_series.last().unwrap().0;
-    let span = t1 - t0;
-    let warmup_cutoff = t0 + span * thresholds.warmup_fraction;
-    let post_warmup: Vec<Sample> = rss_series
-        .iter()
-        .copied()
-        .filter(|(t, _)| *t >= warmup_cutoff)
-        .collect();
-
-    if post_warmup.len() < 2 {
-        return CriterionResult::new(NAME, "insufficient post-warmup samples", "n/a", false)
-            .with_note("window too short relative to warmup_fraction to fit a slope");
-    }
-
-    let (slope_bytes_per_sec, _intercept) = linear_fit(&post_warmup);
-    let slope_mb_per_hour = slope_bytes_per_sec * 3600.0 / (1024.0 * 1024.0);
+    let slope_mb_per_hour = match post_warmup_growth_mb_per_hour(
+        rss_series,
+        thresholds.warmup_fraction,
+        NAME,
+        "need >= 2 cq_process_rss_bytes samples to fit a slope",
+        "window too short relative to warmup_fraction to fit a slope",
+    ) {
+        Ok(v) => v,
+        Err(result) => return result,
+    };
     let pass = slope_mb_per_hour <= thresholds.max_rss_growth_mb_per_hour;
 
     CriterionResult::new(
@@ -306,15 +350,33 @@ fn counter_delta(series: &[Sample]) -> f64 {
     total
 }
 
-/// Criterion 3: txlog bounded via checkpoint + reclaim counters.
+/// Criterion 3: txlog bounded — a real byte-growth bound, plus
+/// complementary checkpoint/reclaim activity checks.
 ///
-/// No txlog-bytes-on-disk gauge exists in the server today (see module
-/// doc comment), so this asserts the two proxies that *do* exist:
-/// checkpoints fired at least once, and at least one reclaim event
-/// happened (segments were actually freed, not just checkpointed).
+/// `txlog_bytes_series` is `(timestamp_secs, total_bytes)` samples of
+/// `cq_txlog_bytes` (summed across topics — see [`run`]'s PromQL), the
+/// per-topic on-disk-size gauge the server emits on every checkpoint
+/// tick. This is fit the same way as RSS (warmup-excluded OLS slope,
+/// converted to MB/hour) and FAILs if the fitted growth rate exceeds
+/// `thresholds.max_txlog_growth_mb_per_hour` — the direct proof that
+/// disk is NOT growing unboundedly, which checkpoint/reclaim *activity*
+/// counters alone cannot prove (a reclaim that's losing the race to the
+/// write rate still fires checkpoints and frees segments each time, so
+/// activity-only would falsely PASS while disk climbs forever).
+///
+/// The pre-existing proxies are kept as a second, independent signal:
+/// checkpoints must have fired at least once over the window AND at
+/// least one reclaim event must have happened. This catches a distinct
+/// failure mode from the byte bound — checkpointing/reclaim itself
+/// broken/disabled — which a byte-growth fit alone might not catch on
+/// a short or slow-writing window (e.g. too little data written yet
+/// for the slope to look alarming, but reclaim never ran at all).
+/// Overall pass requires both the byte bound AND the activity checks.
 pub fn check_txlog_bounded(
     checkpoint_series: &[Sample],
     reclaimed_series: &[Sample],
+    txlog_bytes_series: &[Sample],
+    thresholds: &Thresholds,
 ) -> CriterionResult {
     const NAME: &str = "txlog_bounded";
     if checkpoint_series.is_empty() || reclaimed_series.is_empty() {
@@ -324,19 +386,54 @@ pub fn check_txlog_bounded(
     }
     let checkpoints = counter_delta(checkpoint_series);
     let reclaimed = counter_delta(reclaimed_series);
-    let pass = checkpoints >= 1.0 && reclaimed >= 1.0;
+    let activity_pass = checkpoints >= 1.0 && reclaimed >= 1.0;
+
+    let growth_mb_per_hour = match post_warmup_growth_mb_per_hour(
+        txlog_bytes_series,
+        thresholds.warmup_fraction,
+        NAME,
+        "need >= 2 cq_txlog_bytes samples to fit a growth slope",
+        "window too short relative to warmup_fraction to fit a txlog growth slope",
+    ) {
+        Ok(v) => v,
+        Err(mut result) => {
+            // Preserve the checkpoint/reclaimed measured values in the
+            // note even when the byte series itself is insufficient, so
+            // the failure is diagnosable without re-running.
+            result.note = format!(
+                "{} (checkpoints={:.0} reclaimed={:.0})",
+                result.note, checkpoints, reclaimed
+            );
+            return result;
+        }
+    };
+    let bytes_bound_pass = growth_mb_per_hour <= thresholds.max_txlog_growth_mb_per_hour;
+    let pass = activity_pass && bytes_bound_pass;
 
     let mut result = CriterionResult::new(
         NAME,
-        format!("checkpoints={:.0} reclaimed={:.0}", checkpoints, reclaimed),
-        "checkpoints >= 1 and reclaimed >= 1",
+        format!(
+            "growth={:.2} MB/hour checkpoints={:.0} reclaimed={:.0}",
+            growth_mb_per_hour, checkpoints, reclaimed
+        ),
+        format!(
+            "growth <= {:.2} MB/hour and checkpoints >= 1 and reclaimed >= 1",
+            thresholds.max_txlog_growth_mb_per_hour
+        ),
         pass,
     );
-    result.note = "no txlog-bytes-on-disk gauge is exported today; this criterion proves \
-                   checkpoint+reclaim activity (disk should sawtooth), not a bounded byte \
-                   count directly — adding a size gauge (or scraping node_exporter disk \
-                   usage for the txlog volume) is a follow-up for a stronger guarantee"
-        .to_string();
+    if !bytes_bound_pass {
+        result.note = "cq_txlog_bytes grew faster than the configured bound — reclaim is \
+                       losing the race against the write rate, so disk is growing \
+                       unboundedly even though checkpoint/reclaim activity may look healthy"
+            .to_string();
+    } else if !activity_pass {
+        result.note = "cq_txlog_bytes stayed within the growth bound, but checkpoint/reclaim \
+                       activity was missing over the window (checkpoints >= 1 and reclaimed \
+                       >= 1 required) — checkpointing may be disabled or the window too short \
+                       to observe a reclaim"
+            .to_string();
+    }
     result
 }
 
@@ -376,12 +473,14 @@ pub fn check_p99_publish_latency(
 
 /// Run all four criteria and assemble the final report. Pure — takes
 /// pre-fetched series, does no I/O.
+#[allow(clippy::too_many_arguments)]
 pub fn analyze(
     rss_series: &[Sample],
     dropped_series: &[Sample],
     delivered_series: &[Sample],
     checkpoint_series: &[Sample],
     reclaimed_series: &[Sample],
+    txlog_bytes_series: &[Sample],
     p99_series: &[Sample],
     thresholds: &Thresholds,
 ) -> SoakReport {
@@ -389,7 +488,12 @@ pub fn analyze(
         criteria: vec![
             check_rss_slope(rss_series, thresholds),
             check_drop_ratio(dropped_series, delivered_series, thresholds),
-            check_txlog_bounded(checkpoint_series, reclaimed_series),
+            check_txlog_bounded(
+                checkpoint_series,
+                reclaimed_series,
+                txlog_bytes_series,
+                thresholds,
+            ),
             check_p99_publish_latency(p99_series, thresholds),
         ],
     }
@@ -524,6 +628,7 @@ pub fn analyze_config_from_args(
     warmup_fraction: f64,
     max_drop_ratio: f64,
     max_p99_publish_latency_us: f64,
+    max_txlog_growth_mb_per_hour: f64,
 ) -> AnalyzeConfig {
     let step = if step_secs <= 0.0 { 10.0 } else { step_secs };
     let window = match (start, end) {
@@ -542,11 +647,12 @@ pub fn analyze_config_from_args(
             warmup_fraction,
             max_drop_ratio,
             max_p99_publish_latency_us,
+            max_txlog_growth_mb_per_hour,
         },
     }
 }
 
-/// Fetch all five series from Prometheus and run [`analyze`]. This is
+/// Fetch all six series from Prometheus and run [`analyze`]. This is
 /// the only function in the module that talks to a network — every
 /// verdict computation it calls into is separately unit-tested with
 /// synthetic data.
@@ -596,6 +702,17 @@ pub async fn run(cfg: &AnalyzeConfig) -> Result<SoakReport> {
     )
     .await
     .context("fetching cq_txlog_segments_reclaimed_total")?;
+    // Sum across topics: cq_txlog_bytes is per-topic (labeled `topic=`),
+    // and the byte-bound check cares about total on-disk txlog size, not
+    // any single topic's.
+    let txlog_bytes = fetch_range(
+        &client,
+        &cfg.prometheus_url,
+        "sum(cq_txlog_bytes)",
+        cfg.window,
+    )
+    .await
+    .context("fetching cq_txlog_bytes")?;
     // Server-side quantile: histogram_quantile needs the full bucket
     // set, so compute it in PromQL rather than pulling every bucket
     // series and refitting client-side.
@@ -610,6 +727,7 @@ pub async fn run(cfg: &AnalyzeConfig) -> Result<SoakReport> {
         &delivered,
         &checkpoints,
         &reclaimed,
+        &txlog_bytes,
         &p99,
         &cfg.thresholds,
     ))
@@ -762,21 +880,49 @@ mod tests {
 
     // ---- criterion 3: txlog bounded ---------------------------------------
 
+    /// A sawtooth `cq_txlog_bytes` series: ramps up as segments are
+    /// written, then drops back down on each reclaim — net-flat over the
+    /// full window. Reused across tests as the "healthy" byte series.
+    fn sawtooth_txlog_bytes(n: usize, step_secs: f64, base: f64, sawtooth_amplitude: f64) -> Vec<Sample> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 * step_secs;
+                // Triangle wave with period 10 samples: up for 5, down for 5.
+                let phase = i % 10;
+                let frac = if phase < 5 {
+                    phase as f64 / 5.0
+                } else {
+                    (10 - phase) as f64 / 5.0
+                };
+                (t, base + sawtooth_amplitude * frac)
+            })
+            .collect()
+    }
+
     #[test]
     fn reclaim_events_present_pass() {
         let checkpoints: Vec<Sample> = vec![(0.0, 0.0), (10.0, 1.0), (20.0, 2.0), (30.0, 3.0)];
         let reclaimed: Vec<Sample> = vec![(0.0, 0.0), (10.0, 0.0), (20.0, 1.0), (30.0, 2.0)];
-        let result = check_txlog_bounded(&checkpoints, &reclaimed);
+        let txlog_bytes: Vec<Sample> = vec![
+            (0.0, 100.0),
+            (10.0, 200.0),
+            (20.0, 50.0),
+            (30.0, 150.0),
+        ];
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
         assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
     }
 
     #[test]
     fn no_reclaim_events_fail_txlog_unbounded() {
         // Checkpoints fire, but nothing ever gets reclaimed — segments
-        // accumulate forever even though checkpointing "works".
+        // accumulate forever even though checkpointing "works". Byte
+        // series is flat here just to isolate this failure mode from the
+        // byte-growth one (tested separately below).
         let checkpoints: Vec<Sample> = vec![(0.0, 0.0), (10.0, 1.0), (20.0, 2.0), (30.0, 3.0)];
         let reclaimed: Vec<Sample> = vec![(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)];
-        let result = check_txlog_bounded(&checkpoints, &reclaimed);
+        let txlog_bytes: Vec<Sample> = vec![(0.0, 100.0), (10.0, 100.0), (20.0, 100.0), (30.0, 100.0)];
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
         assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
     }
 
@@ -785,14 +931,89 @@ mod tests {
         // Reclaimed stays at 0 because checkpointing itself never ran.
         let checkpoints: Vec<Sample> = vec![(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)];
         let reclaimed: Vec<Sample> = vec![(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)];
-        let result = check_txlog_bounded(&checkpoints, &reclaimed);
+        let txlog_bytes: Vec<Sample> = vec![(0.0, 100.0), (10.0, 100.0), (20.0, 100.0)];
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
         assert_eq!(result.verdict, Verdict::Fail, "{:?}", result);
     }
 
     #[test]
     fn txlog_missing_series_fails_closed() {
-        let result = check_txlog_bounded(&[], &[]);
+        let result = check_txlog_bounded(&[], &[], &[], &thresholds());
         assert_eq!(result.verdict, Verdict::Fail);
+    }
+
+    /// The load-bearing regression this criterion exists to catch:
+    /// reclaim fires and frees segments every checkpoint (activity looks
+    /// perfectly healthy), but the write rate outpaces it — total disk
+    /// still grows linearly and unboundedly. Activity-only checking would
+    /// falsely PASS this; the byte-growth fit must FAIL it.
+    #[test]
+    fn linearly_growing_txlog_bytes_fails_even_with_healthy_activity() {
+        let checkpoints: Vec<Sample> = (0..361).map(|i| (i as f64 * 10.0, i as f64)).collect();
+        let reclaimed: Vec<Sample> = (0..361).map(|i| (i as f64 * 10.0, i as f64)).collect();
+        // Starts at 100MB, grows linearly to 100MB + 500MB over 1 hour
+        // (3600s) => ~500MB/hour, way over the 50MB/hour default
+        // threshold — same shape as the rss_leaking_series_fails test.
+        let base = 100.0 * 1024.0 * 1024.0;
+        let growth_per_sec = 500.0 * 1024.0 * 1024.0 / 3600.0;
+        let txlog_bytes: Vec<Sample> = (0..361)
+            .map(|i| (i as f64 * 10.0, base + growth_per_sec * (i as f64 * 10.0)))
+            .collect();
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
+        assert_eq!(
+            result.verdict,
+            Verdict::Fail,
+            "unbounded byte growth must fail even though checkpoint+reclaim activity is healthy: {:?}",
+            result
+        );
+    }
+
+    /// Complement: a sawtooth `cq_txlog_bytes` series (grows as segments
+    /// are written, drops on each reclaim) with net-flat growth over the
+    /// window, plus healthy activity, must PASS — this is what a
+    /// correctly-bounded txlog looks like.
+    #[test]
+    fn sawtooth_txlog_bytes_with_activity_passes() {
+        let checkpoints: Vec<Sample> = (0..60).map(|i| (i as f64 * 10.0, i as f64)).collect();
+        let reclaimed: Vec<Sample> = (0..60).map(|i| (i as f64 * 10.0, i as f64)).collect();
+        let txlog_bytes = sawtooth_txlog_bytes(60, 10.0, 100.0 * 1024.0 * 1024.0, 20.0 * 1024.0 * 1024.0);
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+    }
+
+    /// A flat `cq_txlog_bytes` series (no growth at all) must also PASS —
+    /// the simplest bounded case.
+    #[test]
+    fn flat_txlog_bytes_with_activity_passes() {
+        let checkpoints: Vec<Sample> = (0..30).map(|i| (i as f64 * 10.0, i as f64)).collect();
+        let reclaimed: Vec<Sample> = (0..30).map(|i| (i as f64 * 10.0, i as f64)).collect();
+        let txlog_bytes: Vec<Sample> = (0..30)
+            .map(|i| (i as f64 * 10.0, 200.0 * 1024.0 * 1024.0))
+            .collect();
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
+    }
+
+    /// Warmup exclusion applies to the byte fit too: a sharp initial
+    /// ramp (first checkpoint building up the first segments from an
+    /// empty log) followed by sawtooth/flat steady state must PASS, the
+    /// same way `rss_warmup_ramp_then_flat_passes` does for RSS.
+    #[test]
+    fn txlog_bytes_warmup_ramp_then_flat_passes() {
+        let mut txlog_bytes = Vec::new();
+        for i in 0..=6 {
+            let t = i as f64 * 10.0;
+            let bytes = (10.0 + (200.0 / 6.0) * i as f64) * 1024.0 * 1024.0;
+            txlog_bytes.push((t, bytes));
+        }
+        for i in 7..=60 {
+            let t = i as f64 * 10.0;
+            txlog_bytes.push((t, 210.0 * 1024.0 * 1024.0));
+        }
+        let checkpoints: Vec<Sample> = vec![(0.0, 0.0), (600.0, 5.0)];
+        let reclaimed: Vec<Sample> = vec![(0.0, 0.0), (600.0, 3.0)];
+        let result = check_txlog_bounded(&checkpoints, &reclaimed, &txlog_bytes, &thresholds());
+        assert_eq!(result.verdict, Verdict::Pass, "{:?}", result);
     }
 
     // ---- criterion 4: p99 publish latency ----------------------------------
@@ -834,6 +1055,9 @@ mod tests {
         let dropped: Vec<Sample> = (0..10).map(|i| (i as f64 * 10.0, i as f64 * 5.0)).collect();
         let checkpoints: Vec<Sample> = vec![(0.0, 0.0), (30.0, 3.0)];
         let reclaimed: Vec<Sample> = vec![(0.0, 0.0), (30.0, 2.0)];
+        let txlog_bytes: Vec<Sample> = (0..60)
+            .map(|i| (i as f64 * 10.0, 300.0 * 1024.0 * 1024.0))
+            .collect();
         let p99: Vec<Sample> = (0..20).map(|i| (i as f64 * 10.0, 5000.0)).collect();
 
         let report = analyze(
@@ -842,6 +1066,7 @@ mod tests {
             &delivered,
             &checkpoints,
             &reclaimed,
+            &txlog_bytes,
             &p99,
             &thresholds(),
         );
@@ -863,6 +1088,9 @@ mod tests {
         let dropped: Vec<Sample> = (0..10).map(|i| (i as f64 * 10.0, i as f64 * 5.0)).collect();
         let checkpoints: Vec<Sample> = vec![(0.0, 0.0), (30.0, 3.0)];
         let reclaimed: Vec<Sample> = vec![(0.0, 0.0), (30.0, 2.0)];
+        let txlog_bytes: Vec<Sample> = (0..60)
+            .map(|i| (i as f64 * 10.0, 300.0 * 1024.0 * 1024.0))
+            .collect();
         let p99: Vec<Sample> = (0..20).map(|i| (i as f64 * 10.0, 5000.0)).collect();
 
         let report = analyze(
@@ -871,6 +1099,7 @@ mod tests {
             &delivered,
             &checkpoints,
             &reclaimed,
+            &txlog_bytes,
             &p99,
             &thresholds(),
         );

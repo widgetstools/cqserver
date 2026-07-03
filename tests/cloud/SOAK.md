@@ -170,7 +170,7 @@ PASS/FAIL with measured value + threshold:
 |---|---|---|
 | `rss_slope` | `cq_process_rss_bytes` | linear-fit slope (after excluding the first 10% of the window as warmup) implies growth beyond `--soak-analyze-max-rss-growth-mb-per-hour` (default 50 MB/hour) — a leak |
 | `delta_drop_ratio` | `cq_deltas_dropped_total`, `cq_deltas_delivered_total` | dropped/delivered ratio over the window exceeds `--soak-analyze-max-drop-ratio` (default 0.05). The slow-consumer class is *expected* to cause some drops — this bounds them, it doesn't require zero |
-| `txlog_bounded` | `cq_txlog_checkpoint_total`, `cq_txlog_segments_reclaimed_total` | no checkpoints fired, or no segments were ever reclaimed, over the window — the txlog would grow unboundedly instead of sawtoothing |
+| `txlog_bounded` | `cq_txlog_bytes` (per-topic on-disk-size gauge, summed), `cq_txlog_checkpoint_total`, `cq_txlog_segments_reclaimed_total` | linear-fit slope of `cq_txlog_bytes` (after excluding the first 10% of the window as warmup) implies growth beyond `--soak-analyze-max-txlog-growth-mb-per-hour` (default 50 MB/hour) — reclaim is losing the race against the write rate, so disk grows unboundedly — **or** no checkpoints fired, or no segments were ever reclaimed, over the window (activity check, kept as a complementary signal) |
 | `p99_publish_latency` | `cq_publish_latency_us` (`histogram_quantile(0.99, ...)`) | the worst p99 sample in the window exceeds `--soak-analyze-max-p99-latency-us` (default 50000 = 50ms) |
 
 Run it after (or during) a soak, pointed at the soak's Prometheus:
@@ -198,19 +198,28 @@ cq-loadgen --scenario soak-analyze --prometheus-url http://127.0.0.1:9090 \
 ```
 
 The verdict math (linear fit, drop ratio, checkpoint/reclaim presence,
-p99 threshold) lives in `crates/cq-loadgen/src/soak_analyze.rs` as pure
-functions and is unit-tested against synthetic metric series (leaking
-RSS → FAIL, flat RSS → PASS, runaway drops → FAIL, bounded drops →
-PASS, no reclaim events → FAIL, reclaim events present → PASS) — no
-live Prometheus needed for `cargo test -p cq-loadgen`.
+txlog byte-growth bound, p99 threshold) lives in
+`crates/cq-loadgen/src/soak_analyze.rs` as pure functions and is
+unit-tested against synthetic metric series (leaking RSS → FAIL, flat
+RSS → PASS, runaway drops → FAIL, bounded drops → PASS, no reclaim
+events → FAIL, reclaim events present → PASS, linearly-growing
+`cq_txlog_bytes` → FAIL even with healthy checkpoint/reclaim activity,
+sawtooth/flat `cq_txlog_bytes` → PASS) — no live Prometheus needed for
+`cargo test -p cq-loadgen`.
 
-**Known gap**: there is no txlog-bytes-on-disk gauge exported by the
-server today (only the checkpoint/reclaim/error counters — grepped
-`crates/cq-server`, `crates/cq-txlog`), so `txlog_bounded` proves
-checkpoint+reclaim *activity* rather than directly asserting a bounded
-byte count. A dedicated size gauge, or scraping node_exporter's disk
-usage for the txlog volume, would close that gap — flagged as a
-follow-up, not blocking for B3.
+**Byte-bound gap closed**: the server now exports `cq_txlog_bytes{topic=...}`
+— a per-topic gauge of the txlog directory's total on-disk size (sum of
+segment file sizes + the durable snapshot file), emitted on every
+periodic checkpoint tick (`crates/cq-server/src/main.rs`,
+`run_checkpointer`; computed by `Topic::txlog_disk_bytes()` in
+`crates/cq-core/src/topic.rs`). `txlog_bounded` now asserts a real
+bounded-disk guarantee via a linear fit of this gauge (summed across
+topics), the same warmup-excluded-slope approach as `rss_slope` — not
+just checkpoint/reclaim activity, which can look perfectly healthy
+while the write rate outpaces reclaim and disk grows unboundedly
+anyway. The checkpoint/reclaim activity checks are kept as a
+complementary signal (they catch a different failure mode: checkpointing
+disabled/broken outright).
 
 ## What this does NOT do (yet)
 
