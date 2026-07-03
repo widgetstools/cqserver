@@ -10,6 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 cq-client = { path = "../cq-client" }
+# B2.1 — raw-socket slow subscriber (backpressure/drop path) reuses the
+# wire codec + message types directly instead of hand-rolling frame bytes.
+cq-protocol = { path = "../cq-protocol" }
+bytes.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

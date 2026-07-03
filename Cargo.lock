@@ -594,8 +594,10 @@ name = "cq-loadgen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "cq-client",
+ "cq-protocol",
  "futures",
  "hdrhistogram",
  "reqwest",

@@ -73,8 +73,11 @@ enum Scenario {
     /// (`--soak-fast-subscribers`), conflated (`--soak-conflated-subscribers`
     /// — conflation itself comes from the topic's server-side
     /// `conflation_ms`), and deliberately-slow
-    /// (`--soak-slow-subscribers`, `--soak-slow-read-delay-ms`). Logs
-    /// progress every `--soak-progress-interval-secs` and a final summary.
+    /// (`--soak-slow-subscribers`, `--soak-slow-read-delay-ms`,
+    /// `--soak-slow-mode` — `raw` by default, a bare-TCP stalling reader
+    /// that genuinely backpressures the server; `sdk` is kept for
+    /// comparison but can't induce real drops). Logs progress every
+    /// `--soak-progress-interval-secs` and a final summary.
     Soak,
     /// Bucket B, task B3 — read Prometheus over a run window and emit a
     /// machine-checkable PASS/FAIL verdict for a soak: RSS slope ≈ 0
@@ -163,6 +166,18 @@ struct Args {
     #[arg(long, default_value = "")]
     soak_key_field: String,
 
+    /// soak (task B2.1): how the slow subscriber class connects. `raw`
+    /// (default) opens a bare TCP socket and stalls its reads so it
+    /// genuinely fills the server's outbound queue and induces real
+    /// slow-consumer drops (`cq_subscription_dropped_total` /
+    /// `cq_deltas_dropped_total`). `sdk` uses the cq-client SDK like the
+    /// fast/conflated classes — kept for comparison, but it CANNOT induce
+    /// real backpressure: the SDK's driver loop always drains the socket
+    /// into an unbounded channel regardless of how slowly the app reads
+    /// from it. Empty ⇒ "raw".
+    #[arg(long, default_value = "")]
+    soak_slow_mode: String,
+
     /// soak-analyze: Prometheus base URL, e.g. http://localhost:9090.
     #[arg(long, default_value = "http://127.0.0.1:9090")]
     prometheus_url: String,
@@ -239,6 +254,7 @@ async fn main() -> Result<()> {
         soak_slow_read_delay_ms: args.soak_slow_read_delay_ms,
         soak_progress_interval_secs: args.soak_progress_interval_secs,
         soak_key_field: args.soak_key_field,
+        soak_slow_mode: args.soak_slow_mode,
     };
     match args.scenario {
         Scenario::PublishThroughput => scenarios::publish_throughput(&cfg).await?.print(),

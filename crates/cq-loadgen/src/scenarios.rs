@@ -64,6 +64,13 @@ pub struct ScenarioConfig {
     /// ["position_id"]`). Set this when pointing `--topic` at a
     /// differently-keyed topic.
     pub soak_key_field: String,
+    /// `soak` (task B2.1): how the slow subscriber class connects. `"raw"`
+    /// (default when empty) opens a bare TCP socket and stalls its reads
+    /// so it genuinely backpressures the server's outbound queue; `"sdk"`
+    /// uses the cq-client SDK (kept for comparison — see `SlowMode`'s doc
+    /// comment for why it can't actually induce drops). Any other value
+    /// is rejected by `soak()` at startup.
+    pub soak_slow_mode: String,
 }
 
 impl Default for ScenarioConfig {
@@ -85,6 +92,7 @@ impl Default for ScenarioConfig {
             soak_slow_read_delay_ms: 0,
             soak_progress_interval_secs: 0,
             soak_key_field: String::new(),
+            soak_slow_mode: String::new(),
         }
     }
 }
@@ -1640,10 +1648,33 @@ pub async fn schema_evolution_under_load(cfg: &ScenarioConfig) -> Result<Evoluti
 //                deltas mean this class should see materially fewer raw
 //                deltas than `fast` for the same publish stream while
 //                still tracking the latest value with no drops.
-//   3. slow    — deliberately slow: sleeps `soak_slow_read_delay_ms`
-//                between reads, exercising the slow-consumer / queue-drop
-//                path (see `crates/cq-e2e-tests/tests/slow_consumer.rs`
-//                for the equivalent short-lived e2e).
+//   3. slow    — deliberately slow, and its mode determines whether it
+//                can actually induce server-side backpressure:
+//
+//                  - `raw` (default, `SlowMode::Raw`): opens a bare TCP
+//                    socket, hand-sends a length-prefixed `sow_and_subscribe`
+//                    frame via `cq_protocol`'s own codec/message types (no
+//                    cq-client SDK involved), then reads the socket only
+//                    every `soak_slow_read_delay_ms` — and even then just
+//                    drains and discards whatever arrived, without pulling
+//                    harder than the OS hands over in one `read()`. Because
+//                    nothing is racing to drain the kernel recv buffer, it
+//                    fills, TCP backpressure propagates to the server's
+//                    write side, and the server's own outbound queue for
+//                    this session backs up and starts dropping — the same
+//                    mechanism `crates/cq-e2e-tests/tests/slow_consumer.rs`
+//                    uses to prove `cq_subscription_dropped_total` fires.
+//                  - `sdk` (`SlowMode::Sdk`): uses `cq_client::Client` like
+//                    the fast/conflated classes, just sleeping
+//                    `soak_slow_read_delay_ms` between `next_delta()` calls.
+//                    **This class can NOT induce real drops**: the SDK's
+//                    driver loop (`crates/cq-client/src/client.rs`) always
+//                    races ahead reading the socket into an unbounded
+//                    `mpsc::unbounded_channel`, regardless of how slowly the
+//                    app drains that channel — so the kernel recv buffer
+//                    never backs up and the server never sees a slow
+//                    consumer. Kept only for comparison / back-compat
+//                    (`--soak-slow-mode sdk`).
 //
 // The driver logs progress every `soak_progress_interval_secs` (published
 // count, per-class delivered count, elapsed) and prints a final summary on
@@ -1679,6 +1710,143 @@ impl SoakClassCounters {
             subs_opened: AtomicU64::new(0),
             subs_failed: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+        }
+    }
+}
+
+/// How the soak's `slow` subscriber class connects. See the module doc
+/// comment above for why `Raw` is the only mode that induces real
+/// server-side backpressure/drops.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SlowMode {
+    /// Raw TCP socket, hand-built wire frames, throttled/never reads —
+    /// genuinely backpressures the server (default).
+    Raw,
+    /// cq-client SDK, sleeps between `next_delta()` calls — cannot
+    /// backpressure (SDK drains the socket into an unbounded channel
+    /// regardless of app-side pacing). Kept for comparison / back-compat.
+    Sdk,
+}
+
+impl SlowMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "raw" => Some(SlowMode::Raw),
+            "sdk" => Some(SlowMode::Sdk),
+            _ => None,
+        }
+    }
+}
+
+/// Build the raw wire frame for a `sow_and_subscribe` on `topic`, encoded
+/// exactly as `cq-client`'s transport would (length-prefixed JSON via
+/// `cq_protocol::codec`), but assembled by hand so the soak's raw slow
+/// subscriber never needs the SDK's draining driver loop. Pulled out as
+/// its own function so frame construction is unit-testable without a
+/// live server or a socket.
+fn build_sow_and_subscribe_frame(cid: &str, topic: &str) -> bytes::BytesMut {
+    let mut msg = cq_protocol::message::CqMessage::new(cq_protocol::command::Command::SowAndSubscribe);
+    msg.command_id = Some(cid.to_string());
+    msg.topic = Some(topic.to_string());
+    let body = cq_protocol::serialization::Codec::Json
+        .encode(&msg)
+        .expect("CqMessage JSON encoding is infallible for this shape");
+    let mut out = bytes::BytesMut::new();
+    cq_protocol::codec::encode_frame(&body, &mut out);
+    out
+}
+
+/// Parse `tcp://host:port` the same way `cq_client::transport::Transport`
+/// does, so the raw slow subscriber connects to the same address form the
+/// SDK-based classes use. Returns `None` for any other scheme (ws/wss) —
+/// the raw path only supports the TCP transport.
+fn tcp_host_port(server_url: &str) -> Option<&str> {
+    server_url.strip_prefix("tcp://")
+}
+
+/// Raw-socket variant of the soak's slow subscriber class (task B2.1):
+/// opens a bare TCP connection, hand-sends a `sow_and_subscribe` frame via
+/// `build_sow_and_subscribe_frame`, then reads the socket only once every
+/// `read_delay` — and even then does a single bounded `read()` per wakeup
+/// rather than draining in a loop, so the kernel recv buffer is left to
+/// fill between reads. No cq-client SDK involved on this connection, so
+/// there's no unbounded channel racing to empty the socket: TCP
+/// backpressure propagates all the way to the server's per-session
+/// outbound queue, which is what makes this class actually exercise the
+/// slow-consumer drop path (see the module doc comment above and
+/// `crates/cq-e2e-tests/tests/slow_consumer.rs`, whose `open_silent_subscriber`
+/// helper is the proof-of-concept this mirrors).
+///
+/// `delivered` counts frames read off the wire (best-effort — this path
+/// doesn't decode/validate each frame's contents, just counts arrivals),
+/// mirroring the SDK path's `delivered` counter closely enough for the
+/// soak summary's fast-vs-slow comparison.
+async fn run_soak_subscriber_raw_stall(
+    idx: usize,
+    server_url: String,
+    topic: String,
+    read_delay: Duration,
+    counters: Arc<SoakClassCounters>,
+    stop: Arc<AtomicBool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some(host_port) = tcp_host_port(&server_url) else {
+        eprintln!(
+            "soak sub {idx} ({}) raw mode requires a tcp:// server url, got {server_url}",
+            counters.class
+        );
+        counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::net::TcpStream::connect(host_port),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            eprintln!("soak sub {idx} ({}) raw connect failed: {e}", counters.class);
+            counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            eprintln!("soak sub {idx} ({}) raw connect timed out", counters.class);
+            counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let cid = format!("soak-raw-slow-{idx}");
+    let frame = build_sow_and_subscribe_frame(&cid, &topic);
+    if let Err(e) = stream.write_all(&frame).await {
+        eprintln!("soak sub {idx} ({}) raw subscribe send failed: {e}", counters.class);
+        counters.subs_failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    counters.subs_opened.fetch_add(1, Ordering::Relaxed);
+
+    // Deliberately small read buffer + a bounded single `read()` call per
+    // wakeup: we want to pull as little as possible off the wire, not
+    // drain whatever accumulated. This is what leaves the kernel recv
+    // buffer (and thus the server's outbound queue) to fill between
+    // wakeups instead of racing to empty it every time we touch the
+    // socket.
+    let mut buf = [0u8; 4096];
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(read_delay).await;
+        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,   // server closed the connection
+            Ok(Ok(_n)) => {
+                counters.delivered.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(e)) => {
+                eprintln!("soak sub {idx} ({}) raw read error: {e}", counters.class);
+                break;
+            }
+            Err(_) => continue, // nothing arrived within the poke window — expected; keep stalling
         }
     }
 }
@@ -1780,6 +1948,12 @@ pub async fn soak(cfg: &ScenarioConfig) -> Result<()> {
         if cfg.soak_progress_interval_secs == 0 { 10 } else { cfg.soak_progress_interval_secs };
     let publish_rate = if cfg.publish_rate <= 0.0 { 50.0 } else { cfg.publish_rate };
     let key_field = if cfg.soak_key_field.is_empty() { "position_id" } else { &cfg.soak_key_field };
+    let slow_mode_str = if cfg.soak_slow_mode.is_empty() { "raw" } else { &cfg.soak_slow_mode };
+    let slow_mode = SlowMode::from_str(slow_mode_str).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --soak-slow-mode '{slow_mode_str}' (expected 'raw' or 'sdk')"
+        )
+    })?;
 
     println!("──────────────────────────────────────────────────");
     println!("Scenario: soak  (topic={}, duration={:.0}s)", cfg.topic, cfg.duration.as_secs_f64());
@@ -1787,8 +1961,15 @@ pub async fn soak(cfg: &ScenarioConfig) -> Result<()> {
         "Seed:      {rows} rows × {cols} cols (key field '{key_field}')  |  ticks: delta_publish @ {publish_rate:.0}/s"
     );
     println!(
-        "Subscribers: fast={n_fast}  conflated={n_conflated}  slow={n_slow} (read delay {slow_delay_ms}ms)"
+        "Subscribers: fast={n_fast}  conflated={n_conflated}  slow={n_slow} (read delay {slow_delay_ms}ms, mode={slow_mode_str})"
     );
+    if slow_mode == SlowMode::Sdk {
+        println!(
+            "  note: slow-mode=sdk cannot induce real server-side backpressure/drops \
+             (SDK drains the socket into an unbounded channel) — use --soak-slow-mode raw \
+             (the default) to actually exercise the slow-consumer drop path"
+        );
+    }
 
     // ---- seed --------------------------------------------------------
     let seeder = Client::connect(&cfg.server_url)
@@ -1848,14 +2029,24 @@ pub async fn soak(cfg: &ScenarioConfig) -> Result<()> {
     }
     let slow_delay = Duration::from_millis(slow_delay_ms);
     for i in 0..n_slow {
-        sub_handles.push(tokio::spawn(run_soak_subscriber(
-            i,
-            cfg.server_url.clone(),
-            cfg.topic.clone(),
-            slow_delay,
-            slow_counters.clone(),
-            stop.clone(),
-        )));
+        sub_handles.push(match slow_mode {
+            SlowMode::Raw => tokio::spawn(run_soak_subscriber_raw_stall(
+                i,
+                cfg.server_url.clone(),
+                cfg.topic.clone(),
+                slow_delay,
+                slow_counters.clone(),
+                stop.clone(),
+            )),
+            SlowMode::Sdk => tokio::spawn(run_soak_subscriber(
+                i,
+                cfg.server_url.clone(),
+                cfg.topic.clone(),
+                slow_delay,
+                slow_counters.clone(),
+                stop.clone(),
+            )),
+        });
     }
 
     // Let every subscriber finish connecting + draining the seed snapshot
@@ -2022,4 +2213,98 @@ async fn read_rss_subs(admin: &cq_client::admin::AdminClient) -> Result<(f64, u6
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     Ok((rss, subs))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// B2.1 — pure-logic tests for the raw slow-subscriber path: frame
+// construction/round-trip, URL parsing, and mode-string parsing. None of
+// these need a live server or a socket — the live-backpressure claim
+// itself is validated separately against a real compose cluster (see
+// tests/cloud/SOAK.md and the B2.1 task report).
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod raw_slow_subscriber_tests {
+    use super::*;
+
+    #[test]
+    fn slow_mode_from_str_accepts_raw_and_sdk() {
+        assert_eq!(SlowMode::from_str("raw"), Some(SlowMode::Raw));
+        assert_eq!(SlowMode::from_str("sdk"), Some(SlowMode::Sdk));
+    }
+
+    #[test]
+    fn slow_mode_from_str_rejects_anything_else() {
+        assert_eq!(SlowMode::from_str(""), None);
+        assert_eq!(SlowMode::from_str("RAW"), None); // case-sensitive by design
+        assert_eq!(SlowMode::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn tcp_host_port_strips_scheme() {
+        assert_eq!(tcp_host_port("tcp://127.0.0.1:9007"), Some("127.0.0.1:9007"));
+        assert_eq!(tcp_host_port("tcp://cqserver:9007"), Some("cqserver:9007"));
+    }
+
+    #[test]
+    fn tcp_host_port_rejects_non_tcp_schemes() {
+        assert_eq!(tcp_host_port("ws://127.0.0.1:9008/cq/json"), None);
+        assert_eq!(tcp_host_port("wss://example.com/cq"), None);
+        assert_eq!(tcp_host_port("127.0.0.1:9007"), None);
+    }
+
+    /// The raw frame must be a valid length-prefixed `cq_protocol` frame
+    /// whose decoded payload is a `sow_and_subscribe` CqMessage carrying
+    /// the caller's `cid`/`topic` — i.e. exactly what the server's own
+    /// frame decoder expects, matching what `cq_e2e_tests`'
+    /// `open_silent_subscriber` hand-builds (JSON, same field names).
+    #[test]
+    fn build_sow_and_subscribe_frame_round_trips_through_the_wire_codec() {
+        let mut frame = build_sow_and_subscribe_frame("soak-raw-slow-0", "/positions");
+
+        // Length prefix must exactly match the encoded body length (no
+        // compression — bodies this small never cross the zstd threshold).
+        let declared_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        assert_eq!(declared_len as usize, frame.len() - 4);
+        // High bit (compressed flag) must be clear.
+        assert_eq!(declared_len & cq_protocol::compression::COMPRESSED_FLAG, 0);
+
+        let payload = cq_protocol::codec::decode_frame(&mut frame)
+            .expect("valid frame")
+            .expect("complete frame");
+        let msg: cq_protocol::message::CqMessage =
+            cq_protocol::serialization::Codec::Json.decode(&payload).expect("valid CqMessage JSON");
+
+        assert_eq!(msg.command, cq_protocol::command::Command::SowAndSubscribe);
+        assert_eq!(msg.command_id.as_deref(), Some("soak-raw-slow-0"));
+        assert_eq!(msg.topic.as_deref(), Some("/positions"));
+        // No filter/bookmark set — matches `open_silent_subscriber`'s
+        // shape (`{ "c": "sow_and_subscribe", "cid": ..., "t": topic }`).
+        assert!(msg.filter.is_none());
+        assert!(msg.bookmark.is_none());
+    }
+
+    #[test]
+    fn build_sow_and_subscribe_frame_is_valid_json_on_the_wire() {
+        let mut frame = build_sow_and_subscribe_frame("c-1", "/loadgen");
+        let payload = cq_protocol::codec::decode_frame(&mut frame).unwrap().unwrap();
+        let text = std::str::from_utf8(&payload).expect("frame body is UTF-8 JSON, not msgpack");
+        assert!(text.contains("sow_and_subscribe"));
+        assert!(text.contains("/loadgen"));
+    }
+
+    #[test]
+    fn distinct_cids_produce_distinct_frames() {
+        let mut a = build_sow_and_subscribe_frame("c-1", "/t");
+        let mut b = build_sow_and_subscribe_frame("c-2", "/t");
+        assert_ne!(a, b);
+        // Both still decode to well-formed frames with the right cid each.
+        let pa = cq_protocol::codec::decode_frame(&mut a).unwrap().unwrap();
+        let pb = cq_protocol::codec::decode_frame(&mut b).unwrap().unwrap();
+        let ma: cq_protocol::message::CqMessage =
+            cq_protocol::serialization::Codec::Json.decode(&pa).unwrap();
+        let mb: cq_protocol::message::CqMessage =
+            cq_protocol::serialization::Codec::Json.decode(&pb).unwrap();
+        assert_eq!(ma.command_id.as_deref(), Some("c-1"));
+        assert_eq!(mb.command_id.as_deref(), Some("c-2"));
+    }
 }

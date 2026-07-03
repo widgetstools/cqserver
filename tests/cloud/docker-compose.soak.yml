@@ -98,6 +98,12 @@ services:
       SOAK_CONFLATED_SUBSCRIBERS: "${SOAK_CONFLATED_SUBSCRIBERS:-2}"
       SOAK_SLOW_SUBSCRIBERS: "${SOAK_SLOW_SUBSCRIBERS:-1}"
       SOAK_SLOW_READ_DELAY_MS: "${SOAK_SLOW_READ_DELAY_MS:-300}"
+      # B2.1 — "raw" (default) opens a bare TCP socket and stalls its
+      # reads so it genuinely backpressures cqserver's outbound queue and
+      # induces real slow-consumer drops; "sdk" uses cq-client like the
+      # fast/conflated classes and is kept only for comparison (it can't
+      # induce real drops — see scenarios.rs's `SlowMode` doc comment).
+      SOAK_SLOW_MODE: "${SOAK_SLOW_MODE:-raw}"
       SOAK_PROGRESS_INTERVAL_SECS: "${SOAK_PROGRESS_INTERVAL_SECS:-10}"
     entrypoint: ["/bin/sh", "-c"]
     command:
