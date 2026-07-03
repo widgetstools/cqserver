@@ -408,6 +408,43 @@ impl Topic {
         self.txlog.is_some()
     }
 
+    /// Total on-disk size, in bytes, of this topic's txlog directory: the
+    /// sum of every segment file's size (sealed + the active segment) plus
+    /// the durable snapshot file, if one has been written. `0` for a
+    /// non-persistent topic.
+    ///
+    /// Cheap-ish: one `read_dir` + one `metadata()` stat per segment file.
+    /// Called from the periodic checkpoint tick (seconds-scale interval),
+    /// not the publish hot path, so the extra syscalls are fine.
+    pub fn txlog_disk_bytes(&self) -> u64 {
+        let Some(txlog) = &self.txlog else {
+            return 0;
+        };
+        let dir = txlog.lock().dir().to_path_buf();
+        Self::dir_disk_bytes(&dir)
+    }
+
+    /// Sum the file sizes of every txlog segment (`cq_txlog::segment::
+    /// list_segments`) plus the snapshot file under `dir`, if present.
+    /// Missing files (e.g. a segment deleted by a racing reclaim between
+    /// the listing and the stat) are skipped rather than erroring — this
+    /// is a best-effort metrics gauge, not a correctness check.
+    fn dir_disk_bytes(dir: &std::path::Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(segments) = cq_txlog::segment::list_segments(dir) {
+            for (_, path) in segments {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    total += meta.len();
+                }
+            }
+        }
+        let snapshot_path = cq_txlog::snapshot::snapshot_path(dir);
+        if let Ok(meta) = std::fs::metadata(&snapshot_path) {
+            total += meta.len();
+        }
+        total
+    }
+
     /// Force the attached txlog writer to roll to a new segment now.
     /// Used by the admin endpoint so operators can seal the current
     /// segment on demand. No-op when no txlog is attached.
@@ -4256,6 +4293,70 @@ mod view_tap_tests {
             res.rows[0].get("price").unwrap(),
             999.0,
             "post-checkpoint tail update wins after recovery"
+        );
+    }
+
+    /// `txlog_disk_bytes` must (a) be `0` for a topic with no txlog
+    /// attached, (b) grow as segments are written, and (c) shrink after a
+    /// reclaiming checkpoint deletes sealed segments — proving the gauge
+    /// actually tracks on-disk size rather than just activity counters.
+    #[test]
+    fn txlog_disk_bytes_tracks_segment_growth_and_reclaim() {
+        use cq_txlog::writer::TxLogWriter;
+        use cq_txlog::FsyncPolicy;
+        use parking_lot::Mutex as PlMutex;
+
+        // No txlog attached: must report 0, not panic.
+        let bare_topic = make_topic();
+        assert_eq!(bare_topic.txlog_disk_bytes(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Arc::new(PlMutex::new(
+            TxLogWriter::open_with_segment_size(dir.path(), FsyncPolicy::None, 512).unwrap(),
+        ));
+        let mut topic = make_topic();
+        topic.attach_txlog(writer.clone());
+        assert_eq!(
+            topic.txlog_disk_bytes(),
+            0,
+            "empty log before any publish"
+        );
+
+        // Publish enough to seal several segments; disk usage must grow.
+        for i in 0..40 {
+            publish(&topic, &format!("SYM{i:03}"), i as f64);
+        }
+        writer.lock().sync().unwrap();
+        let bytes_before_checkpoint = topic.txlog_disk_bytes();
+        assert!(
+            bytes_before_checkpoint > 0,
+            "segment files on disk after publishing"
+        );
+
+        // Cross-check against a direct sum of the segment files + snapshot
+        // file, computed independently of the method under test.
+        let expected: u64 = cq_txlog::segment::list_segments(dir.path())
+            .unwrap()
+            .iter()
+            .map(|(_, p)| std::fs::metadata(p).unwrap().len())
+            .sum();
+        assert_eq!(
+            bytes_before_checkpoint, expected,
+            "matches independently-summed segment file sizes (no snapshot yet)"
+        );
+
+        // A reclaiming checkpoint deletes sealed segments (keeping only the
+        // active one) and writes a snapshot file — net on-disk size must
+        // drop from the pre-checkpoint high-water mark.
+        topic.checkpoint(true).unwrap();
+        let bytes_after_checkpoint = topic.txlog_disk_bytes();
+        assert!(
+            bytes_after_checkpoint < bytes_before_checkpoint,
+            "reclaim should shrink on-disk size: before={bytes_before_checkpoint} after={bytes_after_checkpoint}"
+        );
+        assert!(
+            bytes_after_checkpoint > 0,
+            "snapshot + active segment still on disk after checkpoint"
         );
     }
 

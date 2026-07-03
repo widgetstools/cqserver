@@ -870,29 +870,52 @@ async fn run_checkpointer(
             }
             let name_for_log = name.clone();
             let reclaim = snapshot_reclaim;
+            let topic_for_gauge = topic.clone();
             // Blocking fsync + deletes off the async runtime. Topic::
             // checkpoint runs the durable log→snapshot→reclaim sequence;
             // with `reclaim = false` it refreshes the snapshot (fast
-            // restart) but never deletes segments.
-            let result = tokio::task::spawn_blocking(move || topic.checkpoint(reclaim)).await;
+            // restart) but never deletes segments. The disk-usage stat is
+            // read in the same blocking task (it's a few `metadata()`
+            // syscalls) so this tick's gauge reflects the just-completed
+            // checkpoint rather than a stale pre-checkpoint size, and is
+            // emitted for every persistent topic on every tick — even
+            // when `reclaim=false` — so `cq_txlog_bytes` is tracked
+            // continuously, not only when a reclaim happens.
+            let result = tokio::task::spawn_blocking(move || {
+                let outcome = topic.checkpoint(reclaim);
+                let disk_bytes = topic_for_gauge.txlog_disk_bytes();
+                (outcome, disk_bytes)
+            })
+            .await;
             match result {
-                Ok(Ok(Some(stats))) => {
+                Ok((Ok(Some(stats)), disk_bytes)) => {
                     metrics::counter!("cq_txlog_checkpoint_total").increment(1);
                     metrics::counter!("cq_txlog_segments_reclaimed_total")
                         .increment(stats.reclaimed as u64);
                     metrics::histogram!("cq_txlog_checkpoint_build_lock_hold_seconds")
                         .record(stats.build_lock_hold.as_secs_f64());
+                    metrics::gauge!("cq_txlog_bytes", "topic" => name_for_log.clone())
+                        .set(disk_bytes as f64);
                     tracing::info!(
                         topic = %name_for_log,
                         reclaimed = stats.reclaimed,
                         covered_sequence = stats.covered_sequence,
                         build_lock_hold_us = stats.build_lock_hold.as_micros() as u64,
+                        disk_bytes,
                         "periodic checkpoint complete"
                     );
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
+                Ok((Ok(None), disk_bytes)) => {
+                    // has_txlog() gated us into this loop iteration, so a
+                    // no-op checkpoint result shouldn't actually happen —
+                    // but keep the gauge continuous regardless.
+                    metrics::gauge!("cq_txlog_bytes", "topic" => name_for_log.clone())
+                        .set(disk_bytes as f64);
+                }
+                Ok((Err(e), disk_bytes)) => {
                     metrics::counter!("cq_txlog_checkpoint_errors_total").increment(1);
+                    metrics::gauge!("cq_txlog_bytes", "topic" => name_for_log.clone())
+                        .set(disk_bytes as f64);
                     tracing::warn!(topic = %name_for_log, error = %e, "periodic checkpoint failed");
                 }
                 Err(e) => {
