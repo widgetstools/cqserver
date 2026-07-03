@@ -1,0 +1,126 @@
+# Soak / scale topology — CLOUD_REPLICATION_TEST_WORKLOG Bucket B, task B1.
+#
+# Purpose: a long-running (multi-day) single-node cqserver under
+# sustained load, with Prometheus scraping its /metrics the whole
+# time, so B2 (load driver) and later analysis can watch memory/CPU/
+# disk/latency trend over hours-to-days instead of the few-minute
+# windows the C0 replication harness exercises.
+#
+# Topology:
+#   cqserver     :8085 admin/metrics/ui   :9007 tcp   :9008 ws
+#                persistent Atlas-shaped topics, checkpoint_interval_secs
+#                set so the txlog stays disk-bounded across the whole soak
+#   load-driver  no exposed ports; placeholder in B1 (sleep loop hitting
+#                cqserver's /healthz). B2 replaces `command:` with the
+#                real soak driver — same service, same network, so the
+#                swap is a one-line diff.
+#   prometheus   :9090, scrapes cqserver:8085/metrics every 10s per
+#                prometheus-soak.yml
+#
+# The compose network is `cq-soak` bridge. Hostnames `cqserver`,
+# `load-driver`, `prometheus` resolve inside it.
+#
+# Usage: see tests/cloud/SOAK.md.
+
+services:
+  # Docker creates named volumes root-owned; Dockerfile.runtime's image
+  # layer `chown -R cq:cq /var/lib/cqserver` is shadowed the moment the
+  # named volume is mounted over it, so cqserver (running as the
+  # unprivileged `cq` user) can't write its txlog on first boot. This
+  # one-shot init container fixes ownership on the volume itself before
+  # `cqserver` starts, then exits.
+  txlog-perms-fix:
+    container_name: cq-soak-txlog-perms-fix
+    image: cqserver:local
+    build:
+      context: ../..
+      dockerfile: tests/cloud/Dockerfile.runtime
+    user: root
+    entrypoint: ["/bin/sh", "-c", "chown -R cq:cq /var/lib/cqserver/txlog"]
+    volumes:
+      - cqserver-soak-txlog:/var/lib/cqserver/txlog
+    networks:
+      cq-soak: {}
+
+  cqserver:
+    container_name: cq-soak-server
+    image: cqserver:local
+    build:
+      context: ../..
+      dockerfile: tests/cloud/Dockerfile.runtime
+    networks:
+      cq-soak:
+        aliases: [cqserver]
+    ports:
+      - "127.0.0.1:9007:9007"   # tcp transport
+      - "127.0.0.1:9008:9008"   # ws transport
+      - "127.0.0.1:8085:8085"   # admin + /metrics + /ui
+    volumes:
+      - ./configs/soak.toml:/etc/cqserver/cqserver.toml:ro
+      - ../../config/schemas:/etc/cqserver/schemas:ro
+      - cqserver-soak-txlog:/var/lib/cqserver/txlog
+    depends_on:
+      txlog-perms-fix:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8085/healthz"]
+      interval: 5s
+      timeout: 2s
+      start_period: 5s
+      retries: 20
+
+  # Placeholder for B2 — the real soak load driver. Kept on the same
+  # runtime image + network so B2 only needs to change `command:`
+  # (and, if it ships as a separate binary, `entrypoint:`) without
+  # touching topology, networking, or the cqserver service.
+  load-driver:
+    container_name: cq-soak-load-driver
+    image: cqserver:local
+    networks:
+      cq-soak: {}
+    depends_on:
+      cqserver:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "[load-driver] placeholder (B1) — B2 replaces this command with the real soak driver.";
+        while true; do
+          if curl -fsS http://cqserver:8085/healthz >/dev/null 2>&1; then
+            echo "[load-driver] $(date -u +%FT%TZ) cqserver healthy";
+          else
+            echo "[load-driver] $(date -u +%FT%TZ) cqserver NOT healthy";
+          fi
+          sleep 30
+        done
+    restart: unless-stopped
+
+  prometheus:
+    container_name: cq-soak-prometheus
+    image: prom/prometheus:v2.55.1
+    networks:
+      cq-soak:
+        aliases: [prometheus]
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus-soak.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-soak-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    depends_on:
+      cqserver:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  cq-soak:
+    name: cq-soak
+    driver: bridge
+
+volumes:
+  cqserver-soak-txlog:
+  prometheus-soak-data:

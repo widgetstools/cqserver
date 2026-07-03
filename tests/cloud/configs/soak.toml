@@ -1,0 +1,132 @@
+# cqserver B1 — soak topology config.
+#
+# Single persistent node, Atlas-shaped (positions/trades/securities +
+# a couple of representative materialized views), sized for a
+# multi-day soak: periodic in-process checkpointing keeps the txlog
+# bounded WITHOUT requiring a restart (see [txlog] below), so
+# `docker compose -f docker-compose.soak.yml up` can run for days
+# without the log growing unbounded on the mounted volume.
+#
+# This intentionally mirrors config/cqserver.toml's schema-driven
+# topics (config/bench-500k-positions.toml showed the minimal-topic
+# shape used for pure ingest benchmarks) but trims the view count to
+# the handful that exercise the incremental-aggregate path without
+# adding unnecessary CPU to a long-running soak.
+
+tcp_addr       = "0.0.0.0:9007"
+websocket_addr = "0.0.0.0:9008"
+websocket_path = "/cq/json"
+admin_addr     = "0.0.0.0:8085"
+
+heartbeat_interval_s     = 60
+heartbeat_idle_timeout_s = 600
+
+[transport]
+outbound_queue_capacity = 2048
+sow_batch_size          = 200
+
+# ===== Transaction log / fast restart =====
+#
+# checkpoint_interval_secs > 0 runs a background sweeper every N
+# seconds that fsyncs the log, writes a durable snapshot.bin, and
+# (because snapshot_reclaim = true) deletes the now-redundant sealed
+# segments — the AMPS sow-compact-action equivalent. This is the
+# prerequisite for a bounded-disk multi-day soak: without it the
+# /positions log would grow unbounded across the run. 10s keeps the
+# on-disk footprint close to one live segment at all times while
+# staying cheap (the checkpoint only holds a topic *read* lock).
+[txlog]
+directory            = "/var/lib/cqserver/txlog"
+snapshot_on_shutdown = true
+snapshot_reclaim     = true
+checkpoint_interval_secs = 10
+
+# ===== Atlas-shaped persistent topics =====
+
+[[topics]]
+name = "/securities"
+key = ["cusip"]
+persist = true
+initial_capacity = 1000
+schema_file = "schemas/securities.json"
+
+[[topics]]
+name = "/trades"
+key = ["trade_id"]
+persist = true
+expire_seconds = 60
+initial_capacity = 10000
+schema_file = "schemas/trades.json"
+
+# Primary soak load target — the Atlas publisher ticks these
+# continuously over the life of the soak.
+[[topics]]
+name = "/positions"
+key = ["position_id"]
+persist = true
+conflation_ms = 50
+initial_capacity = 550000
+schema_file = "schemas/positions.json"
+
+[[topics]]
+name = "/risk"
+key = ["positionKey"]
+persist = true
+conflation_ms = 100
+initial_capacity = 50000
+schema_file = "schemas/risk.json"
+
+# ===== Materialized views =====
+#
+# A representative subset (not the full Atlas set) — enough to keep
+# the incremental-aggregate + join code paths hot for the whole soak
+# without adding view fan-out that isn't needed to validate B1/B2.
+
+[[views]]
+name = "/v_net_exposure"
+source = "/positions"
+sql = """
+  SELECT book_id, book_name, asset_class, currency,
+         SUM(market_value_usd) AS net_mv_usd,
+         SUM(exposure_gross)   AS gross_exposure,
+         SUM(dv01_usd)         AS net_dv01,
+         SUM(var_1d_95)        AS sum_var,
+         MAX(risk_limit_utilization_pct) AS worst_util_pct,
+         COUNT(*)              AS n_positions
+  FROM positions
+  GROUP BY book_id, book_name, asset_class, currency
+"""
+
+[[views]]
+name = "/v_book_totals"
+source = "/positions"
+sql = """
+  SELECT SUM(exposure_gross)      AS exposure_gross,
+         SUM(market_value_usd)    AS market_value,
+         SUM(unrealized_pnl_usd)  AS unrealized_pnl,
+         SUM(realized_pnl_usd)    AS realized_pnl,
+         SUM(day_pnl)             AS day_pnl,
+         SUM(ytd_pnl)             AS ytd_pnl,
+         SUM(var_1d_95)           AS var_95,
+         COUNT(*)                 AS n_positions
+  FROM positions
+"""
+
+[[views]]
+name = "/v_trades_by_compliance"
+source = "/trades"
+sql = """
+  SELECT compliance_status,
+         COUNT(*)                  AS n_trades,
+         SUM(total_fees_usd)       AS total_fees,
+         AVG(slippage_arrival_bps) AS avg_slip_arr
+  FROM trades JOIN positions USING (position_id)
+  GROUP BY compliance_status
+"""
+
+# Atlas rows are wide (200+ columns). Raise the SOW estimate cap the
+# same way config/cqserver.toml does so /positions and /trades don't
+# get rejected under sustained load.
+[query_limits]
+max_sow_estimated_bytes  = 1073741824
+hard_max_sow_result_bytes = 2147483648

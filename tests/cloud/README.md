@@ -69,15 +69,35 @@ Loopback can't disprove or confirm any of those. C0 validates the
 ```
 tests/cloud/
 ├── README.md                      ← you are here
+├── SOAK.md                        ← Bucket B soak/scale topology (see below)
 ├── Makefile                       ← build / up / test / down / logs
 ├── Dockerfile.runtime             ← thin Debian runtime; binary mounted in
-├── docker-compose.local.yml       ← 3-node compose topology
+├── docker-compose.local.yml       ← 3-node compose topology (C0)
+├── docker-compose.soak.yml        ← soak topology (B1): cqserver + load-driver + prometheus
+├── prometheus-soak.yml            ← Prometheus scrape config for the soak topology
 ├── configs/
 │   ├── leader.toml                ← role=primary, peers=[follower1, follower2]
 │   ├── follower1.toml             ← role=standby, listen=:9010
-│   └── follower2.toml             ← role=standby, listen=:9010
+│   ├── follower2.toml             ← role=standby, listen=:9010
+│   └── soak.toml                  ← persistent Atlas-shaped config, checkpoint_interval_secs=10
 └── scripts/
     └── assert-converged.sh        ← test driver: publish + wait + verify
+```
+
+## Soak / scale topology (Bucket B)
+
+`docker-compose.soak.yml` stands up a single persistent `cqserver`
+node with periodic txlog checkpointing (`checkpoint_interval_secs`)
+so a multi-day run stays disk-bounded, plus a Prometheus instance
+scraping `:8085/metrics`. See [`SOAK.md`](./SOAK.md) for the full
+writeup, including why `checkpoint_interval_secs` matters and how to
+bring it up / verify it / tear it down.
+
+```sh
+docker compose -f tests/cloud/docker-compose.soak.yml up -d --build
+curl -fsS http://127.0.0.1:8085/healthz
+curl -fsS http://127.0.0.1:9090/-/ready
+docker compose -f tests/cloud/docker-compose.soak.yml down -v
 ```
 
 ## Troubleshooting
